@@ -1,16 +1,12 @@
-# Store query timeouts
+# store
 
-Store queries are executed through `GuardedStore`, which applies the configured
-per-query timeout to each store operation. The timeout is exposed through the
-existing `API_QUERY_TIMEOUT` configuration setting and defaults to 25 seconds.
+## Purpose
+The `store` package provides persistence layers and database abstractions for storing indexed ledgers, transactions, events, and contract states, acting as the primary persistence engine for SoroTrail.
 
-The guarded store derives a child context for each operation and passes that
-context to the underlying store implementation. Consequently, the earlier of
-the request's existing deadline and `API_QUERY_TIMEOUT` determines how long the
-query may run. Cancellation is propagated to the database driver, which stops
-the in-flight query and returns the context error.
+## Entry Points & Key Abstractions
+- **`Store`**: Core persistence interface defining methods for writing and querying historical chain data.
+- **`PostgresStore`**: Production PostgreSQL implementation supporting transactions, connection pooling, and optimized indexing for event streams.
 
-`API_SLOW_QUERY_THRESHOLD` controls slow-query logging independently; it does
-not extend the query timeout. The timeout applies to reads and other guarded
-store operations without changing any endpoint, configuration, or database
-schema contracts.
+## Non-Obvious Decisions & Invariants
+- **Idempotency**: All write operations are designed to be fully idempotent, safely handling duplicate ingestion of ledgers or blocks during recovery or replay scenarios.
+- **Cross-Links**: Refer to the architecture document for details on schema partitioning and migration strategies.
