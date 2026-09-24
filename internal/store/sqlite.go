@@ -952,7 +952,7 @@ func (s *SQLite) SaveIngestionState(ctx context.Context, st IngestionState) erro
 	// last_successful_poll mirrors the Postgres backend: the UPSERT sets
 	// it to EXCLUDED.last_successful_poll, so a nil value overwrites with
 	// NULL (not the previous timestamp). A non-nil poll is stored as an
-	// RFC3339Nano string that parseTime round-trips on read.
+	// sqliteTimeLayout string that parseTime round-trips on read.
 	var poll any
 	if st.LastSuccessfulPoll != nil {
 		poll = formatTime(*st.LastSuccessfulPoll)
@@ -1517,11 +1517,21 @@ func scanSubscriptionsSQLite(rows *sql.Rows) ([]Subscription, error) {
 	return subs, rows.Err()
 }
 
+// sqliteTimeLayout is RFC3339 with a fixed nine-digit fraction. SQLite has
+// no timestamp type, so ORDER BY and range filters on these columns compare
+// the stored strings byte by byte. time.RFC3339Nano trims trailing zeros,
+// which makes "…:00Z" sort after "…:00.5Z"; padding every value to the same
+// width keeps string order identical to chronological order. parseTime still
+// reads it through its RFC3339Nano branch.
+const sqliteTimeLayout = "2006-01-02T15:04:05.000000000Z07:00"
+
+// formatTime renders t in UTC with sqliteTimeLayout. The zero time maps to
+// "" so optional columns and filters read as unset rather than year 1.
 func formatTime(t time.Time) string {
 	if t.IsZero() {
 		return ""
 	}
-	return t.UTC().Format(time.RFC3339Nano)
+	return t.UTC().Format(sqliteTimeLayout)
 }
 
 func parseTime(s string) time.Time {

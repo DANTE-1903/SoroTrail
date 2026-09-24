@@ -115,6 +115,9 @@ type Options struct {
 	RetentionLedgers uint32
 	// PageLimit is the getEvents pagination limit per request. Default 1000.
 	PageLimit uint
+	// MaxRetries bounds consecutive retries before resetting the backoff window.
+	// Default 0 (disabled).
+	MaxRetries int
 	// WriteBatchSize is the maximum number of events written in one store
 	// operation. Default 1000.
 	WriteBatchSize uint
@@ -342,11 +345,12 @@ type dryRunPosition struct {
 
 // Ingester pages events out of the RPC and into the store.
 type Ingester struct {
-	client  rpc.Client
-	store   store.Store
-	decoder decode.Decoder
-	log     *slog.Logger
-	opts    Options
+	client               rpc.Client
+	store                store.Store
+	decoder              decode.Decoder
+	log                  *slog.Logger
+	opts                 Options
+	startOverrideApplied bool
 	// tracer emits OpenTelemetry spans around each ingest cycle. It is
 	// always non-nil (noop by default) so call sites never need a guard.
 	tracer trace.Tracer
@@ -537,11 +541,6 @@ func (ing *Ingester) backoffSleep(backoff time.Duration) time.Duration {
 // resumes from there with idempotent upserts covering any half-done
 // batch. There is no place in the loop where a partial state lands in
 // the store, so a tranquil Ctrl-C / SIGTERM never truncates a write.
-// Startup/shutdown logging: Run emits one "ingester started" line carrying
-// the effective (post-defaults) configuration, and one "ingester stopped"
-// line on every exit path — clean cancellation, RPC failure backoff exit,
-// or error return — so an operator correlating logs can see exactly when
-// the loop was live and with what knobs, without grepping config dumps.
 func (ing *Ingester) Run(ctx context.Context) (err error) {
 	if ing.opts.DryRun {
 		return ing.RunDryRun(ctx)
@@ -557,6 +556,7 @@ func (ing *Ingester) Run(ctx context.Context) (err error) {
 	}()
 
 	backoff := ing.opts.MinBackoff
+	retries := 0
 	lastReorgRescanAt := time.Time{}
 	for {
 		caughtUp, err := ing.runOnce(ctx)
@@ -564,6 +564,11 @@ func (ing *Ingester) Run(ctx context.Context) (err error) {
 		case ctx.Err() != nil:
 			return ctx.Err()
 		case err != nil:
+			if ing.opts.MaxRetries > 0 && retries >= ing.opts.MaxRetries {
+				retries = 0
+				backoff = ing.opts.MinBackoff
+			}
+			retries++
 			// Lag alarm runs BEFORE the backoff so a stuck indexer
 			// doesn't wait out MaxBackoff before the operator sees
 			// it.
@@ -583,6 +588,7 @@ func (ing *Ingester) Run(ctx context.Context) (err error) {
 			// on the cycle that noticed the gap, not PollInterval
 			// later.
 			ing.checkLag(ctx)
+			retries = 0
 			backoff = ing.opts.MinBackoff
 			if caughtUp {
 				// PollInterval (not opts.PollInterval) so a live update via
@@ -1423,11 +1429,19 @@ func (ing *Ingester) setDryRunPosition(cursor string, lastIngestedLedger int64) 
 }
 
 func (ing *Ingester) resolvePosition(ctx context.Context) (startLedger uint32, cursor string, err error) {
-	if ing.opts.DryRun && ing.dryRunPosition != nil {
-		if ing.dryRunPosition.cursor != "" {
-			return 0, ing.dryRunPosition.cursor, nil
+	if !ing.startOverrideApplied && ing.opts.StartLedger > 0 {
+		ing.startOverrideApplied = true // Apply override exactly once on startup
+		health, hErr := ing.client.GetHealth(ctx)
+		if hErr != nil {
+			return 0, "", fmt.Errorf("getHealth for override: %w", hErr)
 		}
-		return uint32(ing.dryRunPosition.lastIngestedLedger) + 1, "", nil
+		if health.OldestLedger > 0 && ing.opts.StartLedger < health.OldestLedger {
+			return 0, "", fmt.Errorf(
+				"START_LEDGER %d is below the RPC's oldest retained ledger %d; events in the gap are unrecoverable",
+				ing.opts.StartLedger, health.OldestLedger)
+		}
+		ing.log.Info("resume override via config", "start_ledger", ing.opts.StartLedger)
+		return ing.opts.StartLedger, "", nil
 	}
 
 	state, err := ing.getIngestionState(ctx)
@@ -1447,6 +1461,7 @@ func (ing *Ingester) resolvePosition(ctx context.Context) (startLedger uint32, c
 		return uint32(state.LastIngestedLedger) + 1, "", nil
 	}
 
+	// Cold start.
 	health, err := ing.client.GetHealth(ctx)
 	if err != nil {
 		return 0, "", fmt.Errorf("getHealth for cold start: %w", err)
@@ -1808,27 +1823,6 @@ func clampDuration(d, min, max time.Duration) time.Duration {
 		return max
 	}
 	return d
-}
-
-// sleepCtx sleeps for d or until ctx is done; it reports whether the full
-// sleep completed.
-func (ing *Ingester) logDryRunAddressRefs(events []store.Event) {
-	var refs []store.AddressRef
-	for _, ev := range events {
-		for _, ref := range decode.ExtractAddresses(ev.Topics, ev.Value) {
-			refs = append(refs, store.AddressRef{Address: ref.Address, EventID: ev.ID, Role: ref.Role})
-		}
-	}
-	if len(refs) == 0 {
-		return
-	}
-	ids := make([]string, len(refs))
-	for i, ref := range refs {
-		ids[i] = ref.EventID
-	}
-	ing.log.Info("dry-run: would write address references",
-		"count", len(refs),
-		"event_ids", ids)
 }
 
 // indexEventAddresses extracts G.../C... addresses from each event's

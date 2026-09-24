@@ -173,3 +173,117 @@ func TestSQLite_MigrationsCreateTxHashIndex(t *testing.T) {
 		t.Fatalf("idx_events_tx_hash should exist after migrations: %v", err)
 	}
 }
+
+// TestFormatTime pins the string formatTime stores for the SQLite backend.
+// SQLite has no timestamp type, so these strings are what ORDER BY and the
+// created_at range filters compare; the exact shape is the contract.
+func TestFormatTime(t *testing.T) {
+	lagos := time.FixedZone("WAT", 1*60*60)
+	newYork := time.FixedZone("EST", -5*60*60)
+
+	tests := []struct {
+		name string
+		in   time.Time
+		want string
+	}{
+		{
+			name: "UTC whole second is padded to nine fractional digits",
+			in:   time.Date(2024, 3, 15, 12, 30, 45, 0, time.UTC),
+			want: "2024-03-15T12:30:45.000000000Z",
+		},
+		{
+			name: "nanosecond precision is preserved",
+			in:   time.Date(2024, 3, 15, 12, 30, 45, 123456789, time.UTC),
+			want: "2024-03-15T12:30:45.123456789Z",
+		},
+		{
+			name: "trailing zeros are kept, not trimmed",
+			in:   time.Date(2024, 3, 15, 12, 30, 45, 500_000_000, time.UTC),
+			want: "2024-03-15T12:30:45.500000000Z",
+		},
+		{
+			name: "positive offset is normalised to UTC",
+			in:   time.Date(2024, 3, 15, 13, 30, 45, 0, lagos),
+			want: "2024-03-15T12:30:45.000000000Z",
+		},
+		{
+			// The shift crosses midnight, so the date must change too.
+			name: "negative offset is normalised to UTC across a day boundary",
+			in:   time.Date(2024, 12, 31, 22, 0, 0, 0, newYork),
+			want: "2025-01-01T03:00:00.000000000Z",
+		},
+		{
+			// Unset optional timestamps must read as absent, not year 1.
+			name: "zero time renders as empty string",
+			in:   time.Time{},
+			want: "",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var got string
+			require.NotPanics(t, func() { got = formatTime(tc.in) })
+			assert.Equal(t, tc.want, got)
+			if !tc.in.IsZero() {
+				assert.True(t, tc.in.Equal(parseTime(got)),
+					"parseTime must round-trip %q back to %v", got, tc.in)
+			}
+		})
+	}
+}
+
+// TestFormatTime_SortsChronologically asserts that byte-wise string order
+// matches time order, which is what SQLite relies on for ORDER BY created_at
+// and for the >= / <= range filters. The pairs are the ones a trimmed
+// RFC3339Nano layout gets wrong: a whole second against a fraction of the
+// same second, and fractions of different lengths.
+func TestFormatTime_SortsChronologically(t *testing.T) {
+	base := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	tests := []struct {
+		name           string
+		earlier, later time.Time
+	}{
+		{name: "whole second before a fraction of it", earlier: base, later: base.Add(500 * time.Millisecond)},
+		{name: "shorter fraction before longer one", earlier: base.Add(100 * time.Millisecond), later: base.Add(120 * time.Millisecond)},
+		{name: "one nanosecond apart", earlier: base, later: base.Add(time.Nanosecond)},
+		{name: "fraction before next whole second", earlier: base.Add(999_999_999), later: base.Add(time.Second)},
+		{name: "across a year boundary", earlier: base.Add(-time.Nanosecond), later: base},
+		{
+			name:    "different input zones compare in UTC",
+			earlier: time.Date(2024, 1, 1, 6, 0, 0, 0, time.FixedZone("UTC+8", 8*60*60)),
+			later:   time.Date(2024, 1, 1, 0, 0, 0, 0, time.FixedZone("UTC-1", -1*60*60)),
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			require.True(t, tc.earlier.Before(tc.later), "fixture must be chronologically ordered")
+			e, l := formatTime(tc.earlier), formatTime(tc.later)
+			assert.Less(t, e, l, "%q must sort before %q", e, l)
+		})
+	}
+
+	t.Run("a mixed batch sorts into chronological order", func(t *testing.T) {
+		chrono := []time.Time{
+			base.Add(-time.Second),
+			base,
+			base.Add(time.Nanosecond),
+			base.Add(100 * time.Millisecond),
+			base.Add(120 * time.Millisecond),
+			base.Add(500 * time.Millisecond),
+			base.Add(time.Second),
+			base.Add(10 * time.Second),
+		}
+		want := make([]string, len(chrono))
+		for i, ts := range chrono {
+			want[i] = formatTime(ts)
+		}
+		got := append([]string(nil), want...)
+		// Reverse first so sort.Strings has real work to do.
+		sort.Sort(sort.Reverse(sort.StringSlice(got)))
+		sort.Strings(got)
+		assert.Equal(t, want, got)
+	})
+}

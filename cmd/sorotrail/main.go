@@ -238,6 +238,9 @@ func runService(dryRun bool) error {
 		pg   *store.Postgres
 	)
 	if strings.HasPrefix(cfg.DatabaseURL, "clickhouse://") {
+		if cfg.RetentionEnabled() {
+			return fmt.Errorf("clickhouse: retention pruning is not supported by the clickhouse backend")
+		}
 		st, err = store.NewStoreFromURL(cfg.DatabaseURL)
 		if err != nil {
 			return err

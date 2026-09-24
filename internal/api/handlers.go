@@ -2,6 +2,7 @@ package api
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 
 	"crypto/sha256"
@@ -39,32 +40,58 @@ import (
 	"github.com/sorotrail/sorotrail/internal/store"
 )
 
+// maxJSONBodyBytes caps a JSON request body decoded by decodeJSONBody.
+// Every body it serves is a small control-plane object, so anything larger
+// is a client error, not something to buffer.
+const maxJSONBodyBytes = 4 << 10
+
 // decodeJSONBody parses a single small JSON body (≤4 KiB), rejecting
-
 // unknown fields so a typo like {"contractID": "..."} doesn't fall
-
 // through with an empty contract_id and a confusing 400 from a later
-// check.
+// check. On success dst is overwritten with the decoded value; on any
+// error it is left untouched. Error text never quotes the body's values.
 func decodeJSONBody(r *http.Request, dst any) error {
-
+	rv := reflect.ValueOf(dst)
+	if rv.Kind() != reflect.Pointer || rv.IsNil() {
+		return fmt.Errorf("decodeJSONBody: dst must be a non-nil pointer, got %T", dst)
+	}
+	// Server requests always carry a non-nil Body, so an absent body shows
+	// up as zero bytes below; the nil check covers hand-built requests.
 	if r.Body == nil {
-
 		return errors.New("request body is empty")
-
 	}
 
-	dec := json.NewDecoder(io.LimitReader(r.Body, 4<<10))
+	// Read one byte past the cap so an oversized body is reported as too
+	// large instead of being truncated into a misleading "unexpected EOF".
+	// At most maxJSONBodyBytes+1 bytes are ever buffered.
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxJSONBodyBytes+1))
+	if err != nil {
+		return fmt.Errorf("reading request body: %w", err)
+	}
+	if len(body) > maxJSONBodyBytes {
+		return fmt.Errorf("request body exceeds %d bytes", maxJSONBodyBytes)
+	}
+	if len(bytes.TrimSpace(body)) == 0 {
+		return errors.New("request body is empty")
+	}
 
+	// Decode into a scratch value and publish it only on success:
+	// encoding/json keeps filling fields after a type mismatch or an
+	// unknown field, and a half-populated struct must never reach a handler.
+	tmp := reflect.New(rv.Elem().Type())
+	dec := json.NewDecoder(bytes.NewReader(body))
 	dec.DisallowUnknownFields()
-
-	if err := dec.Decode(dst); err != nil {
-
+	if err := dec.Decode(tmp.Interface()); err != nil {
 		return fmt.Errorf("invalid JSON body: %w", err)
-
 	}
-
+	// The body is exactly one JSON value. Trailing data means the client
+	// sent something other than what was decoded, so reject it rather than
+	// act on the first value alone.
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		return errors.New("invalid JSON body: unexpected data after the JSON value")
+	}
+	rv.Elem().Set(tmp.Elem())
 	return nil
-
 }
 
 var cachePrivate atomic.Bool
