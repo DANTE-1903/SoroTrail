@@ -560,6 +560,30 @@ single global cursor to a **per-contract cursor model** backed by the
 - Unwatched mode (empty `WATCHED_CONTRACTS`) keeps the single global
   `ingestion_state` row exactly as before.
 
+### Managing watched contracts from the CLI
+
+The `contracts` command talks to the running API, so it works against a remote
+SoroTrail instance as well as the local process. Set `API_KEY` (or pass
+`--api-key`) for the management credential and use `--url` when the API is not
+at `http://$HTTP_ADDR`:
+
+```sh
+# List the persisted operator watch set.
+sorotrail contracts list --url https://sorotrail.example.com
+
+# Add a contract. --confirm is required by the API when this is the first
+# explicit watch-list entry and ingestion would switch from all contracts.
+sorotrail contracts add --url https://sorotrail.example.com --confirm C...
+
+# Stop future ingestion while preserving already stored events.
+sorotrail contracts remove --url https://sorotrail.example.com --confirm C...
+```
+
+`WATCHED_CONTRACTS` entries configured in the process environment are an
+operator overlay and cannot be removed by this command; unset the environment
+variable to stop those entries. The CLI never edits the environment or
+configuration file.
+
 ### How to check who is behind
 
 `GET /stats` now includes a `contract_cursors` field — the number of

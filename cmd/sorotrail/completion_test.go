@@ -117,7 +117,7 @@ func TestRunCompletionTo(t *testing.T) {
 func TestCompletionMatchesDispatch(t *testing.T) {
 	t.Parallel()
 	dispatched := []string{
-		"replay", "apikey", "backfill", "index-addresses",
+		"replay", "apikey", "contracts", "backfill", "index-addresses",
 		"healthcheck", "schema-inspect", "migrate-status",
 		"completion", "help",
 	}

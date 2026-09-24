@@ -5,6 +5,7 @@
 //
 //	sorotrail replay --from-ledger N [--to-ledger M]
 //	sorotrail apikey create|list|revoke
+//	sorotrail contracts add|list|remove
 //	sorotrail backfill --contract C... --from-ledger N [--to-ledger M]
 package main
 
@@ -74,6 +75,8 @@ func dispatch(args []string) error {
 		return runReplay(args[1:])
 	case "apikey":
 		return runAPIKey(args[1:])
+	case "contracts":
+		return runContracts(args[1:])
 	case "backfill":
 		return runBackfill(args[1:])
 	case "index-addresses":
@@ -127,6 +130,8 @@ subcommands:
                    (sorotrail replay --help)
   apikey           issue, list, and revoke API keys
                    (sorotrail apikey --help)
+  contracts        add, list, and remove watched contracts
+                   (sorotrail contracts --help)
   backfill         ingest historical contract events from Horizon
                    (sorotrail backfill --help)
   index-addresses  rebuild the address→event inverted index from stored events

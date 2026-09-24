@@ -24,6 +24,7 @@ type completionCommand struct {
 var completionCommands = []completionCommand{
 	{"replay", "re-decode stored events with the current decoder"},
 	{"apikey", "issue, list, and revoke API keys"},
+	{"contracts", "add, list, and remove watched contracts"},
 	{"backfill", "ingest historical contract events from Horizon"},
 	{"index-addresses", "rebuild the address to event inverted index"},
 	{"healthcheck", "probe /health and exit (used by docker HEALTHCHECK)"},

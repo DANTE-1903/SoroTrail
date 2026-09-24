@@ -226,6 +226,7 @@ func TestDispatchRoutesSubcommands(t *testing.T) {
 		{"backfill without dry-run", []string{"backfill", "--contract", "CABCDEFCABCDEFCABCDEFCABCDEFCABCDEFCABCDEFCABCDEFCABCDEF", "--from-ledger", "1", "--rps", "1"}},
 		{"index-addresses with dry-run", []string{"index-addresses", "--dry-run"}},
 		{"index-addresses without dry-run", []string{"index-addresses"}},
+		{"contracts with invalid ID", []string{"contracts", "add", "not-a-contract"}},
 	}
 
 	for _, tt := range tests {
