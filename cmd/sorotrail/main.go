@@ -146,6 +146,8 @@ subcommands:
                    (sorotrail migrate-status --help)
   completion       print a shell completion script (bash, zsh, fish)
                    (sorotrail completion --help)
+  stats            print store stats as a table
+                   (sorotrail stats --help)
 `)
 }
 
@@ -367,7 +369,28 @@ func runService(dryRun bool) error {
 		}
 	}
 
-	ing := ingester.New(countingClient, st, decode.XDRDecoder{}, log, ingesterOptionsFromConfig(cfg, false)).WithBroadcaster(bcast)
+	ing := ingester.New(countingClient, st, decode.XDRDecoder{}, log, ingester.Options{
+		PollInterval:            cfg.PollInterval,
+		PollIntervalMin:         cfg.PollIntervalMin,
+		PollIntervalMax:         cfg.PollIntervalMax,
+		StartLedger:             cfg.StartLedger,
+		StartLedgerRaw:          cfg.StartLedgerRaw,
+		RetentionLedgers:        cfg.RetentionLedgers,
+		PageLimit:               cfg.IngestPageSize,
+		WriteBatchSize:          cfg.IngestBatchSize,
+		LagWarnLedgers:          cfg.LagWarnLedgers,
+		SweepConcurrency:        cfg.SweepConcurrency,
+		MaxEventsPerCycle:       cfg.MaxEventsPerCycle,
+		BatchSize:               cfg.BatchSize,
+		BatchTargetLatency:      cfg.BatchTargetLatency,
+		BatchMaxBackoff:         cfg.BatchMaxBackoff,
+		MinBackoff:              cfg.IngesterMinBackoff,
+		MaxBackoff:              cfg.IngesterMaxBackoff,
+		ReorgConfirmationWindow: cfg.ReorgConfirmationWindow,
+		ReorgRescanInterval:     cfg.ReorgRescanInterval,
+		SkipContracts:           cfg.SkipContracts,
+		Network:                 cfg.Network,
+	}).WithBroadcaster(bcast)
 	ing.SetNotifier(wh)
 	// Wire the same store as the dead-letter sink: events that fail to
 	// decode/persist land in the dead_letters table instead of

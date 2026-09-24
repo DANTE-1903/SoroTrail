@@ -379,7 +379,7 @@ func (s *Server) authenticate(next http.Handler) http.Handler {
 			return
 		}
 		if err != nil {
-			s.log.Error("looking up api key", "error", err)
+			loggerFromContext(r.Context()).Error("looking up api key", "error", err)
 			writeError(w, http.StatusInternalServerError, errors.New("authentication failed"))
 			return
 		}
@@ -400,7 +400,7 @@ func (s *Server) authenticate(next http.Handler) http.Handler {
 
 		scope, err := s.tenants.ScopeForTenant(r.Context(), tenant)
 		if err != nil {
-			s.log.Error("resolving tenant scope", "tenant", tenant.ID, "error", err)
+			loggerFromContext(r.Context()).Error("resolving tenant scope", "tenant", tenant.ID, "error", err)
 			writeError(w, http.StatusInternalServerError, errors.New("authentication failed"))
 			return
 		}

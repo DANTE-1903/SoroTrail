@@ -72,7 +72,7 @@ func (s *Server) handleCreateTenant(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		s.log.Error("creating tenant", "error", err)
+		loggerFromContext(r.Context()).Error("creating tenant", "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("creating tenant failed"))
 		return
 	}
@@ -102,7 +102,7 @@ func validateTenantQuotas(t store.Tenant) error {
 func (s *Server) handleListTenants(w http.ResponseWriter, r *http.Request) {
 	tenants, err := s.tenants.ListTenants(r.Context())
 	if err != nil {
-		s.log.Error("listing tenants", "error", err)
+		loggerFromContext(r.Context()).Error("listing tenants", "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("listing tenants failed"))
 		return
 	}
@@ -164,7 +164,7 @@ func (s *Server) handleUpdateTenant(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		s.log.Error("updating tenant", "error", err)
+		loggerFromContext(r.Context()).Error("updating tenant", "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("updating tenant failed"))
 		return
 	}
@@ -191,7 +191,7 @@ func (s *Server) handleDeleteTenant(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		s.log.Error("deleting tenant", "error", err)
+		loggerFromContext(r.Context()).Error("deleting tenant", "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("deleting tenant failed"))
 		return
 	}
@@ -218,7 +218,7 @@ func (s *Server) handleGrantContract(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.tenants.GrantContract(r.Context(), t.ID, req.ContractID); err != nil {
-		s.log.Error("granting contract", "error", err)
+		loggerFromContext(r.Context()).Error("granting contract", "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("granting contract failed"))
 		return
 	}
@@ -232,7 +232,7 @@ func (s *Server) handleRevokeContract(w http.ResponseWriter, r *http.Request) {
 	}
 	contractID := chi.URLParam(r, "contract_id")
 	if err := s.tenants.RevokeContract(r.Context(), t.ID, contractID); err != nil {
-		s.log.Error("revoking contract", "error", err)
+		loggerFromContext(r.Context()).Error("revoking contract", "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("revoking contract failed"))
 		return
 	}
@@ -253,7 +253,7 @@ func (s *Server) handleListTenantGrants(w http.ResponseWriter, r *http.Request) 
 func (s *Server) writeGrants(w http.ResponseWriter, r *http.Request, tenantID int64) {
 	grants, err := s.tenants.ListGrants(r.Context(), tenantID)
 	if err != nil {
-		s.log.Error("listing grants", "error", err)
+		loggerFromContext(r.Context()).Error("listing grants", "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("listing grants failed"))
 		return
 	}
@@ -281,13 +281,13 @@ func (s *Server) handleCreateTenantKey(w http.ResponseWriter, r *http.Request) {
 	}
 	plaintext, prefix, digest, err := GenerateAPIKey()
 	if err != nil {
-		s.log.Error("generating api key", "error", err)
+		loggerFromContext(r.Context()).Error("generating api key", "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("generating api key failed"))
 		return
 	}
 	key, err := s.tenants.CreateTenantAPIKey(r.Context(), t.ID, req.Name, prefix, digest)
 	if err != nil {
-		s.log.Error("creating api key", "error", err)
+		loggerFromContext(r.Context()).Error("creating api key", "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("creating api key failed"))
 		return
 	}
@@ -303,7 +303,7 @@ func (s *Server) handleListTenantKeys(w http.ResponseWriter, r *http.Request) {
 	}
 	keys, err := s.tenants.ListTenantAPIKeys(r.Context(), t.ID)
 	if err != nil {
-		s.log.Error("listing api keys", "error", err)
+		loggerFromContext(r.Context()).Error("listing api keys", "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("listing api keys failed"))
 		return
 	}
@@ -325,7 +325,7 @@ func (s *Server) handleRevokeTenantKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		s.log.Error("revoking api key", "error", err)
+		loggerFromContext(r.Context()).Error("revoking api key", "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("revoking api key failed"))
 		return
 	}
@@ -382,7 +382,7 @@ func (s *Server) writeUsage(w http.ResponseWriter, r *http.Request, tenantID int
 	}
 	usage, err := s.tenants.ListUsage(r.Context(), tenantID, days)
 	if err != nil {
-		s.log.Error("listing usage", "error", err)
+		loggerFromContext(r.Context()).Error("listing usage", "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("listing usage failed"))
 		return
 	}
@@ -425,7 +425,7 @@ func (s *Server) handleAddOwnWatched(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		s.log.Error("adding watched contract", "error", err)
+		loggerFromContext(r.Context()).Error("adding watched contract", "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("adding watched contract failed"))
 		return
 	}
@@ -439,7 +439,7 @@ func (s *Server) handleRemoveOwnWatched(w http.ResponseWriter, r *http.Request) 
 	p, _ := PrincipalFrom(r.Context())
 	contractID := chi.URLParam(r, "contract_id")
 	if err := s.tenants.RemoveTenantWatchedContract(r.Context(), p.Tenant.ID, contractID); err != nil {
-		s.log.Error("removing watched contract", "error", err)
+		loggerFromContext(r.Context()).Error("removing watched contract", "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("removing watched contract failed"))
 		return
 	}
@@ -449,7 +449,7 @@ func (s *Server) handleRemoveOwnWatched(w http.ResponseWriter, r *http.Request) 
 func (s *Server) writeOwnWatched(w http.ResponseWriter, r *http.Request, tenantID int64) {
 	watched, err := s.tenants.ListTenantWatchedContracts(r.Context(), tenantID)
 	if err != nil {
-		s.log.Error("listing watched contracts", "error", err)
+		loggerFromContext(r.Context()).Error("listing watched contracts", "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("listing watched contracts failed"))
 		return
 	}
@@ -474,7 +474,7 @@ func (s *Server) tenantFromPath(w http.ResponseWriter, r *http.Request) (store.T
 		return store.Tenant{}, false
 	}
 	if err != nil {
-		s.log.Error("loading tenant", "error", err)
+		loggerFromContext(r.Context()).Error("loading tenant", "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("loading tenant failed"))
 		return store.Tenant{}, false
 	}

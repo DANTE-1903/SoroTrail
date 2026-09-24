@@ -681,6 +681,20 @@ func loggerFromContext(ctx context.Context) *slog.Logger {
 	return log
 }
 
+// RequestIDFrom returns the correlatable request ID the request-ID
+// middleware installed on the context: either the client-supplied
+// X-Request-ID header value, or the generated "host/random-counter" ID
+// when the client sent none. Every log line for the request carries the
+// same value under the request_id key, and the same value is echoed in
+// the X-Request-ID response header.
+//
+// Handlers and middleware downstream of the router read the ID from here
+// (rather than re-parsing headers) so the context is the single source of
+// truth for correlation.
+func RequestIDFrom(ctx context.Context) string {
+	return middleware.GetReqID(ctx)
+}
+
 // SetGraphQLHandler mounts the GraphQL transport. handler serves /graphql;
 // playground, when non-nil, serves GraphiQL at /graphiql. Call before
 // Router(); passing nil for either leaves that route unmounted.

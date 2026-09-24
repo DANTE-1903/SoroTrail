@@ -210,6 +210,9 @@ type Options struct {
 	// values mean replays-of-truth are caught faster at the cost of
 	// extra RPC requests per idle cycle.
 	ReorgRescanInterval time.Duration
+	// SkipContracts is a denylist of contract IDs whose events are dropped
+	// before insertion.
+	SkipContracts []string
 	// Network is the logical network name this ingester is responsible for
 	// (e.g. "mainnet", "testnet"). Empty means callers should treat it as
 	// the store default ("default").
@@ -381,10 +384,8 @@ type Ingester struct {
 	// a poison event no longer stalls the loop. nil means no
 	// dead-lettering — the cycle aborts on the first error as before.
 	deadLetterStore DeadLetterSink
-	// dryRunPosition is used only when Options.DryRun is true. It is
-	// accessed by the Run goroutine (or the single goroutine driving
-	// RunOnceForTest), so it needs no synchronization.
-	dryRunPosition *dryRunPosition
+	// skipContracts is the denylist map built from opts.SkipContracts for O(1) filtering.
+	skipContracts map[string]bool
 }
 
 type networkStateStore interface {
@@ -401,13 +402,18 @@ func (ing *Ingester) getIngestionState(ctx context.Context) (store.IngestionStat
 // New wires an Ingester.
 func New(client rpc.Client, st store.Store, dec decode.Decoder, log *slog.Logger, opts Options) *Ingester {
 	opts.applyDefaults()
+	skipMap := make(map[string]bool, len(opts.SkipContracts))
+	for _, id := range opts.SkipContracts {
+		skipMap[id] = true
+	}
 	ing := &Ingester{
-		client:  client,
-		store:   st,
-		decoder: dec,
-		log:     log,
-		opts:    opts,
-		tracer:  noop.NewTracerProvider().Tracer("github.com/sorotrail/sorotrail/internal/ingester"),
+		client:        client,
+		store:         st,
+		decoder:       dec,
+		log:           log,
+		opts:          opts,
+		skipContracts: skipMap,
+		tracer:        noop.NewTracerProvider().Tracer("github.com/sorotrail/sorotrail/internal/ingester"),
 	}
 	ing.pollInterval.Store(int64(opts.PollInterval))
 	return ing
@@ -1135,6 +1141,9 @@ func (ing *Ingester) persistEvents(ctx context.Context, rpcEvents []rpc.Event, l
 	}
 	events := make([]store.Event, 0, len(rpcEvents))
 	for _, re := range rpcEvents {
+		if ing.skipContracts[re.ContractID] {
+			continue
+		}
 		ev, err := ing.toStoreEvent(re)
 		if err != nil {
 			// Issue #131: a poison event must not stall the cycle. If a

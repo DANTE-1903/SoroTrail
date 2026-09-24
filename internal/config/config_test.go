@@ -157,6 +157,24 @@ func TestLoad(t *testing.T) {
 			wantErr: "not a valid contract ID",
 		},
 		{
+			name: "skip contracts parsed and trimmed",
+			env: map[string]string{
+				"DATABASE_URL":   "postgres://localhost/db",
+				"SKIP_CONTRACTS": validContract + ", " + validContract + " ,",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, []string{validContract, validContract}, c.SkipContracts)
+			},
+		},
+		{
+			name: "invalid skip contract rejected",
+			env: map[string]string{
+				"DATABASE_URL":   "postgres://localhost/db",
+				"SKIP_CONTRACTS": "not-a-contract",
+			},
+			wantErr: "not a valid contract ID",
+		},
+		{
 			name: "bad poll interval",
 			env: map[string]string{
 				"DATABASE_URL":  "postgres://localhost/db",

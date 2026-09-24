@@ -866,6 +866,41 @@ func TestPersistEvents_RetainsRawXDR(t *testing.T) {
 	assert.Empty(t, st.events["e2"].RawValueXDR)
 }
 
+func TestSkipContracts(t *testing.T) {
+	skippedID := "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	keptID := "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+	ev1 := rpc.Event{
+		ID:         "e1",
+		Type:       "contract",
+		Ledger:     100,
+		ContractID: skippedID,
+	}
+	ev2 := rpc.Event{
+		ID:         "e2",
+		Type:       "contract",
+		Ledger:     100,
+		ContractID: keptID,
+	}
+
+	client := &mockRPC{eventsResps: []rpc.GetEventsResponse{{
+		Events:       []rpc.Event{ev1, ev2},
+		LatestLedger: 500,
+	}}}
+	st := newMockStore()
+	ing := newTestIngester(client, st, Options{
+		StartLedger:   100,
+		SkipContracts: []string{skippedID},
+	})
+
+	_, err := ing.runOnce(context.Background())
+	require.NoError(t, err)
+
+	_, hasEv1 := st.events["e1"]
+	_, hasEv2 := st.events["e2"]
+	assert.False(t, hasEv1, "event from skipped contract should not be persisted")
+	assert.True(t, hasEv2, "event from non-skipped contract should be persisted")
+}
+
 func TestPersistEvents_DeduplicatesEventIDs(t *testing.T) {
 	tests := []struct {
 		name         string
