@@ -482,6 +482,13 @@ should ensure the shortest retention window is ≥ the ingester's
   and once on recovery rather than spamming. No log is emitted on cold
   start (no baseline yet) or when the alarm is disabled
   (`LAG_WARN_LEDGERS=0`).
+- **Preview writes**: run `sorotrail --dry-run` to fetch and decode the
+  live RPC stream and log the event IDs and cursor updates the ingester
+  would write. The preview keeps its position in memory, walks the
+  currently available data, and exits without writing events, ingestion
+  state, derived indexes, or progress rows. It does not apply migrations
+  or seed watched contracts, so run it against an already-migrated
+  database.
 - Topics/values are stored as JSON. When the RPC supports `xdrFormat: "json"`
   its decoding is used verbatim; otherwise the base64 XDR is decoded locally
   into shapes like `{"symbol":"transfer"}`, `{"u64":42}`, `{"i128":"-1000"}`,

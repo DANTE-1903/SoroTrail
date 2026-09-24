@@ -122,7 +122,7 @@ _sorotrail() {
 	b.WriteString(strings.Join(completionNames(), " "))
 	b.WriteString(`" -- "$cur"))
     else
-        COMPREPLY=($(compgen -W "--help -h" -- "$cur") $(compgen -f -- "$cur"))
+        COMPREPLY=($(compgen -W "--help -h --dry-run" -- "$cur") $(compgen -f -- "$cur"))
     fi
 }
 complete -F _sorotrail sorotrail
@@ -168,6 +168,7 @@ func fishCompletionScript() string {
 #   sorotrail completion fish > ~/.config/fish/completions/sorotrail.fish
 
 complete -c sorotrail -f
+complete -c sorotrail -l dry-run -d 'fetch and log planned writes without writing'
 `)
 	for _, c := range completionCommands {
 		fmt.Fprintf(&b,

@@ -11,6 +11,7 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -54,10 +55,19 @@ func main() {
 }
 
 // dispatch routes to a subcommand, defaulting to the indexer so existing
-// deployments (and the Dockerfile entrypoint) keep working unchanged.
+// deployments (and the Dockerfile entrypoint) keep working unchanged. Flags
+// before the first word are options for that default ingester (for example,
+// `sorotrail --dry-run`).
 func dispatch(args []string) error {
 	if len(args) == 0 {
 		return run()
+	}
+	if args[0] == "help" || args[0] == "-h" || args[0] == "--help" {
+		usage()
+		return nil
+	}
+	if strings.HasPrefix(args[0], "-") {
+		return runWithArgs(args)
 	}
 	switch args[0] {
 	case "replay":
@@ -94,9 +104,6 @@ func dispatch(args []string) error {
 		return runMigrateStatus(args[1:])
 	case "completion":
 		return runCompletion(args[1:])
-	case "help", "-h", "--help":
-		usage()
-		return nil
 	default:
 		usage()
 		return fmt.Errorf("unknown subcommand %q", args[0])
@@ -104,9 +111,16 @@ func dispatch(args []string) error {
 }
 
 func usage() {
-	fmt.Fprint(os.Stderr, `usage: sorotrail [subcommand]
+	fmt.Fprint(os.Stderr, `usage: sorotrail [--dry-run]
+       sorotrail <subcommand> [flags]
 
-With no subcommand, runs the indexer (ingester + HTTP API).
+With no subcommand, runs the indexer (ingester + HTTP API). Use --dry-run
+to fetch and log the events the ingester would write, then exit without
+writing anything to the database.
+
+options:
+  --dry-run            fetch and log the ingester's planned writes only
+  -h, --help           show this help message
 
 subcommands:
   replay           re-decode stored events with the current decoder
@@ -130,14 +144,65 @@ subcommands:
 `)
 }
 
+// ingesterFlags contains options accepted by the default (no-subcommand)
+// ingester invocation. It is intentionally parsed separately from the
+// maintenance subcommands so their existing flag sets remain unchanged.
+type ingesterFlags struct {
+	dryRun bool
+}
+
+func parseIngesterFlags(args []string) (ingesterFlags, error) {
+	fs := flag.NewFlagSet("sorotrail", flag.ContinueOnError)
+	fs.Usage = func() {
+		fmt.Fprint(fs.Output(), `usage: sorotrail [--dry-run]
+
+Fetch events with the live ingester. With --dry-run, events and cursor
+updates are logged but no database writes are made; the preview drains
+the currently available RPC data and exits.
+
+options:
+`)
+		fs.PrintDefaults()
+	}
+	var f ingesterFlags
+	fs.BoolVar(&f.dryRun, "dry-run", false, "fetch and log what would be written without writing to the database")
+	if err := fs.Parse(args); err != nil {
+		return ingesterFlags{}, err
+	}
+	if fs.NArg() != 0 {
+		fs.Usage()
+		return ingesterFlags{}, fmt.Errorf("unexpected argument %q", fs.Arg(0))
+	}
+	return f, nil
+}
+
+// run is kept as the no-argument entry point used by the main package and
+// by the default deployment path.
 func run() error {
+	return runWithArgs(nil)
+}
+
+func runWithArgs(args []string) error {
+	flags, err := parseIngesterFlags(args)
+	if err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil // usage was printed by flag
+		}
+		return err
+	}
+	return runService(flags.dryRun)
+}
+
+func runService(dryRun bool) error {
 	cfg, err := config.Load()
 	if err != nil {
 		return err
 	}
 	log, logLevel := newLoggerWithLevel(cfg.LogLevel, cfg.LogFormat)
 
-	log.Info("startup configuration", cfg.LoggableFields()...)
+	startupFields := append([]any{}, cfg.LoggableFields()...)
+	startupFields = append(startupFields, "dry_run", dryRun)
+	log.Info("startup configuration", startupFields...)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	provider, shutdown, err := telemetry.Configure(ctx, log)
@@ -150,8 +215,14 @@ func run() error {
 	_ = provider
 	defer stop()
 
-	if err := store.Migrate(cfg.DatabaseURL); err != nil {
-		return err
+	// A dry-run must not mutate the database merely to make the preview
+	// possible. The normal startup path still migrates before opening the
+	// pool, while the preview assumes the existing schema is already
+	// available and performs read-only queries.
+	if !dryRun {
+		if err := store.Migrate(cfg.DatabaseURL); err != nil {
+			return err
+		}
 	}
 
 	var (
@@ -211,6 +282,32 @@ func run() error {
 		st = pg
 	}
 
+	// Single-provider client: the interval limiter caps the request rate
+	// at RPC_RATE_LIMIT (default 10 req/s, the public endpoint limit) and
+	// the retry wrapper applies the configured backoff, honoring any
+	// Retry-After hint a rate-limiting provider sends (issue #58).
+	rpcClient := newRPCClient(cfg, log)
+
+	if dryRun {
+		// Do not seed WATCHED_CONTRACTS or start any of the service's
+		// writers (API routes, webhooks, auditor, pruners, archival, or
+		// multi-tenant bootstrap). The preview uses an in-memory cursor and
+		// returns after the currently available RPC data has been walked.
+		ingestStore := st
+		if len(cfg.WatchedContracts) > 0 {
+			ingestStore = watchListOverrideStore{
+				Store:   st,
+				watched: watchedContracts(cfg.WatchedContracts),
+			}
+		}
+		ing := ingester.New(rpcClient, ingestStore, decode.XDRDecoder{}, log, ingesterOptionsFromConfig(cfg, true))
+		log.Info("ingester dry-run enabled (no database writes)")
+		if err := ing.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			return fmt.Errorf("ingester dry-run: %w", err)
+		}
+		return nil
+	}
+
 	for _, id := range cfg.WatchedContracts {
 		if err := st.AddWatchedContract(ctx, id); err != nil {
 			return err
@@ -219,24 +316,6 @@ func run() error {
 
 	// Shared broadcaster for live event streaming across all networks.
 	bcast := broadcast.New(broadcast.DefaultBufferSize)
-
-	// Single-provider client: the interval limiter caps the request rate
-	// at RPC_RATE_LIMIT (default 10 req/s, the public endpoint limit) and
-	// the retry wrapper applies the configured backoff, honoring any
-	// Retry-After hint a rate-limiting provider sends (issue #58).
-	rpcClient := rpc.NewRetryClient(
-		rpc.NewHTTPClient(
-			cfg.RPCURL,
-			rpc.WithRateLimitRPS(cfg.RPCRateLimit),
-			rpc.WithHTTPTimeout(cfg.RPCHTTPTimeout),
-		),
-		rpc.RetryConfig{
-			MaxAttempts: cfg.RPCMaxAttempts,
-			BaseBackoff: cfg.RPCBaseBackoff,
-			MaxBackoff:  cfg.RPCMaxBackoff,
-			Jitter:      cfg.RPCJitter,
-			Logger:      log,
-		})
 	wh := webhook.NewNotifier(st, log)
 
 	// Wire the spec cache and enricher for spec-decoded event views.
@@ -283,27 +362,7 @@ func run() error {
 		}
 	}
 
-	ing := ingester.New(countingClient, st, decode.XDRDecoder{}, log, ingester.Options{
-		PollInterval:            cfg.PollInterval,
-		PollIntervalMin:         cfg.PollIntervalMin,
-		PollIntervalMax:         cfg.PollIntervalMax,
-		StartLedger:             cfg.StartLedger,
-		StartLedgerRaw:          cfg.StartLedgerRaw,
-		RetentionLedgers:        cfg.RetentionLedgers,
-		PageLimit:               cfg.IngestPageSize,
-		WriteBatchSize:          cfg.IngestBatchSize,
-		LagWarnLedgers:          cfg.LagWarnLedgers,
-		SweepConcurrency:        cfg.SweepConcurrency,
-		MaxEventsPerCycle:       cfg.MaxEventsPerCycle,
-		BatchSize:               cfg.BatchSize,
-		BatchTargetLatency:      cfg.BatchTargetLatency,
-		BatchMaxBackoff:         cfg.BatchMaxBackoff,
-		MinBackoff:              cfg.IngesterMinBackoff,
-		MaxBackoff:              cfg.IngesterMaxBackoff,
-		ReorgConfirmationWindow: cfg.ReorgConfirmationWindow,
-		ReorgRescanInterval:     cfg.ReorgRescanInterval,
-		Network:                 cfg.Network,
-	}).WithBroadcaster(bcast)
+	ing := ingester.New(countingClient, st, decode.XDRDecoder{}, log, ingesterOptionsFromConfig(cfg, false)).WithBroadcaster(bcast)
 	ing.SetNotifier(wh)
 	// Wire the same store as the dead-letter sink: events that fail to
 	// decode/persist land in the dead_letters table instead of
@@ -617,6 +676,97 @@ func run() error {
 	}
 	log.Info("shutdown complete")
 	return firstErr
+}
+
+// watchListOverrideStore supplies the environment-configured watch list
+// to a dry-run without writing those rows to the store. The embedded Store
+// still provides the read methods needed to resolve the existing cursor and
+// filter state.
+type watchListOverrideStore struct {
+	store.Store
+	watched []store.WatchedContract
+}
+
+func (s watchListOverrideStore) ListWatchedContracts(ctx context.Context) ([]store.WatchedContract, error) {
+	existing, err := s.Store.ListWatchedContracts(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := append([]store.WatchedContract(nil), existing...)
+	seen := make(map[string]struct{}, len(out)+len(s.watched))
+	for _, contract := range out {
+		seen[contract.ContractID] = struct{}{}
+	}
+	for _, contract := range s.watched {
+		if _, ok := seen[contract.ContractID]; ok {
+			continue
+		}
+		seen[contract.ContractID] = struct{}{}
+		out = append(out, contract)
+	}
+	return out, nil
+}
+
+// GetIngestionStateForNetwork preserves the ingester's optional network-
+// scoped state seam when the underlying store provides it. Without this
+// method, wrapping a store for WATCHED_CONTRACTS would accidentally make
+// the preview read the unscoped/default network instead.
+func (s watchListOverrideStore) GetIngestionStateForNetwork(ctx context.Context, network string) (store.IngestionState, error) {
+	if scoped, ok := s.Store.(interface {
+		GetIngestionStateForNetwork(context.Context, string) (store.IngestionState, error)
+	}); ok {
+		return scoped.GetIngestionStateForNetwork(ctx, network)
+	}
+	return s.GetIngestionState(ctx)
+}
+
+func watchedContracts(ids []string) []store.WatchedContract {
+	out := make([]store.WatchedContract, len(ids))
+	for i, id := range ids {
+		out[i] = store.WatchedContract{ContractID: id}
+	}
+	return out
+}
+
+func newRPCClient(cfg config.Config, log *slog.Logger) rpc.Client {
+	return rpc.NewRetryClient(
+		rpc.NewHTTPClient(
+			cfg.RPCURL,
+			rpc.WithRateLimitRPS(cfg.RPCRateLimit),
+			rpc.WithHTTPTimeout(cfg.RPCHTTPTimeout),
+		),
+		rpc.RetryConfig{
+			MaxAttempts: cfg.RPCMaxAttempts,
+			BaseBackoff: cfg.RPCBaseBackoff,
+			MaxBackoff:  cfg.RPCMaxBackoff,
+			Jitter:      cfg.RPCJitter,
+			Logger:      log,
+		})
+}
+
+func ingesterOptionsFromConfig(cfg config.Config, dryRun bool) ingester.Options {
+	return ingester.Options{
+		PollInterval:            cfg.PollInterval,
+		PollIntervalMin:         cfg.PollIntervalMin,
+		PollIntervalMax:         cfg.PollIntervalMax,
+		StartLedger:             cfg.StartLedger,
+		StartLedgerRaw:          cfg.StartLedgerRaw,
+		RetentionLedgers:        cfg.RetentionLedgers,
+		PageLimit:               cfg.IngestPageSize,
+		WriteBatchSize:          cfg.IngestBatchSize,
+		LagWarnLedgers:          cfg.LagWarnLedgers,
+		SweepConcurrency:        cfg.SweepConcurrency,
+		MaxEventsPerCycle:       cfg.MaxEventsPerCycle,
+		BatchSize:               cfg.BatchSize,
+		BatchTargetLatency:      cfg.BatchTargetLatency,
+		BatchMaxBackoff:         cfg.BatchMaxBackoff,
+		MinBackoff:              cfg.IngesterMinBackoff,
+		MaxBackoff:              cfg.IngesterMaxBackoff,
+		ReorgConfirmationWindow: cfg.ReorgConfirmationWindow,
+		ReorgRescanInterval:     cfg.ReorgRescanInterval,
+		Network:                 cfg.Network,
+		DryRun:                  dryRun,
+	}
 }
 
 // bootstrapAdminKey installs MULTI_TENANT_BOOTSTRAP_KEY as a credential for
