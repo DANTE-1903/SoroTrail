@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "SoroTrail API",
-    "description": "A contract event indexer for the Stellar/Soroban network. SoroTrail polls\na Stellar RPC endpoint, stores contract events durably in Postgres, and\nserves them back through a queryable HTTP API long after the RPC has\nforgotten them.\n",
+    "description": "A contract event indexer for the Stellar/Soroban network. SoroTrail polls\na Stellar RPC endpoint, stores contract events durably in Postgres, and\nserves them back through a queryable HTTP API long after the RPC has\nforgotten them.\n\nJSON-producing operations accept the shared `pretty=true` query\nparameter to indent responses for human inspection; it does not change\nthe response data.\n",
     "version": "0.1.0"
   },
   "servers": [
@@ -25,6 +25,7 @@
       "get": {
         "operationId": "health",
         "summary": "Dependency health check",
+        "description": "Report whether the API process can reach its database and RPC dependencies. This probe is public and does not expose tenant data.",
         "tags": [
           "System"
         ],
@@ -123,6 +124,45 @@
           },
           {
             "$ref": "#/components/parameters/Decoded"
+          },
+          {
+            "$ref": "#/components/parameters/ContractIDPrefix"
+          },
+          {
+            "$ref": "#/components/parameters/TopicContains"
+          },
+          {
+            "$ref": "#/components/parameters/TxHash"
+          },
+          {
+            "$ref": "#/components/parameters/TxIndex"
+          },
+          {
+            "$ref": "#/components/parameters/OpIndex"
+          },
+          {
+            "$ref": "#/components/parameters/InSuccessfulCall"
+          },
+          {
+            "$ref": "#/components/parameters/HasValue"
+          },
+          {
+            "$ref": "#/components/parameters/Recent"
+          },
+          {
+            "$ref": "#/components/parameters/Fields"
+          },
+          {
+            "$ref": "#/components/parameters/IncludeXDR"
+          },
+          {
+            "$ref": "#/components/parameters/Stream"
+          },
+          {
+            "$ref": "#/components/parameters/Envelope"
+          },
+          {
+            "$ref": "#/components/parameters/Pretty"
           }
         ],
         "responses": {
@@ -257,6 +297,7 @@
       "get": {
         "operationId": "getEvent",
         "summary": "Get a single event by ID",
+        "description": "Return one stored event. The decoded parameter controls optional spec-driven enrichment, and include_xdr adds the original XDR fields.",
         "tags": [
           "Events"
         ],
@@ -274,6 +315,15 @@
           },
           {
             "$ref": "#/components/parameters/Decoded"
+          },
+          {
+            "$ref": "#/components/parameters/Fields"
+          },
+          {
+            "$ref": "#/components/parameters/IncludeXDR"
+          },
+          {
+            "$ref": "#/components/parameters/Pretty"
           }
         ],
         "responses": {
@@ -338,7 +388,7 @@
       "get": {
         "operationId": "contractEvents",
         "summary": "List events for a contract",
-        "description": "Convenience wrapper around GET /events with contract_id={id}",
+        "description": "Convenience wrapper around GET /events with contract_id={id}. It accepts the same filters, pagination controls and response projections as the general event listing.",
         "tags": [
           "Events"
         ],
@@ -398,6 +448,39 @@
           },
           {
             "$ref": "#/components/parameters/Decoded"
+          },
+          {
+            "$ref": "#/components/parameters/TopicContains"
+          },
+          {
+            "$ref": "#/components/parameters/TxHash"
+          },
+          {
+            "$ref": "#/components/parameters/TxIndex"
+          },
+          {
+            "$ref": "#/components/parameters/OpIndex"
+          },
+          {
+            "$ref": "#/components/parameters/InSuccessfulCall"
+          },
+          {
+            "$ref": "#/components/parameters/HasValue"
+          },
+          {
+            "$ref": "#/components/parameters/Recent"
+          },
+          {
+            "$ref": "#/components/parameters/Fields"
+          },
+          {
+            "$ref": "#/components/parameters/IncludeXDR"
+          },
+          {
+            "$ref": "#/components/parameters/Envelope"
+          },
+          {
+            "$ref": "#/components/parameters/Pretty"
           }
         ],
         "responses": {
@@ -485,6 +568,12 @@
             "example": "GDW6AUTBXTOC7FIKUO5BOO3OGLK4SF7ZPOBLMQHMZDI45J2Z6VXRB5NR"
           },
           {
+            "$ref": "#/components/parameters/EventType"
+          },
+          {
+            "$ref": "#/components/parameters/ContractID"
+          },
+          {
             "$ref": "#/components/parameters/FromLedger"
           },
           {
@@ -498,6 +587,27 @@
           },
           {
             "$ref": "#/components/parameters/Order"
+          },
+          {
+            "name": "order_by",
+            "in": "query",
+            "description": "Address activity is always ordered by event ID; this is the only accepted value.",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "id"
+              ],
+              "default": "id"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/Recent"
+          },
+          {
+            "$ref": "#/components/parameters/Envelope"
+          },
+          {
+            "$ref": "#/components/parameters/Pretty"
           }
         ],
         "responses": {
@@ -640,18 +750,19 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "$ref": "#/components/schemas/TenantList"
                 },
                 "example": {
                   "tenants": [
                     {
                       "id": 1,
                       "name": "acme-corp",
+                      "wildcard": false,
+                      "admin": false,
                       "enabled": true,
                       "created_at": "2026-07-21T00:00:00Z"
                     }
-                  ],
-                  "count": 1
+                  ]
                 }
               }
             }
@@ -676,21 +787,39 @@
       "post": {
         "operationId": "createTenant",
         "summary": "Create a tenant",
-        "description": "Administrative endpoint, available only when MULTI_TENANT is enabled and gated behind the admin credential.",
+        "description": "Administrative endpoint, available only when MULTI_TENANT is enabled and gated behind the admin credential. A name is required; quota overrides are optional and inherit the instance defaults when omitted.",
         "tags": [
           "Admin"
         ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TenantCreateRequest"
+              },
+              "example": {
+                "name": "acme-corp",
+                "wildcard": false,
+                "admin": false,
+                "enabled": true
+              }
+            }
+          }
+        },
         "responses": {
           "201": {
             "description": "Success",
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "$ref": "#/components/schemas/Tenant"
                 },
                 "example": {
                   "id": 1,
                   "name": "acme-corp",
+                  "wildcard": false,
+                  "admin": false,
                   "enabled": true,
                   "created_at": "2026-07-21T00:00:00Z"
                 }
@@ -749,11 +878,13 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "$ref": "#/components/schemas/Tenant"
                 },
                 "example": {
                   "id": 1,
                   "name": "acme-corp",
+                  "wildcard": false,
+                  "admin": false,
                   "enabled": true,
                   "created_at": "2026-07-21T00:00:00Z"
                 }
@@ -783,7 +914,7 @@
       "patch": {
         "operationId": "updateTenant",
         "summary": "Update a tenant",
-        "description": "Administrative endpoint, available only when MULTI_TENANT is enabled and gated behind the admin credential.",
+        "description": "Administrative endpoint, available only when MULTI_TENANT is enabled and gated behind the admin credential. PATCH semantics apply: fields omitted from the JSON object retain their stored values.",
         "tags": [
           "Admin"
         ],
@@ -801,17 +932,34 @@
             "example": 1
           }
         ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TenantUpdateRequest"
+              },
+              "example": {
+                "enabled": false,
+                "rate_limit_rps": 10,
+                "rate_limit_burst": 20
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
             "description": "Success",
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "$ref": "#/components/schemas/Tenant"
                 },
                 "example": {
                   "id": 1,
                   "name": "acme-corp",
+                  "wildcard": false,
+                  "admin": false,
                   "enabled": true,
                   "created_at": "2026-07-21T00:00:00Z"
                 }
@@ -999,13 +1147,12 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "$ref": "#/components/schemas/GrantList"
                 },
                 "example": {
-                  "grants": [
+                  "contract_ids": [
                     "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
-                  ],
-                  "count": 1
+                  ]
                 }
               }
             }
@@ -1051,20 +1198,32 @@
             "example": 1
           }
         ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GrantContractRequest"
+              },
+              "example": {
+                "contract_id": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
             "description": "The tenant's refreshed grant list. Not a 201: the response is the whole list, not the created grant.",
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "$ref": "#/components/schemas/GrantList"
                 },
                 "example": {
-                  "grants": [
+                  "contract_ids": [
                     "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
-                    "CAAAA..."
-                  ],
-                  "count": 2
+                    "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+                  ]
                 }
               }
             }
@@ -1129,13 +1288,12 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "$ref": "#/components/schemas/GrantList"
                 },
                 "example": {
-                  "grants": [
+                  "contract_ids": [
                     "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
-                  ],
-                  "count": 1
+                  ]
                 }
               }
             }
@@ -1237,7 +1395,7 @@
       "post": {
         "operationId": "createTenantKey",
         "summary": "Issue an API key for a tenant",
-        "description": "Administrative endpoint, available only when MULTI_TENANT is enabled and gated behind the admin credential.",
+        "description": "Administrative endpoint, available only when MULTI_TENANT is enabled and gated behind the admin credential. The plaintext key is returned only in this response.",
         "tags": [
           "Admin"
         ],
@@ -1255,6 +1413,19 @@
             "example": 1
           }
         ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TenantAPIKeyRequest"
+              },
+              "example": {
+                "name": "ci-reader"
+              }
+            }
+          }
+        },
         "responses": {
           "201": {
             "description": "Success",
@@ -1410,17 +1581,10 @@
           "content": {
             "application/json": {
               "schema": {
-                "type": "object",
-                "properties": {
-                  "name": {
-                    "type": "string",
-                    "maxLength": 100,
-                    "description": "A human-readable label for the key, to make it identifiable in the list response. At most 100 characters."
-                  }
-                },
-                "example": {
-                  "name": "ci-reader"
-                }
+                "$ref": "#/components/schemas/APIKeyRequest"
+              },
+              "example": {
+                "name": "ci-reader"
               }
             }
           }
@@ -1569,6 +1733,12 @@
               "pattern": "^C[A-Z2-7]{0,55}$"
             },
             "example": "CDLZ"
+          },
+          {
+            "$ref": "#/components/parameters/Envelope"
+          },
+          {
+            "$ref": "#/components/parameters/Pretty"
           }
         ],
         "responses": {
@@ -1813,6 +1983,30 @@
           },
           {
             "$ref": "#/components/parameters/ToTime"
+          },
+          {
+            "$ref": "#/components/parameters/ContractIDPrefix"
+          },
+          {
+            "$ref": "#/components/parameters/TopicContains"
+          },
+          {
+            "$ref": "#/components/parameters/TxHash"
+          },
+          {
+            "$ref": "#/components/parameters/TxIndex"
+          },
+          {
+            "$ref": "#/components/parameters/OpIndex"
+          },
+          {
+            "$ref": "#/components/parameters/InSuccessfulCall"
+          },
+          {
+            "$ref": "#/components/parameters/HasValue"
+          },
+          {
+            "$ref": "#/components/parameters/Pretty"
           }
         ],
         "responses": {
@@ -1896,6 +2090,27 @@
             "$ref": "#/components/parameters/ToTime"
           },
           {
+            "$ref": "#/components/parameters/ContractIDPrefix"
+          },
+          {
+            "$ref": "#/components/parameters/TopicContains"
+          },
+          {
+            "$ref": "#/components/parameters/TxHash"
+          },
+          {
+            "$ref": "#/components/parameters/TxIndex"
+          },
+          {
+            "$ref": "#/components/parameters/OpIndex"
+          },
+          {
+            "$ref": "#/components/parameters/InSuccessfulCall"
+          },
+          {
+            "$ref": "#/components/parameters/HasValue"
+          },
+          {
             "name": "bucket",
             "in": "query",
             "required": true,
@@ -1914,6 +2129,9 @@
                 "value": "1h"
               }
             }
+          },
+          {
+            "$ref": "#/components/parameters/Pretty"
           }
         ],
         "responses": {
@@ -1975,7 +2193,7 @@
       "get": {
         "operationId": "eventsCSV",
         "summary": "Export events as CSV",
-        "description": "Streaming CSV export of matching events.",
+        "description": "Streaming CSV export of matching events. Pagination controls are intentionally ignored; the server walks the complete result set.",
         "tags": [
           "Operations"
         ],
@@ -2014,15 +2232,47 @@
             "$ref": "#/components/parameters/ToTime"
           },
           {
+            "$ref": "#/components/parameters/ContractIDPrefix"
+          },
+          {
+            "$ref": "#/components/parameters/TopicContains"
+          },
+          {
+            "$ref": "#/components/parameters/TxHash"
+          },
+          {
+            "$ref": "#/components/parameters/TxIndex"
+          },
+          {
+            "$ref": "#/components/parameters/OpIndex"
+          },
+          {
+            "$ref": "#/components/parameters/InSuccessfulCall"
+          },
+          {
+            "$ref": "#/components/parameters/HasValue"
+          },
+          {
             "$ref": "#/components/parameters/Order"
           },
           {
             "$ref": "#/components/parameters/OrderBy"
+          },
+          {
+            "$ref": "#/components/parameters/Recent"
           }
         ],
         "responses": {
           "200": {
-            "description": "Success"
+            "description": "CSV rows streamed until the complete result set is written.",
+            "content": {
+              "text/csv": {
+                "schema": {
+                  "type": "string",
+                  "description": "CSV text with id, ledger, type, tx_hash, topics and value columns."
+                }
+              }
+            }
           },
           "400": {
             "$ref": "#/components/responses/BadRequest"
@@ -2132,6 +2382,15 @@
           },
           {
             "$ref": "#/components/parameters/Decoded"
+          },
+          {
+            "$ref": "#/components/parameters/Fields"
+          },
+          {
+            "$ref": "#/components/parameters/IncludeXDR"
+          },
+          {
+            "$ref": "#/components/parameters/Pretty"
           }
         ],
         "responses": {
@@ -2453,7 +2712,21 @@
         ],
         "responses": {
           "200": {
-            "description": "Success"
+            "description": "The requested export stream.",
+            "content": {
+              "text/csv": {
+                "schema": {
+                  "type": "string",
+                  "description": "CSV rows when format=csv."
+                }
+              },
+              "application/x-ndjson": {
+                "schema": {
+                  "type": "string",
+                  "description": "One JSON event per line when format=ndjson."
+                }
+              }
+            }
           },
           "400": {
             "$ref": "#/components/responses/BadRequest"
@@ -2504,7 +2777,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "type": "object"
+                "$ref": "#/components/schemas/ContractSpecOverrideRequest"
               },
               "example": {
                 "spec": {
@@ -2698,13 +2971,19 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "$ref": "#/components/schemas/CurrentTenant"
                 },
                 "example": {
-                  "id": 1,
-                  "name": "acme-corp",
-                  "enabled": true,
-                  "grants": [
+                  "tenant": {
+                    "id": 1,
+                    "name": "acme-corp",
+                    "wildcard": false,
+                    "admin": false,
+                    "enabled": true,
+                    "created_at": "2026-07-21T00:00:00Z"
+                  },
+                  "wildcard": false,
+                  "granted_contract_ids": [
                     "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
                   ]
                 }
@@ -2812,13 +3091,12 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "$ref": "#/components/schemas/TenantWatchList"
                 },
                 "example": {
-                  "contracts": [
+                  "contract_ids": [
                     "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
-                  ],
-                  "count": 1
+                  ]
                 }
               }
             }
@@ -2843,24 +3121,36 @@
       "post": {
         "operationId": "addTenantWatch",
         "summary": "Add a contract to the tenant's watch list",
-        "description": "Adds a contract to the calling tenant's watch list.",
+        "description": "Adds a contract to the calling tenant's watch list. The contract must be a valid Stellar contract ID; the response is the refreshed list.",
         "tags": [
           "Operations"
         ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WatchedContractRequest"
+              },
+              "example": {
+                "contract_id": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
             "description": "The tenant's refreshed watch list. Not a 201: the response is the whole list, not the created row.",
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "$ref": "#/components/schemas/TenantWatchList"
                 },
                 "example": {
-                  "contracts": [
+                  "contract_ids": [
                     "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
-                    "CAAAA..."
-                  ],
-                  "count": 2
+                    "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+                  ]
                 }
               }
             }
@@ -2913,13 +3203,12 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "$ref": "#/components/schemas/TenantWatchList"
                 },
                 "example": {
-                  "contracts": [
+                  "contract_ids": [
                     "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
-                  ],
-                  "count": 1
+                  ]
                 }
               }
             }
@@ -2970,13 +3259,13 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "$ref": "#/components/schemas/WatchedContractsPage"
                 },
                 "example": {
                   "contracts": [
                     {
                       "contract_id": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
-                      "start_ledger": 256000
+                      "added_at": "2026-07-21T12:00:00Z"
                     }
                   ],
                   "count": 1
@@ -3001,7 +3290,7 @@
       "post": {
         "operationId": "addWatchedContract",
         "summary": "Add a watched contract",
-        "description": "Starts ingesting a contract on the next poll.",
+        "description": "Starts ingesting a contract on the next poll. When this is the first watched contract, pass confirm=true to acknowledge switching from all-contract ingestion to the explicit list.",
         "tags": [
           "Operations"
         ],
@@ -3010,26 +3299,46 @@
             "ManagementKey": []
           }
         ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WatchedContractRequest"
+              },
+              "example": {
+                "contract_id": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "confirm",
+            "in": "query",
+            "description": "Required when adding the first watched contract, because that changes ingestion from all contracts to the explicit list. The exact value \"true\" acknowledges the transition.",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "true"
+              ]
+            },
+            "example": "true"
+          }
+        ],
         "responses": {
           "200": {
-            "description": "The refreshed watch list, plus the ledger ingestion for the new contract will start from. Not a 201: the response is the whole list, not the created row.",
+            "description": "The newly watched contract and its ingestion frontier.",
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "$ref": "#/components/schemas/WatchedContractAdded"
                 },
                 "example": {
-                  "contracts": [
-                    {
-                      "contract_id": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
-                      "start_ledger": 256000
-                    },
-                    {
-                      "contract_id": "CAAAA...",
-                      "start_ledger": 256000
-                    }
-                  ],
-                  "count": 2
+                  "contract_id": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+                  "added_at": "2026-07-21T12:00:00Z",
+                  "history_from_ledger": 256000,
+                  "mode_transition": "all_to_specific"
                 }
               }
             }
@@ -3091,20 +3400,17 @@
         ],
         "responses": {
           "200": {
-            "description": "The refreshed watch list. Not a 204: the response carries the remaining contracts.",
+            "description": "The removed contract and the resulting ingestion mode.",
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "$ref": "#/components/schemas/WatchedContractRemoved"
                 },
                 "example": {
-                  "contracts": [
-                    {
-                      "contract_id": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
-                      "start_ledger": 256000
-                    }
-                  ],
-                  "count": 1
+                  "contract_id": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+                  "removed_at": "2026-07-21T12:00:00Z",
+                  "history_preserved": true,
+                  "mode_transition": "specific_to_all"
                 }
               }
             }
@@ -3158,6 +3464,12 @@
           },
           {
             "$ref": "#/components/parameters/Cursor"
+          },
+          {
+            "$ref": "#/components/parameters/Envelope"
+          },
+          {
+            "$ref": "#/components/parameters/Pretty"
           }
         ],
         "responses": {
@@ -3266,6 +3578,7 @@
       "get": {
         "operationId": "stats",
         "summary": "Indexer statistics",
+        "description": "Return ingestion, audit, pruner, RPC and decoder counters for the running indexer.",
         "tags": [
           "System"
         ],
@@ -3341,6 +3654,27 @@
           },
           {
             "$ref": "#/components/parameters/ToTime"
+          },
+          {
+            "$ref": "#/components/parameters/ContractIDPrefix"
+          },
+          {
+            "$ref": "#/components/parameters/TopicContains"
+          },
+          {
+            "$ref": "#/components/parameters/TxHash"
+          },
+          {
+            "$ref": "#/components/parameters/TxIndex"
+          },
+          {
+            "$ref": "#/components/parameters/OpIndex"
+          },
+          {
+            "$ref": "#/components/parameters/InSuccessfulCall"
+          },
+          {
+            "$ref": "#/components/parameters/HasValue"
           }
         ],
         "responses": {
@@ -3372,6 +3706,7 @@
       "post": {
         "operationId": "createSubscription",
         "summary": "Register a new webhook subscription",
+        "description": "Register a callback and an event filter. The signing secret is returned in the response and must be stored by the caller.",
         "tags": [
           "Webhooks"
         ],
@@ -3434,6 +3769,7 @@
       "get": {
         "operationId": "listSubscriptions",
         "summary": "List all webhook subscriptions",
+        "description": "Return every webhook subscription visible to the authenticated caller. Responses include the signing secret and are not cacheable.",
         "tags": [
           "Webhooks"
         ],
@@ -3489,6 +3825,7 @@
       "get": {
         "operationId": "getSubscription",
         "summary": "Get a single subscription by ID",
+        "description": "Return one webhook subscription and its current filter.",
         "tags": [
           "Webhooks"
         ],
@@ -3548,7 +3885,7 @@
       "put": {
         "operationId": "updateSubscription",
         "summary": "Update a subscription",
-        "description": "Only fields present in the request body are changed.",
+        "description": "Update a webhook subscription. Only fields present in the request body are changed; omitted fields retain their stored values.",
         "tags": [
           "Webhooks"
         ],
@@ -3622,6 +3959,7 @@
       "delete": {
         "operationId": "deleteSubscription",
         "summary": "Delete a subscription and its delivery history",
+        "description": "Remove a webhook subscription and its stored delivery attempts.",
         "tags": [
           "Webhooks"
         ],
@@ -3665,6 +4003,7 @@
       "get": {
         "operationId": "listDeliveries",
         "summary": "List delivery attempts for a subscription",
+        "description": "Return the delivery attempts recorded for one subscription.",
         "tags": [
           "Webhooks"
         ],
@@ -3919,6 +4258,162 @@
             "false"
           ]
         }
+      },
+      "ContractIDPrefix": {
+        "name": "contract_id_prefix",
+        "in": "query",
+        "description": "Match contracts whose ID starts with this prefix. This is a prefix filter, not a complete contract ID, and cannot be combined with contract_id.",
+        "schema": {
+          "type": "string",
+          "minLength": 1
+        },
+        "example": "CDLZ"
+      },
+      "TopicContains": {
+        "name": "topic_contains",
+        "in": "query",
+        "description": "Match events whose topics array contains the supplied JSON value using JSONB containment. The value must be valid JSON; unlike topic, bare text is not automatically quoted.",
+        "schema": {
+          "type": "string"
+        },
+        "example": "[{\"address\":\"GDW6AUTBXTOC7FIKUO5BOO3OGLK4SF7ZPOBLMQHMZDI45J2Z6VXRB5NR\"}]"
+      },
+      "TxHash": {
+        "name": "tx_hash",
+        "in": "query",
+        "description": "Match events emitted by this Stellar transaction hash.",
+        "schema": {
+          "type": "string",
+          "minLength": 1
+        },
+        "example": "9f5c7a2b"
+      },
+      "TxIndex": {
+        "name": "tx_index",
+        "in": "query",
+        "description": "Match the transaction's zero-based index within its ledger.",
+        "schema": {
+          "type": "integer",
+          "format": "int32",
+          "minimum": 0
+        },
+        "example": 0
+      },
+      "OpIndex": {
+        "name": "op_index",
+        "in": "query",
+        "description": "Match the operation's zero-based index within its transaction.",
+        "schema": {
+          "type": "integer",
+          "format": "int32",
+          "minimum": 0
+        },
+        "example": 0
+      },
+      "InSuccessfulCall": {
+        "name": "in_successful_call",
+        "in": "query",
+        "description": "Filter by whether the event was emitted inside a successful call. Omit the parameter when either outcome is acceptable.",
+        "schema": {
+          "type": "string",
+          "enum": [
+            "true",
+            "false"
+          ]
+        },
+        "example": "true"
+      },
+      "HasValue": {
+        "name": "has_value",
+        "in": "query",
+        "description": "Filter events by whether they have a non-empty value field.",
+        "schema": {
+          "type": "string",
+          "enum": [
+            "true",
+            "false"
+          ]
+        },
+        "example": "true"
+      },
+      "Recent": {
+        "name": "recent",
+        "in": "query",
+        "description": "Shorthand for the newest events. Use \"true\" for the default of 20, or a positive integer for a custom page size. It cannot be combined with order, order_by or limit.",
+        "schema": {
+          "oneOf": [
+            {
+              "type": "string",
+              "enum": [
+                "true"
+              ]
+            },
+            {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 500
+            }
+          ]
+        },
+        "example": 20
+      },
+      "Fields": {
+        "name": "fields",
+        "in": "query",
+        "description": "Comma-separated allowlist of event properties to return. Supported names are id, contract_id, ledger, type, tx_hash, tx_index, op_index, in_successful_call, topics, value and created_at. Omit the parameter to return the complete event.",
+        "schema": {
+          "type": "string",
+          "pattern": "^(id|contract_id|ledger|type|tx_hash|tx_index|op_index|in_successful_call|topics|value|created_at)(,(id|contract_id|ledger|type|tx_hash|tx_index|op_index|in_successful_call|topics|value|created_at))*$"
+        },
+        "example": "id,contract_id,ledger"
+      },
+      "IncludeXDR": {
+        "name": "include_xdr",
+        "in": "query",
+        "description": "Include the stored base64 topics_xdr and value_xdr fields on each event. The exact value \"true\" enables the projection.",
+        "schema": {
+          "type": "string",
+          "enum": [
+            "true"
+          ]
+        },
+        "example": "true"
+      },
+      "Stream": {
+        "name": "stream",
+        "in": "query",
+        "description": "Return matching events as a streaming NDJSON response instead of a JSON page. The exact value \"true\" enables streaming.",
+        "schema": {
+          "type": "string",
+          "enum": [
+            "true"
+          ]
+        },
+        "example": "true"
+      },
+      "Envelope": {
+        "name": "envelope",
+        "in": "query",
+        "description": "Return list data in the common {data, next_cursor} envelope. The exact value \"true\" enables the alternate response shape.",
+        "schema": {
+          "type": "string",
+          "enum": [
+            "true"
+          ]
+        },
+        "example": "true"
+      },
+      "Pretty": {
+        "name": "pretty",
+        "in": "query",
+        "description": "Pretty-print JSON responses for human use. The exact value \"true\" enables indentation; it does not change the response data.",
+        "schema": {
+          "type": "string",
+          "enum": [
+            "true"
+          ]
+        },
+        "example": "true"
       }
     },
     "schemas": {
@@ -3955,6 +4450,29 @@
           "prefix",
           "created_at"
         ]
+      },
+      "APIKeyRequest": {
+        "type": "object",
+        "description": "Optional body for creating an API key.",
+        "properties": {
+          "name": {
+            "type": "string",
+            "maxLength": 100,
+            "description": "Human-readable label for the key.",
+            "example": "ci-reader"
+          }
+        }
+      },
+      "ContractSpecOverrideRequest": {
+        "type": "object",
+        "description": "A contract spec override. The normal form is {\"spec\": {...}}; the handler also accepts a bare spec object for compatibility.",
+        "properties": {
+          "spec": {
+            "type": "object",
+            "description": "SEP-0041 contract specification JSON."
+          }
+        },
+        "additionalProperties": true
       },
       "ErrorResponse": {
         "type": "object",
@@ -4168,6 +4686,357 @@
                 "type": "integer"
               }
             }
+          }
+        }
+      },
+      "TenantCreateRequest": {
+        "type": "object",
+        "description": "JSON body used to create a tenant.",
+        "required": [
+          "name"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Unique human-readable tenant name.",
+            "example": "acme-corp"
+          },
+          "wildcard": {
+            "type": "boolean",
+            "description": "When true, the tenant can read events for every contract."
+          },
+          "admin": {
+            "type": "boolean",
+            "description": "When true, the tenant may use the administrative API."
+          },
+          "enabled": {
+            "type": "boolean",
+            "default": true,
+            "description": "Whether the tenant is enabled for requests."
+          },
+          "rate_limit_rps": {
+            "type": "number",
+            "format": "double",
+            "minimum": 0,
+            "description": "Optional requests-per-second override. Set together with rate_limit_burst; omit both to inherit the instance limit."
+          },
+          "rate_limit_burst": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0,
+            "description": "Optional burst-size override. Set together with rate_limit_rps."
+          },
+          "max_watched_contracts": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0,
+            "description": "Maximum number of contracts this tenant may watch."
+          }
+        }
+      },
+      "TenantUpdateRequest": {
+        "type": "object",
+        "description": "JSON body for a partial tenant update. Every property is optional; omitted properties retain their current value.",
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Replacement tenant name.",
+            "example": "acme-corp"
+          },
+          "wildcard": {
+            "type": "boolean",
+            "description": "When true, the tenant can read events for every contract."
+          },
+          "admin": {
+            "type": "boolean",
+            "description": "When true, the tenant may use the administrative API."
+          },
+          "enabled": {
+            "type": "boolean",
+            "description": "Whether the tenant is enabled for requests."
+          },
+          "rate_limit_rps": {
+            "type": "number",
+            "format": "double",
+            "minimum": 0,
+            "description": "Requests-per-second override. Set together with rate_limit_burst; omit both to inherit the instance limit."
+          },
+          "rate_limit_burst": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0,
+            "description": "Burst-size override. Set together with rate_limit_rps."
+          },
+          "max_watched_contracts": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0,
+            "description": "Maximum number of contracts this tenant may watch."
+          }
+        }
+      },
+      "GrantContractRequest": {
+        "type": "object",
+        "description": "JSON body used to grant one contract to a tenant.",
+        "required": [
+          "contract_id"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "contract_id": {
+            "type": "string",
+            "pattern": "^C[A-Z2-7]{55}$",
+            "description": "Stellar contract ID to grant to the tenant.",
+            "example": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+          }
+        }
+      },
+      "TenantAPIKeyRequest": {
+        "type": "object",
+        "description": "JSON body used to issue an API key for a tenant.",
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string",
+            "maxLength": 100,
+            "description": "Human-readable label for the generated key.",
+            "example": "ci-reader"
+          }
+        }
+      },
+      "WatchedContractRequest": {
+        "type": "object",
+        "description": "JSON body used to add a contract to a watch list.",
+        "required": [
+          "contract_id"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "contract_id": {
+            "type": "string",
+            "pattern": "^C[A-Z2-7]{55}$",
+            "description": "Stellar contract ID to add to the watch list.",
+            "example": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+          }
+        }
+      },
+      "Tenant": {
+        "type": "object",
+        "description": "Tenant identity, access scope and quota configuration.",
+        "required": [
+          "id",
+          "name",
+          "wildcard",
+          "admin",
+          "enabled",
+          "created_at"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Tenant database ID."
+          },
+          "name": {
+            "type": "string"
+          },
+          "wildcard": {
+            "type": "boolean"
+          },
+          "admin": {
+            "type": "boolean"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "rate_limit_rps": {
+            "type": "number",
+            "format": "double",
+            "nullable": true
+          },
+          "rate_limit_burst": {
+            "type": "integer",
+            "format": "int32",
+            "nullable": true
+          },
+          "max_watched_contracts": {
+            "type": "integer",
+            "format": "int32",
+            "nullable": true
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "TenantList": {
+        "type": "object",
+        "description": "All tenants visible to the administrative caller.",
+        "required": [
+          "tenants"
+        ],
+        "properties": {
+          "tenants": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Tenant"
+            }
+          }
+        }
+      },
+      "GrantList": {
+        "type": "object",
+        "description": "Contract IDs currently readable by a tenant.",
+        "required": [
+          "contract_ids"
+        ],
+        "properties": {
+          "contract_ids": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "^C[A-Z2-7]{55}$"
+            }
+          }
+        }
+      },
+      "TenantWatchList": {
+        "type": "object",
+        "description": "Contract IDs currently watched by the calling tenant.",
+        "required": [
+          "contract_ids"
+        ],
+        "properties": {
+          "contract_ids": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "^C[A-Z2-7]{55}$"
+            }
+          }
+        }
+      },
+      "CurrentTenant": {
+        "type": "object",
+        "description": "The authenticated tenant and its effective read scope.",
+        "required": [
+          "tenant",
+          "wildcard"
+        ],
+        "properties": {
+          "tenant": {
+            "$ref": "#/components/schemas/Tenant"
+          },
+          "wildcard": {
+            "type": "boolean",
+            "description": "Whether the caller has unrestricted contract visibility."
+          },
+          "granted_contract_ids": {
+            "type": "array",
+            "description": "Contract IDs granted to a non-wildcard tenant.",
+            "items": {
+              "type": "string",
+              "pattern": "^C[A-Z2-7]{55}$"
+            }
+          }
+        }
+      },
+      "WatchedContract": {
+        "type": "object",
+        "description": "One contract in the global ingestion watch list.",
+        "required": [
+          "contract_id",
+          "added_at"
+        ],
+        "properties": {
+          "contract_id": {
+            "type": "string",
+            "pattern": "^C[A-Z2-7]{55}$"
+          },
+          "added_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the contract was added to the watch list."
+          }
+        }
+      },
+      "WatchedContractsPage": {
+        "type": "object",
+        "description": "The complete global contract watch list.",
+        "required": [
+          "contracts",
+          "count"
+        ],
+        "properties": {
+          "contracts": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/WatchedContract"
+            }
+          },
+          "count": {
+            "type": "integer"
+          }
+        }
+      },
+      "WatchedContractAdded": {
+        "type": "object",
+        "description": "Result of adding a contract to the global watch list.",
+        "required": [
+          "contract_id",
+          "added_at",
+          "history_from_ledger"
+        ],
+        "properties": {
+          "contract_id": {
+            "type": "string",
+            "pattern": "^C[A-Z2-7]{55}$"
+          },
+          "added_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "history_from_ledger": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "mode_transition": {
+            "type": "string",
+            "enum": [
+              "all_to_specific"
+            ]
+          }
+        }
+      },
+      "WatchedContractRemoved": {
+        "type": "object",
+        "description": "Result of removing a contract from the global watch list.",
+        "required": [
+          "contract_id",
+          "removed_at",
+          "history_preserved"
+        ],
+        "properties": {
+          "contract_id": {
+            "type": "string",
+            "pattern": "^C[A-Z2-7]{55}$"
+          },
+          "removed_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "history_preserved": {
+            "type": "boolean"
+          },
+          "mode_transition": {
+            "type": "string",
+            "enum": [
+              "specific_to_all"
+            ]
           }
         }
       },
