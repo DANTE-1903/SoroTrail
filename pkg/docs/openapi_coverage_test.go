@@ -44,6 +44,7 @@ type coverageMedia struct {
 type coverageResponse struct {
 	Ref         string                   `yaml:"$ref"`
 	Description string                   `yaml:"description"`
+	Headers     map[string]any           `yaml:"headers"`
 	Content     map[string]coverageMedia `yaml:"content"`
 }
 
@@ -238,6 +239,13 @@ func TestKnownResponseSchemasMatchTheWireFormat(t *testing.T) {
 		{name: "list global watch", method: "get", path: "/watched-contracts", status: "200", wantSchema: "WatchedContractsPage"},
 		{name: "add global watch", method: "post", path: "/watched-contracts", status: "200", wantSchema: "WatchedContractAdded"},
 		{name: "remove global watch", method: "delete", path: "/watched-contracts/{id}", status: "200", wantSchema: "WatchedContractRemoved"},
+		{name: "tenant usage", method: "get", path: "/admin/tenants/{id}/usage", status: "200", wantSchema: "UsagePage"},
+		{name: "tenant keys", method: "get", path: "/admin/tenants/{id}/keys", status: "200", wantSchema: "TenantAPIKeysPage"},
+		{name: "address summary", method: "get", path: "/addresses/{address}/summary", status: "200", wantSchema: "AddressSummary"},
+		{name: "aggregate events", method: "get", path: "/events/aggregate", status: "200", wantSchema: "AggregateResponse"},
+		{name: "transaction events", method: "get", path: "/events/{id}/transaction", status: "200", wantSchema: "EventsResponse"},
+		{name: "contract list", method: "get", path: "/contracts", status: "200", wantSchema: "ContractListResponse"},
+		{name: "stats", method: "get", path: "/stats", status: "200", wantSchema: "Stats"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			op := doc.operation(t, tc.method, tc.path)
@@ -269,7 +277,7 @@ func TestFilterAndProjectionParametersAreDocumented(t *testing.T) {
 	}{
 		{
 			name: "event list", method: "get", path: "/events",
-			params: []string{"contract_id_prefix", "topic_contains", "tx_hash", "tx_index", "op_index", "in_successful_call", "has_value", "recent", "fields", "include_xdr", "stream", "envelope", "pretty"},
+			params: []string{"contract_id_prefix", "topic_contains", "tx_hash", "tx_index", "op_index", "in_successful_call", "has_value", "recent", "fields", "include_xdr", "stream", "envelope", "pretty", "If-None-Match"},
 		},
 		{
 			name: "event count", method: "get", path: "/events/count",
@@ -308,6 +316,14 @@ func TestFilterAndProjectionParametersAreDocumented(t *testing.T) {
 			params: []string{"envelope"},
 		},
 		{
+			name: "subscription deliveries", method: "get", path: "/subscriptions/{id}/deliveries",
+			params: []string{"envelope"},
+		},
+		{
+			name: "live event stream", method: "get", path: "/events/ws",
+			params: []string{"topic", "from_ledger", "to_ledger", "from_time", "to_time", "has_value"},
+		},
+		{
 			name: "global watch", method: "post", path: "/watched-contracts",
 			params: []string{"confirm"},
 		},
@@ -319,6 +335,54 @@ func TestFilterAndProjectionParametersAreDocumented(t *testing.T) {
 				require.NotEmptyf(t, p.Schema, "parameter %s must have a schema", name)
 			}
 		})
+	}
+}
+
+func TestStreamingAndExportResponsesDescribeMedia(t *testing.T) {
+	doc := readCoverageSpec(t)
+	for _, tc := range []struct {
+		name   string
+		method string
+		path   string
+		media  string
+		header string
+	}{
+		{name: "event NDJSON stream", method: "get", path: "/events", media: "application/x-ndjson"},
+		{name: "CSV export", method: "get", path: "/events.csv", media: "text/csv", header: "Content-Disposition"},
+		{name: "contract export", method: "get", path: "/contracts/{id}/export", media: "text/csv", header: "Content-Disposition"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			op := doc.operation(t, tc.method, tc.path)
+			response := resolveResponse(t, doc, op.Responses["200"])
+			require.Contains(t, response.Content, tc.media)
+			if tc.header != "" {
+				require.Contains(t, response.Headers, tc.header)
+			}
+		})
+	}
+}
+
+func TestEventSchemasDescribeWireFields(t *testing.T) {
+	doc := readCoverageSpec(t)
+	event := doc.Components.Schemas["Event"]
+	require.Contains(t, event["required"], "network")
+	properties, ok := event["properties"].(map[string]any)
+	require.True(t, ok)
+	require.Contains(t, properties, "sep41_event")
+
+	enriched := doc.Components.Schemas["EnrichedEvent"]
+	allOf, ok := enriched["allOf"].([]any)
+	require.True(t, ok)
+	require.Len(t, allOf, 2)
+	extra, ok := allOf[1].(map[string]any)
+	require.True(t, ok)
+	extraProperties, ok := extra["properties"].(map[string]any)
+	require.True(t, ok)
+	require.Contains(t, extraProperties, "decode_error")
+	require.Contains(t, extra["required"], "decoded")
+
+	for _, name := range []string{"EventWithXDR", "ProjectedEvent", "EventEnvelopeResponse"} {
+		require.Contains(t, doc.Components.Schemas, name)
 	}
 }
 
