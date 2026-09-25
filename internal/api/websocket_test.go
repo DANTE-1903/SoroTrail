@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -54,12 +55,23 @@ func wsBigPayloadEvent(id, contractID string) store.Event {
 	}
 }
 
+// drainWSResp closes the response of a failed websocket.Dial. The
+// handshake response carries a short body the client is expected to drain,
+// and these tests only inspect the status code.
+func drainWSResp(resp *http.Response) {
+	if resp != nil && resp.Body != nil {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+	}
+}
+
 // dialWS opens a websocket client connected to the test server.
 func dialWS(t *testing.T, srvURL, path string) *websocket.Conn {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	wsURL := "ws" + strings.TrimPrefix(srvURL, "http") + path
+	//nolint:bodyclose // on a successful handshake the response body is owned by the websocket.Conn, which Close releases; there is nothing left to close here.
 	c, _, err := websocket.Dial(ctx, wsURL, nil)
 	require.NoError(t, err)
 	return c
@@ -199,6 +211,7 @@ func TestEventStreamWS_NoBroadcasterReturns501(t *testing.T) {
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "/events/ws"
 
 	_, resp, err := websocket.Dial(ctx, wsURL, nil)
+	drainWSResp(resp)
 	require.Error(t, err, "expected dial to fail when streaming is not configured")
 	require.NotNil(t, resp, "expected the 501 response so callers can branch on it")
 	assert.Equal(t, http.StatusNotImplemented, resp.StatusCode)
@@ -214,6 +227,7 @@ func TestEventStreamWS_BadFilterReturns400(t *testing.T) {
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "/events/ws?type=bogus"
 
 	_, resp, err := websocket.Dial(ctx, wsURL, nil)
+	drainWSResp(resp)
 	require.Error(t, err)
 	require.NotNil(t, resp)
 	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)

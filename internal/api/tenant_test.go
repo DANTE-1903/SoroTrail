@@ -136,6 +136,22 @@ func (s *scopedStore) GetIngestionState(context.Context) (store.IngestionState, 
 }
 func (s *scopedStore) Ping(context.Context) error { return nil }
 
+// GetEventsByTxHash deliberately mirrors the production backends (Postgres,
+// ClickHouse, SQLite): the method has no Scope parameter, so it returns
+// every matching event regardless of which tenant is asking. That is the
+// same shape the real store has, and it is why the handler that calls this
+// (handleGetEventTransaction) must filter the result by scope itself rather
+// than relying on the store to have done it.
+func (s *scopedStore) GetEventsByTxHash(_ context.Context, txHash, excludeID string) ([]store.Event, error) {
+	out := []store.Event{}
+	for _, e := range s.events {
+		if e.TxHash == txHash && e.ID != excludeID {
+			out = append(out, e)
+		}
+	}
+	return out, nil
+}
+
 // fakeTenants is an in-memory TenantStore covering the parts the API needs.
 type fakeTenants struct {
 	store.TenantStore
@@ -282,9 +298,12 @@ func newTenantFixtureWithStatsTTL(t *testing.T, ttl time.Duration) *tenantFixtur
 	t.Cleanup(func() { SetTenantScopedCaching(false) })
 
 	st := &scopedStore{events: []store.Event{
-		{ID: "ev-a1", ContractID: contractA, Ledger: 100, Type: "contract"},
+		// ev-a1 and ev-b1 deliberately share a transaction hash: a single
+		// transaction touching two tenants' contracts is exactly the shape
+		// that exercises GetEventsByTxHash's cross-tenant boundary below.
+		{ID: "ev-a1", ContractID: contractA, Ledger: 100, Type: "contract", TxHash: "tx-shared"},
 		{ID: "ev-a2", ContractID: contractA, Ledger: 101, Type: "contract"},
-		{ID: "ev-b1", ContractID: contractB, Ledger: 100, Type: "contract"},
+		{ID: "ev-b1", ContractID: contractB, Ledger: 100, Type: "contract", TxHash: "tx-shared"},
 		{ID: "ev-c1", ContractID: contractC, Ledger: 100, Type: "contract"},
 	}}
 	tenants := newFakeTenants()
@@ -461,6 +480,16 @@ func TestCrossTenantLeakMatrix(t *testing.T) {
 			path:       "/events?from_ledger=1&to_ledger=999999&limit=200",
 			wantStatus: http.StatusOK,
 			wantHidden: []string{"ev-b1", "ev-c1"},
+		},
+		{
+			// GetEventsByTxHash has no Scope parameter of its own (see
+			// scopedStore.GetEventsByTxHash), so ev-a1's transaction
+			// siblings include tenant B's ev-b1 at the store layer. The
+			// handler must filter that out itself.
+			name:       "transaction siblings hide another tenant's event in the same tx",
+			path:       "/events/ev-a1/transaction",
+			wantStatus: http.StatusOK,
+			wantHidden: []string{"ev-b1", contractB},
 		},
 	}
 

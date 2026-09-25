@@ -26,6 +26,7 @@ var completionCommands = []completionCommand{
 	{"apikey", "issue, list, and revoke API keys"},
 	{"backfill", "ingest historical contract events from Horizon"},
 	{"index-addresses", "rebuild the address to event inverted index"},
+	{"migrate", "apply, roll back, or inspect database migrations"},
 	{"healthcheck", "probe /health and exit (used by docker HEALTHCHECK)"},
 	{"schema-inspect", "report migration state, partitions, and table sizes"},
 	{"migrate-status", "report pending migrations without applying them"},

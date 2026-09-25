@@ -102,8 +102,9 @@ func (s *subErrorStub) ListDeliveryAttempts(_ context.Context, id int64, limit i
 // doAPIRequest issues one HTTP request against a freshly-spun-up
 // test server and returns the response and body. Unlike doGet, this
 // helper accepts a method and body so the table can drive POST/PUT/
-// DELETE in addition to GET.
-func doAPIRequest(t *testing.T, s *Server, method, path, body string) (*http.Response, []byte) {
+// DELETE in addition to GET. Like doGet it returns the drained
+// testResponse rather than a *http.Response with a dead body.
+func doAPIRequest(t *testing.T, s *Server, method, path, body string) (testResponse, []byte) {
 	t.Helper()
 	srv := httptest.NewServer(s.Router())
 	defer srv.Close()
@@ -121,7 +122,7 @@ func doAPIRequest(t *testing.T, s *Server, method, path, body string) (*http.Res
 	b, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
 	resp.Body.Close()
-	return resp, b
+	return testResponse{StatusCode: resp.StatusCode, Header: resp.Header}, b
 }
 
 // errorEnvelope decodes a JSON body of the form {"error": "..."} so a

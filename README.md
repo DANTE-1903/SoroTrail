@@ -2199,7 +2199,8 @@ to reinvent the same panels.
 | `sorotrail_ingest_errors_total` | Counter | Terminal ingestion pass failures (RPC, decode, DB). |
 | `sorotrail_rpc_call_duration_seconds` | Histogram | RPC call latency (HTTP round trip + parse). |
 | `sorotrail_db_write_duration_seconds` | Histogram | Database write latency (upsert, replace-in-range). |
-| `sorotrail_db_query_duration_seconds` | HistogramVec | Database query latency, labelled by `operation`. |
+| `sorotrail_db_query_duration_seconds` | HistogramVec | Store operation latency, labelled by `operation` (Store method name). |
+| `sorotrail_db_operations_total` | CounterVec | Store operations, labelled by `operation` and `outcome` (`success` \| `error`). |
 | `sorotrail_ingestion_lag_ledgers` | Gauge | Ledgers behind the chain head. |
 | `sorotrail_event_batch_writes_total` | Counter | UpsertEvents calls issued by the ingester. |
 | `sorotrail_event_batch_size` | Gauge | Current adaptive batch size per write. |

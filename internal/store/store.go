@@ -14,6 +14,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/sorotrail/sorotrail/internal/sep41"
@@ -443,6 +444,22 @@ const (
 // ErrInvalidContractsCursor is returned when the pagination cursor cannot
 // be decoded for the requested sort. The API maps it to 400.
 var ErrInvalidContractsCursor = errors.New("invalid contracts cursor")
+
+// ErrUnsupported is returned by a Store implementation for an operation it
+// deliberately does not implement. It exists so a backend can be honest about
+// its gaps: an unimplemented method returns this instead of a zero value that
+// reads as success, which is how a missing feature silently becomes an empty
+// 200. Callers detect it with errors.Is and map it to a clear status (501 or
+// the backend's documented fallback) rather than trusting the empty result.
+var ErrUnsupported = errors.New("operation not supported by this store backend")
+
+// errUnsupported builds a backend's explicit refusal for one operation. It
+// names both the operation and the backend so the API layer can map it to a
+// clear status and an operator reading a log knows exactly which capability
+// is missing, while wrapping ErrUnsupported so errors.Is works uniformly.
+func errUnsupported(backend, op string) error {
+	return fmt.Errorf("%s: not supported by the %s backend: %w", op, backend, ErrUnsupported)
+}
 
 // DeadLetter is one event that the ingester could not persist into the
 // events table. It carries enough context (raw XDR + the error) for an

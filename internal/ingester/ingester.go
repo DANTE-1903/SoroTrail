@@ -41,6 +41,7 @@ import (
 	"github.com/sorotrail/sorotrail/internal/broadcast"
 	"github.com/sorotrail/sorotrail/internal/decode"
 	"github.com/sorotrail/sorotrail/internal/metrics"
+	"github.com/sorotrail/sorotrail/internal/requestid"
 	"github.com/sorotrail/sorotrail/internal/rpc"
 	"github.com/sorotrail/sorotrail/internal/store"
 )
@@ -377,6 +378,48 @@ type Ingester struct {
 	deadLetterStore DeadLetterSink
 	// skipContracts is the denylist map built from opts.SkipContracts for O(1) filtering.
 	skipContracts map[string]bool
+	// cycle accumulates the fetched/written/skipped counters for the
+	// current poll cycle's structured summary. runOnce resets it at the
+	// top of each cycle and logs it in a deferred call; the fields are
+	// atomic because the concurrent window-sweep goroutines increment it.
+	cycle cycleCounters
+}
+
+// cycleCounters holds the per-poll-cycle totals behind the structured
+// "poll cycle complete" summary line.
+type cycleCounters struct {
+	fetched atomic.Int64
+	written atomic.Int64
+	skipped atomic.Int64
+}
+
+func (c *cycleCounters) reset() {
+	c.fetched.Store(0)
+	c.written.Store(0)
+	c.skipped.Store(0)
+}
+
+func (c *cycleCounters) addFetched(n int) { c.fetched.Add(int64(n)) }
+func (c *cycleCounters) addWritten(n int) { c.written.Add(int64(n)) }
+func (c *cycleCounters) addSkipped(n int) { c.skipped.Add(int64(n)) }
+
+// logCycleSummary emits exactly one structured line per poll cycle with the
+// fetched/written/skipped counters, so an operator can follow ingestion
+// progress from a single line per cycle rather than reconstructing it from
+// per-batch lines. It runs on every exit path (including errors) so a failing
+// cycle is still visible in the summary stream.
+func (ing *Ingester) logCycleSummary(caughtUp bool, err error, dur time.Duration) {
+	attrs := []any{
+		"fetched", ing.cycle.fetched.Load(),
+		"written", ing.cycle.written.Load(),
+		"skipped", ing.cycle.skipped.Load(),
+		"caught_up", caughtUp,
+		"duration", dur,
+	}
+	if err != nil {
+		attrs = append(attrs, "error", err.Error())
+	}
+	ing.log.Info("poll cycle complete", attrs...)
 }
 
 type networkStateStore interface {
@@ -398,10 +441,13 @@ func New(client rpc.Client, st store.Store, dec decode.Decoder, log *slog.Logger
 		skipMap[id] = true
 	}
 	ing := &Ingester{
-		client:        client,
-		store:         st,
-		decoder:       dec,
-		log:           log,
+		client:  client,
+		store:   st,
+		decoder: dec,
+		// Stamp the ingester's stable job id on every line it emits, so a
+		// log stream identifies background work with the same field HTTP
+		// requests use for their request id.
+		log:           log.With(requestid.Field, requestid.JobIngester),
 		opts:          opts,
 		skipContracts: skipMap,
 		tracer:        noop.NewTracerProvider().Tracer("github.com/sorotrail/sorotrail/internal/ingester"),
@@ -525,6 +571,9 @@ func (ing *Ingester) backoffSleep(backoff time.Duration) time.Duration {
 // batch. There is no place in the loop where a partial state lands in
 // the store, so a tranquil Ctrl-C / SIGTERM never truncates a write.
 func (ing *Ingester) Run(ctx context.Context) (err error) {
+	// Carry the job id on the context too, so the store and RPC decorators
+	// tag their slow-query and error logs from this loop with "ingester".
+	ctx = requestid.WithJob(ctx, requestid.JobIngester)
 	ing.log.Info("ingester started", ing.opts.logAttrs()...)
 	defer func() {
 		if err != nil {
@@ -647,6 +696,16 @@ func (ing *Ingester) rescanForReorg(ctx context.Context) error {
 func (ing *Ingester) runOnce(ctx context.Context) (caughtUp bool, err error) {
 	ctx, span := ing.tracer.Start(ctx, "ingester.poll_cycle")
 	defer span.End()
+
+	// Reset and emit the structured per-cycle summary. The deferred log runs
+	// on every exit path (success or error) so each cycle emits exactly one
+	// "poll cycle complete" line.
+	ing.cycle.reset()
+	cycleStart := time.Now()
+	defer func() {
+		ing.logCycleSummary(caughtUp, err, time.Since(cycleStart))
+	}()
+
 	startLedger, cursor, err := ing.resolvePosition(ctx)
 	if err != nil {
 		return false, err
@@ -682,6 +741,7 @@ func (ing *Ingester) singlePage(ctx context.Context, startLedger uint32, cursor 
 		return false, fmt.Errorf("getEvents from ledger %d: %w", startLedger, err)
 	}
 
+	ing.cycle.addFetched(len(resp.Events))
 	if err := ing.persistEvents(ctx, resp.Events, resp.LatestLedger); err != nil {
 		return false, err
 	}
@@ -823,24 +883,39 @@ func (ing *Ingester) newCycleBudget() *atomic.Int64 {
 // Network returns the network this ingester is responsible for.
 func (ing *Ingester) Network() string { return ing.opts.Network }
 
+// nextState derives the persisted ingestion state from a single getEvents
+// page.
+//
+// Cursor discipline: the cursor only advances on real progress, i.e. on a page
+// that actually carried events. An empty page returns an empty cursor,
+// deliberately discarding any cursor the RPC attached to a zero-event
+// response: resuming from a cursor the RPC has already exhausted can wedge the
+// ingester on the same empty page forever. With no cursor saved,
+// resolvePosition falls back to the ledger path (LastIngestedLedger+1) on the
+// next cycle. The frontier advances to LatestLedger-1 so a caught-up loop does
+// not re-scan the same window, and the cycle reports caught up because there is
+// nothing new to ingest.
 func nextState(resp rpc.GetEventsResponse, pageLimit uint) (store.IngestionState, bool) {
 	caughtUp := uint(len(resp.Events)) < pageLimit
-
-	cursor := resp.Cursor
-	if cursor == "" && len(resp.Events) > 0 {
-		cursor = resp.Events[len(resp.Events)-1].CursorValue()
-	}
-
-	lastLedger := int64(resp.LatestLedger)
-	if len(resp.Events) > 0 {
-		lastLedger = int64(resp.Events[len(resp.Events)-1].Ledger)
-	}
-
 	now := time.Now().UTC()
-	if cursor != "" {
-		return store.IngestionState{LastIngestedLedger: lastLedger, LastCursor: cursor, LastSuccessfulPoll: &now}, caughtUp
+
+	if len(resp.Events) > 0 {
+		last := resp.Events[len(resp.Events)-1]
+		cursor := resp.Cursor
+		if cursor == "" {
+			cursor = last.CursorValue()
+		}
+		return store.IngestionState{
+			LastIngestedLedger: int64(last.Ledger),
+			LastCursor:         cursor,
+			LastSuccessfulPoll: &now,
+		}, caughtUp
 	}
-	return store.IngestionState{LastIngestedLedger: int64(resp.LatestLedger) - 1, LastSuccessfulPoll: &now}, caughtUp
+
+	return store.IngestionState{
+		LastIngestedLedger: int64(resp.LatestLedger) - 1,
+		LastSuccessfulPoll: &now,
+	}, true
 }
 
 // windowSweep ingests the ledger window [start, end] by paging each filter
@@ -987,6 +1062,7 @@ func (ing *Ingester) sweepBatch(ctx context.Context, ledgerOutOfRange *atomic.Bo
 		if err != nil {
 			return fmt.Errorf("getEvents sweep [%d,%d]: %w", start, end, err)
 		}
+		ing.cycle.addFetched(len(resp.Events))
 		if err := ing.persistEvents(ctx, resp.Events, resp.LatestLedger); err != nil {
 			return err
 		}
@@ -1055,6 +1131,7 @@ func (ing *Ingester) persistEvents(ctx context.Context, rpcEvents []rpc.Event, l
 	events := make([]store.Event, 0, len(rpcEvents))
 	for _, re := range rpcEvents {
 		if ing.skipContracts[re.ContractID] {
+			ing.cycle.addSkipped(1)
 			continue
 		}
 		ev, err := ing.toStoreEvent(re)
@@ -1082,6 +1159,7 @@ func (ing *Ingester) persistEvents(ctx context.Context, rpcEvents []rpc.Event, l
 				ing.log.Warn("dead-lettering failed", "event_id", re.ID, "error", derr)
 			}
 			cancel()
+			ing.cycle.addSkipped(1)
 			continue
 		}
 		events = append(events, ev)
@@ -1102,20 +1180,19 @@ func (ing *Ingester) persistEvents(ctx context.Context, rpcEvents []rpc.Event, l
 
 func (ing *Ingester) persistEventBatch(ctx context.Context, events []store.Event, throughLedger, latestLedger uint32) error {
 	persistCtx, persistSpan := ing.tracer.Start(ctx, "ingester.persist_events")
-	inserted, err := ing.writeEventsPersist(persistCtx, events)
+	_, err := ing.writeEventsPersist(persistCtx, events)
 	persistSpan.End()
 	if err != nil {
 		return err
 	}
+	ing.cycle.addWritten(len(events))
 
 	if err := ing.indexEventAddresses(ctx, events); err != nil {
 		ing.log.Error("indexing event addresses", "error", err)
 	}
 
-	ing.log.Info("ingested events",
-		"count", len(events), "new", inserted,
-		"through_ledger", throughLedger,
-		"latest_ledger", latestLedger)
+	// The per-batch "ingested events" line is superseded by the single
+	// per-cycle "poll cycle complete" summary logged by runOnce.
 
 	if ing.bcast != nil {
 		ing.bcast.Publish(ctx, events)
