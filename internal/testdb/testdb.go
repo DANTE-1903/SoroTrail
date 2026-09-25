@@ -15,7 +15,7 @@
 //
 // Never point TEST_DATABASE_URL at a database you care about — the
 // shared path truncates the events / ingestion_state / watched_contracts
-// / replay_state / audit_* tables.
+// / replay_state / dead_letters / audit_* tables.
 //
 // The cycle that this helper would otherwise create — package store
 // tests importing testdb while testdb imports store for store.Migrate —
@@ -160,7 +160,8 @@ func truncateAll(ctx context.Context, pool *pgxpool.Pool) error {
 		audit_state,
 		audit_findings,
 		watched_contracts,
-		replay_state
+		replay_state,
+		dead_letters
 		RESTART IDENTITY`)
 	if err != nil {
 		return fmt.Errorf("truncating tables: %w", err)
