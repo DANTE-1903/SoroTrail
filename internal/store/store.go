@@ -445,10 +445,12 @@ const (
 // be decoded for the requested sort. The API maps it to 400.
 var ErrInvalidContractsCursor = errors.New("invalid contracts cursor")
 
-// ErrUnsupported is returned by a backend that cannot serve an operation at
-// all, as opposed to one that merely found no data. Callers detect it with
-// errors.Is and map it to a clear status (501 or the backend's documented
-// fallback) rather than trusting the empty result.
+// ErrUnsupported is returned by a Store implementation for an operation it
+// deliberately does not implement. It exists so a backend can be honest about
+// its gaps: an unimplemented method returns this instead of a zero value that
+// reads as success, which is how a missing feature silently becomes an empty
+// 200. Callers detect it with errors.Is and map it to a clear status (501 or
+// the backend's documented fallback) rather than trusting the empty result.
 var ErrUnsupported = errors.New("operation not supported by this store backend")
 
 // errUnsupported builds a backend's explicit refusal for one operation. It
@@ -703,8 +705,9 @@ type Stats struct {
 	// directly or when no errors have occurred.
 	QueryErrors uint64 `json:"query_errors"`
 	// EventsIngestedTotal is the total number of events successfully
-	// persisted to the store since process start. Populated by the
-	// ingester; zero when the ingester is not wired.
+	// persisted to the store since process start, read from the
+	// sorotrail_events_ingested_total Prometheus counter. It resets across
+	// restarts, same as every other in-memory counter in this struct.
 	EventsIngestedTotal uint64 `json:"events_ingested_total"`
 	// PanicsRecovered is the number of panics the HTTP middleware has
 	// recovered since process start. Set by the API handler.
@@ -725,6 +728,10 @@ type Stats struct {
 	// Pruner counters are populated only when retention is configured;
 	// omitted from JSON when the pruner is a no-op.
 	Pruner PrunerStats `json:"pruner,omitempty"`
+	// Ingester surfaces adaptive-polling state (issue #146); populated
+	// only when an ingester is wired via api.SetIngester, omitted from
+	// JSON otherwise.
+	Ingester IngesterStats `json:"ingester,omitempty"`
 }
 
 // DecodeStats is a JSON-friendly view of spec-enrichment decode counters,
@@ -734,12 +741,6 @@ type Stats struct {
 type DecodeStats struct {
 	Decodes        uint64 `json:"decodes"`
 	DecodeFailures uint64 `json:"decode_failures"`
-	// Spec-cache counters are populated only when the API layer is given
-	// a spec cache; omitted from JSON otherwise.
-	SpecCache SpecCacheStats `json:"spec_cache,omitempty"`
-	// Pruner counters are populated only when retention is configured;
-	// omitted from JSON when the pruner is a no-op.
-	Pruner PrunerStats `json:"pruner,omitempty"`
 }
 
 // SpecCacheStats is a JSON-friendly view of spec.CacheStats. Defined here
@@ -757,6 +758,14 @@ type SpecCacheStats struct {
 type PrunerStats struct {
 	RunsCompleted   uint64 `json:"runs_completed"`
 	TotalRowsPurged int64  `json:"total_rows_purged"`
+}
+
+// IngesterStats is a JSON-friendly view of the ingester's adaptive
+// polling state (issue #146). EffectivePollIntervalMs follows the same
+// "_ms" millisecond-integer convention already used for durations in
+// this package (see DeliveryAttempt.DurationMs).
+type IngesterStats struct {
+	EffectivePollIntervalMs int64 `json:"effective_poll_interval_ms"`
 }
 
 // RPCErrorStats is a JSON-friendly snapshot of per-method RPC error counts.

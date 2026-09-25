@@ -327,7 +327,7 @@ func (p *Postgres) CreateTenantAPIKey(ctx context.Context, tenantID int64, name,
 	return k, nil
 }
 
-// CreateAPIKeyIfAbsent inserts the key unless its prefix is already present.
+// CreateTenantAPIKeyIfAbsent inserts the key unless its prefix is already present.
 // The digest is refreshed on conflict so that rotating the bootstrap value
 // in the environment actually takes effect, and revoked_at is cleared so a
 // restart with the key still configured restores it deliberately rather than
@@ -347,7 +347,7 @@ func (p *Postgres) CreateTenantAPIKeyIfAbsent(ctx context.Context, tenantID int6
 	return nil
 }
 
-// LookupAPIKey resolves a key prefix to its record, digest and tenant in one
+// LookupTenantAPIKey resolves a key prefix to its record, digest and tenant in one
 // round trip. Revoked keys are excluded here rather than checked by the
 // caller, so a forgotten check cannot resurrect a revoked credential.
 func (p *Postgres) LookupTenantAPIKey(ctx context.Context, prefix string) (TenantAPIKey, []byte, Tenant, error) {
@@ -378,7 +378,7 @@ func (p *Postgres) LookupTenantAPIKey(ctx context.Context, prefix string) (Tenan
 	return k, digest, t, nil
 }
 
-// TouchAPIKey records last use. Failures are the caller's to ignore: this is
+// TouchTenantAPIKey records last use. Failures are the caller's to ignore: this is
 // observability, and a write error here must not deny an otherwise valid
 // request.
 func (p *Postgres) TouchTenantAPIKey(ctx context.Context, id int64) error {

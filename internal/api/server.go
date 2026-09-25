@@ -18,8 +18,10 @@ import (
 
 	"github.com/sorotrail/sorotrail/internal/audit"
 	"github.com/sorotrail/sorotrail/internal/broadcast"
+	"github.com/sorotrail/sorotrail/internal/ingester"
 	"github.com/sorotrail/sorotrail/internal/metrics"
 	"github.com/sorotrail/sorotrail/internal/pruner"
+	"github.com/sorotrail/sorotrail/internal/requestid"
 	"github.com/sorotrail/sorotrail/internal/rpc"
 	"github.com/sorotrail/sorotrail/internal/store"
 )
@@ -76,6 +78,53 @@ func getAuditor() *audit.Auditor {
 	return auditor
 }
 
+// SetRPCCounter registers the CountingClient so /stats can expose
+// per-method RPC error totals. Call this before ListenAndServe.
+// The setter is guarded by a RWMutex so concurrent /stats readers
+// never observe a torn pointer.
+var (
+	rpcCounterMu sync.RWMutex
+	rpcCounter   *rpc.CountingClient
+)
+
+func SetRPCCounter(c *rpc.CountingClient) {
+	rpcCounterMu.Lock()
+	rpcCounter = c
+	rpcCounterMu.Unlock()
+}
+
+func getRPCCounter() *rpc.CountingClient {
+	rpcCounterMu.RLock()
+	defer rpcCounterMu.RUnlock()
+	return rpcCounter
+}
+
+// SetIngester registers the binary's Ingester so /stats can surface its
+// adaptive poll interval (issue #146). There is exactly one Ingester per
+// process, always constructed (even when INGESTION_LOCK_ENABLED causes
+// Run to be skipped on this instance) — main.go calls this unconditionally
+// right after building it.
+//
+// Like SetPruner this MUST be called BEFORE the API starts serving
+// requests, so the first /stats request observes a stable value rather
+// than a nil ingester.
+var (
+	ingesterMu sync.RWMutex
+	ing        *ingester.Ingester
+)
+
+func SetIngester(i *ingester.Ingester) {
+	ingesterMu.Lock()
+	ing = i
+	ingesterMu.Unlock()
+}
+
+func getIngester() *ingester.Ingester {
+	ingesterMu.RLock()
+	defer ingesterMu.RUnlock()
+	return ing
+}
+
 // SpecCacheStatsSource supplies spec-cache metrics for /stats. Mirrors
 // the SetAuditor pattern: one setter, called before ListenAndServe.
 // nil (the default) leaves the /stats spec_cache field omitted.
@@ -100,27 +149,6 @@ func getSpecCache() SpecCacheStatsSource {
 	return specCacheSource
 }
 
-// SetRPCCounter registers the CountingClient so /stats can expose
-// per-method RPC error totals. Call this before ListenAndServe.
-// The setter is guarded by a RWMutex so concurrent /stats readers
-// never observe a torn pointer.
-var (
-	rpcCounterMu sync.RWMutex
-	rpcCounter   *rpc.CountingClient
-)
-
-func SetRPCCounter(c *rpc.CountingClient) {
-	rpcCounterMu.Lock()
-	rpcCounter = c
-	rpcCounterMu.Unlock()
-}
-
-func getRPCCounter() *rpc.CountingClient {
-	rpcCounterMu.RLock()
-	defer rpcCounterMu.RUnlock()
-	return rpcCounter
-}
-
 // Enricher is the spec-based event enrichment interface used by the API.
 // Defined here so the API package doesn't import internal/spec directly.
 // DecodeStats lets /stats surface the enrichment decode failure rate when a
@@ -135,16 +163,16 @@ type Enricher interface {
 type Server struct {
 	store            store.Store
 	rpc              rpc.Client
-	enricher         Enricher
 	log              *slog.Logger
 	apiKey           string
 	limiter          *RateLimiter
 	bcast            *broadcast.Broadcaster
+	enricher         Enricher
+	enableMetrics    bool
 	recoverer        *Recoverer
 	metrics          *metrics.HTTPMetrics
 	tracer           trace.Tracer
 	retentionLedgers uint32
-	enableMetrics    bool
 
 	// apiKeyAuth turns on API key authentication for the write,
 	// streaming, subscription-management, and key-management routes.
@@ -615,8 +643,12 @@ func (s *Server) requestLogger(next http.Handler) http.Handler {
 		ww := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
 		start := time.Now()
 		reqID := middleware.GetReqID(r.Context())
-		log := s.log.With("request_id", reqID, "route", r.Method+" "+r.URL.Path)
+		log := s.log.With(requestid.Field, reqID, "route", r.Method+" "+r.URL.Path)
 		ctx := context.WithValue(r.Context(), loggerCtxKey, log)
+		// Mirror the id onto the context so layers below the router — the
+		// store and RPC decorators in particular — can tag their own slow-
+		// query and error logs without the handler passing it along.
+		ctx = requestid.WithRequestID(ctx, reqID)
 		ww.Header().Set("X-Request-ID", reqID)
 		next.ServeHTTP(ww, r.WithContext(ctx))
 		if span := trace.SpanFromContext(r.Context()); span.IsRecording() {
@@ -652,6 +684,20 @@ func loggerFromContext(ctx context.Context) *slog.Logger {
 		return slog.Default()
 	}
 	return log
+}
+
+// RequestIDFrom returns the correlatable request ID the request-ID
+// middleware installed on the context: either the client-supplied
+// X-Request-ID header value, or the generated "host/random-counter" ID
+// when the client sent none. Every log line for the request carries the
+// same value under the request_id key, and the same value is echoed in
+// the X-Request-ID response header.
+//
+// Handlers and middleware downstream of the router read the ID from here
+// (rather than re-parsing headers) so the context is the single source of
+// truth for correlation.
+func RequestIDFrom(ctx context.Context) string {
+	return middleware.GetReqID(ctx)
 }
 
 // SetGraphQLHandler mounts the GraphQL transport. handler serves /graphql;

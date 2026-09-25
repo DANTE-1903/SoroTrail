@@ -38,6 +38,148 @@ discrepancies.
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
+### Component diagram
+
+The same picture with the boundaries made explicit: what runs inside the
+process, what it talks to over the network, and what it owns on disk. Solid
+arrows are calls, dashed arrows are background paths that run on their own
+schedule.
+
+```mermaid
+flowchart TB
+    subgraph external["External systems"]
+        RPCEP["Stellar RPC<br/>(getEvents, getLedgerEntries)"]
+        CLIENT["API clients<br/>(HTTP, WebSocket, GraphQL)"]
+        HOOKS["Webhook subscribers"]
+    end
+
+    subgraph process["sorotrail process"]
+        direction TB
+        subgraph write["Write path"]
+            ING["ingester<br/>polling loop + cursor"]
+            DEC["decode<br/>ScVal → JSON"]
+        end
+        subgraph read["Read path"]
+            API["api<br/>chi router, scope, cache"]
+            ENR["spec<br/>spec-driven enrichment"]
+            BCAST["broadcast<br/>pub-sub fan-out"]
+        end
+        subgraph background["Background workers"]
+            AUD["audit<br/>census + repair"]
+            PRUNE["pruner<br/>retention"]
+            WH["webhook<br/>signed delivery"]
+        end
+        STORE["store<br/>store.Store interface"]
+    end
+
+    subgraph storage["Durable state"]
+        PG[("PostgreSQL<br/>partitioned events,<br/>raw XDR, replay_state")]
+    end
+
+    CLI["sorotrail replay<br/>(separate invocation)"]
+
+    RPCEP -->|"raw events"| ING
+    ING --> DEC
+    DEC -->|"decoded + raw XDR"| STORE
+    ING -.->|"publish"| BCAST
+    ING -.->|"notify"| WH
+    WH -.->|"POST"| HOOKS
+    BCAST -.->|"subscribe"| API
+
+    CLIENT -->|"requests"| API
+    API --> STORE
+    API --> ENR
+    ENR -->|"contract spec"| RPCEP
+    ENR --> STORE
+
+    AUD -.->|"re-fetch range"| RPCEP
+    AUD -.->|"census, findings"| STORE
+    AUD -.->|"reingest"| ING
+    PRUNE -.->|"delete past retention"| STORE
+
+    STORE <-->|"SQL"| PG
+    CLI -->|"re-decode stored XDR"| PG
+```
+
+Everything inside `sorotrail process` is wired through interfaces at
+`cmd/sorotrail`, which is why the write path, the read path and the
+background workers can each be tested against stubs. `sorotrail replay` is
+deliberately outside the box: it is its own invocation of the binary and
+reaches Postgres directly, never through the running process.
+
+### Request and ingest lifecycle
+
+How one event gets from the chain into a response, including the two places
+a client can be served without a fresh database read.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant RPC as Stellar RPC
+    participant Ing as Ingester
+    participant Dec as Decoder
+    participant PG as Postgres
+    participant API as HTTP API
+    participant C as Client
+
+    loop every POLL_INTERVAL (adaptive)
+        Ing->>RPC: getEvents(startLedger, cursor, filters)
+        RPC-->>Ing: page of events + cursor
+        Ing->>Dec: DecodeScVal(topics, value)
+        Dec-->>Ing: JSON + raw base64 XDR
+        Ing->>PG: UpsertEvents (idempotent, by primary key)
+        Ing->>PG: advance ingestion cursor (same tx)
+    end
+
+    C->>API: GET /events?contract_id=…&decoded=true
+    API->>PG: QueryEvents(filter)
+    PG-->>API: page + next cursor
+    opt ?decoded=true
+        API->>API: enrich against contract spec
+    end
+    API-->>C: 200 + X-Total-Count + cursor
+
+    Note over API,C: ?decoded=false skips enrichment and the<br/>SEP-41 envelope: stored columns, verbatim.
+
+    C->>API: GET /events/{id} (If-None-Match)
+    API-->>C: 304 Not Modified (immutable, no row read)
+```
+
+### Replay lifecycle
+
+Replay is the one path that writes to rows it did not ingest. Its batch
+boundary is what makes an interrupted run safe.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Op as Operator
+    participant R as sorotrail replay
+    participant PG as Postgres
+    participant Dec as Decoder
+
+    Op->>R: replay --from-ledger N [--dry-run]
+    R->>PG: pg_try_advisory_lock("SoroRepl")
+    alt lock not granted
+        PG-->>R: false
+        R-->>Op: "another replay is already running" (exit 1)
+    else lock granted
+        PG-->>R: true
+        loop until range exhausted or ^C
+            R->>PG: NextReplayBatch(range, batch-size)
+            PG-->>R: rows + raw XDR
+            R->>Dec: re-decode raw XDR
+            Dec-->>R: new decoded columns
+            R->>PG: CommitReplayBatch (changed rows + replay_state, one tx)
+        end
+        R-->>Op: summary (processed / changed / skipped / failed)
+    end
+```
+
+Progress and rewrites commit together, so a committed cursor can never run
+ahead of committed rewrites — the property the resume path depends on. See
+[replay.md](replay.md) for the operational workflow.
+
 ### Data flow
 
 ```mermaid
@@ -382,6 +524,7 @@ internal/replay
 
 No circular dependencies. Each package depends only on interfaces from its
 neighbors, so the whole graph is independently testable.
+
 ## Overview
 
 SoroTrail is a contract event indexer for the Stellar/Soroban network. It polls

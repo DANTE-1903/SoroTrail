@@ -152,10 +152,13 @@ SoroTrail is tested in CI against the following Postgres major versions:
 | `HORIZON_URL` | `https://horizon-testnet.stellar.org` | Stellar Horizon REST endpoint used by `sorotrail backfill` only. Live ingestion does not touch Horizon. |
 | `BACKFILL_RATE_RPS` | `10` | Pace against Horizon when backfilling. 10 req/s is the public-instance cap; private deployments can lift this. |
 | `DATABASE_URL` | — (required) | Postgres connection string. |
-| `POLL_INTERVAL` | `5s` | Sleep between polls once caught up. |
+| `POLL_INTERVAL` | `5s` | Sleep between polls once caught up. Also the adaptive-interval starting point; see `POLL_INTERVAL_MIN`/`POLL_INTERVAL_MAX`. |
+| `POLL_INTERVAL_MIN` | unset | Lower bound for the adaptive poll interval. Both this and `POLL_INTERVAL_MAX` unset (the default) disables adaptation entirely — the ingester always polls at exactly `POLL_INTERVAL`. See [Ingestion behavior additions](#ingestion-behavior-additions). |
+| `POLL_INTERVAL_MAX` | unset | Upper bound for the adaptive poll interval. See `POLL_INTERVAL_MIN`. |
 | `HTTP_ADDR` | `:8080` | API listen address. |
 | `HTTP_REQUEST_BODY_LIMIT` | `1048576` | Maximum HTTP request body size in bytes (1 MiB default). |
 | `WATCHED_CONTRACTS` | empty | Comma-separated contract IDs (`C...`). Empty = ingest **all** contract events. Each watched contract tracks its own resume cursor; adding a contract automatically triggers a backfill from `latest − RETENTION_LEDGERS` (clamped to RPC retention), independent of other contracts. |
+| `SKIP_CONTRACTS` | empty | Comma-separated contract IDs (`C...`) to never index events from. |
 | `START_LEDGER` | unset | Force cold-start ingestion from this ledger. |
 | `RETENTION_LEDGERS` | `17280` | Cold-start reach-back in ledgers (~24h at 5s/ledger). |
 | `RETENTION_AGE` | `0` (disabled) | Delete events older than this duration. `0` disables age-based pruning. |
@@ -628,10 +631,13 @@ It is batched, resumable (Ctrl-C and re-run picks up where it stopped),
 idempotent, and safe to run against a live database while ingestion
 continues; a Postgres advisory lock prevents two replays at once.
 
-See 
-docs/replay.md
- for flags, the summary output, the
+See [docs/replay.md](docs/replay.md) for the end-to-end workflow — sizing
+the job, dry-running it, spot-checking a single event, running it in chunks,
+and verifying the result — plus the flag reference, the summary output, the
 advisory-lock strategy, and the derivation order for dependent tables.
+
+When something goes wrong, [docs/troubleshooting.md](docs/troubleshooting.md)
+maps the common RPC, database, API and replay errors to their fixes.
 
 ## Compression
 
@@ -754,7 +760,80 @@ Shell
 | `cursor` | `0001234...` | Opaque pagination cursor from a previous response. |
 | `order` | `desc` | `asc` \| `desc`, defaults to asc. Sort direction. |
 | `order_by` | `created_at` | `id` \| `ledger` \| `created_at`, defaults to `id`. Sort column. Anything else is a `400`. |
-| `decoded` | `true` | When `true`, enriches events with spec-driven named fields. Contracts without a spec return flagged raw data with `"decoded": false`. |
+| `decoded` | `true` | `true` \| `false`. `true` enriches events with spec-driven named fields; contracts without a spec return flagged raw data with `"decoded": false`. `false` is the opt-out — see [Opting out of decoding](#opting-out-of-decoding). |
+
+#### Filter examples
+
+Every parameter in the table above is a query parameter on the same
+endpoint, so each filter is one copy-paste `curl` away. Replace the
+placeholder values (contract ID, hashes, addresses) with real ones.
+
+```sh
+# Contract: a single ID (a comma-separated list matches several at once)
+curl -s 'localhost:8080/events?contract_id=CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC&limit=5'
+
+# Event type: contract | system | diagnostic
+curl -s 'localhost:8080/events?type=contract&limit=5'
+
+# Only events from successful (true) or failed (false) calls
+curl -s 'localhost:8080/events?in_successful_call=true&limit=5'
+
+# Topic: exact match against any position
+curl -s 'localhost:8080/events?topic={"symbol":"transfer"}&limit=5'
+
+# Topic containment: events whose topics include an address
+curl -s 'localhost:8080/events?topic_contains=[{"address":"GA...5WI"}]&limit=5'
+
+# Position-specific topics: topic0..topic3
+curl -s 'localhost:8080/events?topic0={"symbol":"transfer"}&limit=5'
+curl -s 'localhost:8080/events?topic1={"address":"GABC..."}&limit=5'
+curl -s 'localhost:8080/events?topic2={"address":"GDEF..."}&limit=5'
+curl -s 'localhost:8080/events?topic3={"u64":7}&limit=5'
+
+# Transaction hash
+curl -s 'localhost:8080/events?tx_hash=9f5c7a2b...&limit=5'
+
+# Ledger range (inclusive on both ends)
+curl -s 'localhost:8080/events?from_ledger=250000&to_ledger=260000'
+
+# created_at range (RFC 3339, inclusive on both ends)
+curl -s 'localhost:8080/events?from_time=2026-07-21T00:00:00Z&to_time=2026-07-22T00:00:00Z'
+
+# Page size, then the next page via the cursor from the previous response
+curl -s 'localhost:8080/events?limit=50'
+curl -s 'localhost:8080/events?cursor=0001099511627776-0000000009&limit=50'
+
+# Sort direction and sort column
+curl -s 'localhost:8080/events?order=desc&limit=50'
+curl -s 'localhost:8080/events?order_by=created_at&order=desc&limit=50'
+
+# Rendering: skip spec enrichment, or include the raw base64 XDR
+curl -s 'localhost:8080/events?decoded=false&limit=5'
+curl -s 'localhost:8080/events?include_xdr=true&limit=5'
+```
+
+#### Opting out of decoding
+
+`?decoded=false` returns the stored event columns exactly as they are. No
+spec enrichment runs, and the additive `sep41_event` envelope the default
+rendering attaches to SEP-41 token events is omitted:
+
+```sh
+# Default: SEP-41 token events carry a normalized sep41_event envelope.
+curl -s 'localhost:8080/events?limit=1' | jq '.events[0] | keys'
+
+# Opt out: the raw stored topics/value, and nothing derived from them.
+curl -s 'localhost:8080/events?limit=1&decoded=false' | jq '.events[0] | keys'
+```
+
+Use it when you want byte-stable stored values — diffing two deployments,
+feeding a decoder of your own, or reproducing what a replay would read. The
+parameter is a three-way switch: `true` enriches, `false` opts out, and an
+absent (or unrecognised) value keeps the default rendering, so no existing
+client changes shape. It composes with `include_xdr=true`, which still
+projects `topics_xdr` / `value_xdr`, and is honoured on `/events`,
+`/events/{id}`, `/events/{id}/transaction`, and the `?stream=true` NDJSON
+path.
 
 Decode failures are surfaced, not dropped: when an event matches a spec but
 the spec-declared fields cannot be decoded (or the topics are malformed),
@@ -996,6 +1075,19 @@ memory usage stays bounded regardless of the ledger span.
 
 ### Ingestion behavior additions
 
+- **Adaptive polling** (`POLL_INTERVAL_MIN`/`POLL_INTERVAL_MAX`, both
+  unset by default): once caught up, a cycle that just observed backlog
+  (more data was available than one cycle fetched — a full page, or a
+  window sweep that didn't reach the chain head) halves the effective
+  poll interval toward `POLL_INTERVAL_MIN` so a burst gets followed up
+  on quickly; an idle cycle (fully caught up, nothing left to fetch)
+  grows it by 25% toward `POLL_INTERVAL_MAX` so a quiet chain isn't
+  polled needlessly often. The effective interval is always clamped into
+  `[POLL_INTERVAL_MIN, POLL_INTERVAL_MAX]` and is reported live at
+  `/stats` as `ingester.effective_poll_interval_ms`. Leaving both unset
+  collapses the range to a single point at `POLL_INTERVAL` — adaptation
+  becomes a no-op and the ingester behaves exactly as it did before this
+  existed.
 - **Parallel sweeps** (`SWEEP_CONCURRENCY`, default `1`): deployments
   watching more than the per-request 25 contracts split the filter set
   into multiple request chains paged through each `SweepWindow` ledger
@@ -1554,6 +1646,11 @@ events have been proven to match a fresh RPC fetch by the auditor. When
 AUDIT_ENABLED=false it stays at 0. See the Data integrity section
 below for the contract the field implies.
 
+`ingester.effective_poll_interval_ms` is the ingester's current adaptive
+poll interval (see [Adaptive polling](#ingestion-behavior-additions)),
+in milliseconds. With `POLL_INTERVAL_MIN`/`POLL_INTERVAL_MAX` unset it
+always equals `POLL_INTERVAL`.
+
 ### `GET /metrics`
 
 Serves `http_request_duration_seconds`, a Prometheus histogram of HTTP
@@ -2102,7 +2199,8 @@ to reinvent the same panels.
 | `sorotrail_ingest_errors_total` | Counter | Terminal ingestion pass failures (RPC, decode, DB). |
 | `sorotrail_rpc_call_duration_seconds` | Histogram | RPC call latency (HTTP round trip + parse). |
 | `sorotrail_db_write_duration_seconds` | Histogram | Database write latency (upsert, replace-in-range). |
-| `sorotrail_db_query_duration_seconds` | HistogramVec | Database query latency, labelled by `operation`. |
+| `sorotrail_db_query_duration_seconds` | HistogramVec | Store operation latency, labelled by `operation` (Store method name). |
+| `sorotrail_db_operations_total` | CounterVec | Store operations, labelled by `operation` and `outcome` (`success` \| `error`). |
 | `sorotrail_ingestion_lag_ledgers` | Gauge | Ledgers behind the chain head. |
 | `sorotrail_event_batch_writes_total` | Counter | UpsertEvents calls issued by the ingester. |
 | `sorotrail_event_batch_size` | Gauge | Current adaptive batch size per write. |

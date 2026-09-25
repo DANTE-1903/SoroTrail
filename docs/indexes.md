@@ -8,7 +8,7 @@ write, so each one earns its place by matching a query shape the endpoints
 actually issue.
 
 The table is partitioned by `ledger` (`PARTITION BY RANGE (ledger)`, see
-`0008_partition_events`). Indexes are declared on the partitioned parent and
+`0007_partition_events`). Indexes are declared on the partitioned parent and
 PostgreSQL clones them onto every child partition (both `events_default`
 and the runtime-created `events_<from>_<to>` children), so partition
 creation adds no index bookkeeping.

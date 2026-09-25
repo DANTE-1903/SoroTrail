@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/sorotrail/sorotrail/internal/metrics"
+	"github.com/sorotrail/sorotrail/internal/requestid"
 )
 
 // RetryConfig controls the retry/backoff behaviour applied to every RPC call
@@ -92,11 +93,16 @@ func (c *RetryClient) doWithRetry(ctx context.Context, method string, fn func(co
 			// first signal that the upstream is slow or throttling.
 			metrics.RPCRetriesTotal.WithLabelValues(method, source).Inc()
 			metrics.RPCBackoffSeconds.WithLabelValues(method).Add(wait.Seconds())
-			c.log().Debug("rpc retry scheduled",
+			// A retry means the upstream call failed; tagging the line with
+			// the request or job that asked for it lets an incident start
+			// from the client-visible failure and walk down to the RPC hop.
+			attrs := requestid.Attrs(ctx)
+			attrs = append(attrs,
 				"attempt", attempt,
 				"wait", wait.String(),
 				"source", source,
 				"error", err.Error())
+			c.log().Debug("rpc retry scheduled", attrs...)
 			if !sleepCtx(ctx, wait) {
 				return ctx.Err()
 			}

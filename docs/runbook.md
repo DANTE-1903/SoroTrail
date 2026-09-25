@@ -3,6 +3,10 @@
 Practical troubleshooting guide for running SoroTrail in production. Written
 for someone paged at 3 a.m. who has not read the source.
 
+Looking up one specific error message rather than working an incident? See
+[Troubleshooting](troubleshooting.md), which indexes the common RPC,
+database, API and replay errors by their text.
+
 ---
 
 ## Table of Contents

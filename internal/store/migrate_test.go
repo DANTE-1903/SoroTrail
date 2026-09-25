@@ -332,7 +332,7 @@ func TestMigrate_NoUpDropsTableDependency(t *testing.T) {
 // table. If so, the rebuild may have discarded those changes.
 //
 // This test runs without a database, so it catches the issue at build
-// time. 0008_partition_events is the worked example: it rebuilds the
+// time. 0007_partition_events is the worked example: it rebuilds the
 // events table, and the test verifies that no earlier migration had
 // ALTERed events in a way that 0008 would discard.
 func TestMigrate_NoUpRebuildsTableDependency(t *testing.T) {

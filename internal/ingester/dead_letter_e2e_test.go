@@ -1,6 +1,6 @@
 //go:build integration
 
-package ingester
+package ingester_test
 
 import (
 	"context"
@@ -69,11 +69,16 @@ func TestDeadLetterLifecycle_EndToEnd(t *testing.T) {
 	require.NoError(t, err)
 
 	// Wire up the API server to expose dead-letter endpoints.
-	handler := api.New(st, nil, slog.New(slog.NewTextHandler(io.Discard, nil)), "").Router()
+	// The dead-letter routes sit behind apiKeyAuth, which fails closed with
+	// 503 when no key is configured, so the server needs a real key and the
+	// requests below need to present it.
+	const testAPIKey = "test-api-key"
+	handler := api.New(st, nil, slog.New(slog.NewTextHandler(io.Discard, nil)), testAPIKey).Router()
 
 	// 3. Verify the entry is retrievable through the dead-letter endpoint.
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/dead-letters", nil)
+	req.Header.Set("X-API-Key", testAPIKey)
 	handler.ServeHTTP(rec, req)
 
 	require.Equal(t, http.StatusOK, rec.Code)
@@ -121,6 +126,7 @@ func TestDeadLetterLifecycle_EndToEnd(t *testing.T) {
 
 	recDel := httptest.NewRecorder()
 	reqDel := httptest.NewRequest(http.MethodGet, "/dead-letters", nil)
+	reqDel.Header.Set("X-API-Key", testAPIKey)
 	handler.ServeHTTP(recDel, reqDel)
 
 	require.Equal(t, http.StatusOK, recDel.Code)

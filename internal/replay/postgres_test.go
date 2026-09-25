@@ -126,7 +126,8 @@ func TestReplay_ImprovedDecoderRewritesStoredRows(t *testing.T) {
 		ctx := context.Background()
 
 		// 1. Seed events written by a stale decoder carrying unknown fallback format and raw XDR.
-		seedEvents(t, p, 3, true)
+		const seeded = 3
+		seedEvents(t, p, seeded, true)
 
 		// Verify the initial rows carry the stale unknown-type fallback in their decoded JSON.
 		initialGet, err := p.GetEvent(ctx, eventID(1), store.SystemScope())
@@ -163,7 +164,11 @@ func TestReplay_ImprovedDecoderRewritesStoredRows(t *testing.T) {
 		// 4. Test progress persistence across interruptions: progress is saved and bounds work correctly.
 		replayState, err := p.GetReplayState(ctx)
 		require.NoError(t, err)
-		assert.GreaterOrEqual(t, replayState.Processed, int64(100))
+		// Processed counts every row read in the range, across both passes
+		// above, so persisted progress must cover at least the seeded rows.
+		// The exact figure depends on how those passes batch, so assert the
+		// invariant rather than a literal that drifts when the seed changes.
+		assert.GreaterOrEqual(t, replayState.Processed, int64(seeded))
 	})
 }
 

@@ -32,7 +32,7 @@ func testTenantStore(t *testing.T) *Postgres {
 		`TRUNCATE tenant_usage, tenant_api_keys, tenant_watched_contracts,
 		          tenant_contract_grants, tenants RESTART IDENTITY CASCADE`)
 	require.NoError(t, err)
-	// Re-seed what migration 0008 inserts, since the truncate above removed it.
+	// Re-seed what migration 0016 inserts, since the truncate above removed it.
 	_, err = p.pool.Exec(context.Background(),
 		`INSERT INTO tenants (name, wildcard, is_admin, enabled)
 		 VALUES ('default', true, true, true)`)
@@ -368,7 +368,7 @@ func TestWatchingDoesNotGrantAccess(t *testing.T) {
 	assert.Empty(t, got)
 }
 
-func TestAPIKeys(t *testing.T) {
+func TestTenantAPIKeys(t *testing.T) {
 	p := testTenantStore(t)
 	ctx := context.Background()
 	tenant := mustTenant(t, p, "keyed")
@@ -422,7 +422,7 @@ func TestAPIKeys(t *testing.T) {
 }
 
 // The bootstrap path runs on every startup, so it must be idempotent.
-func TestCreateAPIKeyIfAbsent_IsIdempotent(t *testing.T) {
+func TestCreateTenantAPIKeyIfAbsent_IsIdempotent(t *testing.T) {
 	p := testTenantStore(t)
 	ctx := context.Background()
 	tenant := mustTenant(t, p, "bootstrapped")

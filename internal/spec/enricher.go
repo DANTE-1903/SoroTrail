@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"sync/atomic"
 
+	"golang.org/x/sync/singleflight"
+
 	"github.com/sorotrail/sorotrail/internal/store"
 )
 
@@ -25,6 +27,13 @@ type Enricher struct {
 	decodes        atomic.Uint64
 	decodeFailures atomic.Uint64
 	overrideStore  SpecOverrideStore
+
+	// fetchGroup collapses concurrent fetches for the same contract into
+	// one RPC round trip. Without it, a burst of requests that all land
+	// on the same uncached contract each independently fetch and parse
+	// the same Wasm blob — wasted RPC load that scales with request
+	// concurrency instead of with distinct contracts.
+	fetchGroup singleflight.Group
 }
 
 // SpecOverrideStore is the subset of store.Store needed to read
@@ -168,26 +177,32 @@ func (e *Enricher) getSpec(ctx context.Context, contractID string) *ContractSpec
 		return nil
 	}
 
-	// Attempt to fetch the spec (which will cache it).
-	spec, err := e.fetcher.FetchSpec(ctx, contractID)
-	if err != nil {
-		e.log.Warn("failed to fetch spec for contract",
-			"contract_id", contractID,
-			"error", err,
-		)
-		return nil
-	}
+	// fetchGroup.Do keys on contractID: concurrent misses for the same
+	// contract share one fetch, and every waiter gets that call's result
+	// (including a nil spec) rather than triggering its own RPC round trip.
+	v, _, _ := e.fetchGroup.Do(contractID, func() (any, error) {
+		spec, err := e.fetcher.FetchSpec(ctx, contractID)
+		if err != nil {
+			e.log.Warn("failed to fetch spec for contract",
+				"contract_id", contractID,
+				"error", err,
+			)
+			return (*ContractSpec)(nil), nil
+		}
 
-	if spec == nil || len(spec.Events) == 0 {
-		return nil
-	}
+		if spec == nil || len(spec.Events) == 0 {
+			return (*ContractSpec)(nil), nil
+		}
 
-	// Cache the spec for future lookups.
-	if err := e.cache.Set(ctx, spec); err != nil {
-		e.log.Warn("failed to cache spec", "contract_id", contractID, "error", err)
-	}
+		// Cache the spec for future lookups.
+		if err := e.cache.Set(ctx, spec); err != nil {
+			e.log.Warn("failed to cache spec", "contract_id", contractID, "error", err)
+		}
 
-	return spec
+		return spec, nil
+	})
+
+	return v.(*ContractSpec)
 }
 
 // overrideKey is the cache namespace for parsed user-supplied overrides.

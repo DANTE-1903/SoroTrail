@@ -36,7 +36,7 @@ func (e *stubEnricher) DecodeStats() store.DecodeStats { return store.DecodeStat
 // assertImmutable asserts that a response carries the immutable-cache
 // header set: strong ETag (when expected), Vary: Accept-Encoding,
 // Cache-Control: public + max-age + immutable.
-func assertImmutable(t *testing.T, resp *http.Response, wantETag string) {
+func assertImmutable(t *testing.T, resp testResponse, wantETag string) {
 	t.Helper()
 	assert.Equal(t, resp.Header.Get("Vary"), "Accept-Encoding", "Vary must include Accept-Encoding for future compression interplay")
 	cc := resp.Header.Get("Cache-Control")

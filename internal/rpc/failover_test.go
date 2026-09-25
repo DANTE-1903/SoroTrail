@@ -333,3 +333,141 @@ func TestFailover_HealthAndProbingHelpers(t *testing.T) {
 		fc.runProbes(ctx)
 	})
 }
+
+// newPickProviderClient builds a FailoverClient with one provider per state,
+// in priority order, so pickProvider can be driven without issuing calls.
+func newPickProviderClient(states []ProviderState) *FailoverClient {
+	urls := make([]string, len(states))
+	for i := range states {
+		urls[i] = fmt.Sprintf("http://rpc%d.example", i)
+	}
+	fc, _ := newFailoverTestClient(urls, WithFailoverLogger(testLogger()))
+	for i, s := range states {
+		fc.setProviderState(fc.providers[i], s)
+	}
+	return fc
+}
+
+// TestPickProvider_Table pins the selection rule: the highest-priority
+// active provider wins, a degraded provider is used only when nothing is
+// active, and down providers are never chosen. When nothing is usable,
+// including when no providers are configured, pickProvider must return
+// ErrAllProvidersDown and arm the backoff rather than panic or hand back
+// a nil provider with a nil error.
+func TestPickProvider_Table(t *testing.T) {
+	tests := []struct {
+		name    string
+		states  []ProviderState
+		wantIdx int // -1 means ErrAllProvidersDown
+	}{
+		{name: "single active provider", states: []ProviderState{StateActive}, wantIdx: 0},
+		{name: "single degraded provider is still served", states: []ProviderState{StateDegraded}, wantIdx: 0},
+		{name: "single down provider", states: []ProviderState{StateDown}, wantIdx: -1},
+		{name: "priority order among active providers", states: []ProviderState{StateActive, StateActive}, wantIdx: 0},
+		{name: "down provider is skipped", states: []ProviderState{StateDown, StateActive}, wantIdx: 1},
+		{name: "active preferred over higher-priority degraded", states: []ProviderState{StateDegraded, StateActive}, wantIdx: 1},
+		{name: "skips down and degraded to reach active", states: []ProviderState{StateDown, StateDegraded, StateActive}, wantIdx: 2},
+		{name: "degraded used when nothing is active", states: []ProviderState{StateDown, StateDegraded, StateDown}, wantIdx: 1},
+		{name: "first degraded wins when nothing is active", states: []ProviderState{StateDown, StateDegraded, StateDegraded}, wantIdx: 1},
+		{name: "all providers down", states: []ProviderState{StateDown, StateDown, StateDown}, wantIdx: -1},
+		{name: "no providers configured", states: nil, wantIdx: -1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fc := newPickProviderClient(tt.states)
+
+			var (
+				p   *provider
+				idx int
+				err error
+			)
+			require.NotPanics(t, func() { p, idx, err = fc.pickProvider(context.Background()) })
+
+			if tt.wantIdx < 0 {
+				require.ErrorIs(t, err, ErrAllProvidersDown)
+				assert.Nil(t, p)
+				assert.Equal(t, -1, idx)
+				assert.Equal(t, int32(1), fc.allDownCount.Load(), "an all-down episode must be counted")
+				assert.Greater(t, fc.allDownUntil.Load(), time.Now().UnixNano(), "backoff deadline must be in the future")
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantIdx, idx)
+			assert.Same(t, fc.providers[tt.wantIdx], p, "returned provider must match the returned index")
+			assert.Zero(t, fc.allDownUntil.Load(), "a successful pick must not arm the backoff")
+		})
+	}
+}
+
+// TestPickProvider_Selection covers how the choice moves over time. The
+// client is priority-based rather than round-robin by design: it pins to
+// the best healthy provider and advances only when that provider's health
+// changes, then returns to it once it recovers.
+func TestPickProvider_Selection(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("healthy provider is chosen on every call", func(t *testing.T) {
+		fc := newPickProviderClient([]ProviderState{StateActive, StateActive})
+		for range 5 {
+			_, idx, err := fc.pickProvider(ctx)
+			require.NoError(t, err)
+			assert.Equal(t, 0, idx)
+		}
+	})
+
+	t.Run("advances as providers fail and returns on recovery", func(t *testing.T) {
+		fc := newPickProviderClient([]ProviderState{StateActive, StateActive, StateActive})
+		steps := []struct {
+			change  func()
+			wantIdx int
+		}{
+			{change: func() {}, wantIdx: 0},
+			{change: func() { fc.setProviderState(fc.providers[0], StateDown) }, wantIdx: 1},
+			{change: func() { fc.setProviderState(fc.providers[1], StateDegraded) }, wantIdx: 2},
+			{change: func() { fc.setProviderState(fc.providers[0], StateActive) }, wantIdx: 0},
+		}
+		for i, s := range steps {
+			s.change()
+			_, idx, err := fc.pickProvider(ctx)
+			require.NoError(t, err, "step %d", i)
+			assert.Equal(t, s.wantIdx, idx, "step %d", i)
+		}
+	})
+
+	t.Run("backoff window refuses picks even if a provider recovers", func(t *testing.T) {
+		fc := newPickProviderClient([]ProviderState{StateDown})
+		_, _, err := fc.pickProvider(ctx)
+		require.ErrorIs(t, err, ErrAllProvidersDown)
+
+		// Recovery inside the window must not bypass the backoff, and the
+		// refused call must not count as a new all-down episode.
+		fc.setProviderState(fc.providers[0], StateActive)
+		p, idx, err := fc.pickProvider(ctx)
+		require.ErrorIs(t, err, ErrAllProvidersDown)
+		assert.Nil(t, p)
+		assert.Equal(t, -1, idx)
+		assert.Equal(t, int32(1), fc.allDownCount.Load())
+	})
+
+	t.Run("expired backoff is cleared and selection resumes", func(t *testing.T) {
+		fc := newPickProviderClient([]ProviderState{StateActive})
+		fc.allDownUntil.Store(time.Now().Add(-time.Second).UnixNano())
+
+		_, idx, err := fc.pickProvider(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, 0, idx)
+		assert.Zero(t, fc.allDownUntil.Load(), "expired deadline must be cleared")
+	})
+
+	t.Run("repeated all-down episodes grow the backoff count", func(t *testing.T) {
+		fc := newPickProviderClient([]ProviderState{StateDown})
+		for want := int32(1); want <= 3; want++ {
+			_, _, err := fc.pickProvider(ctx)
+			require.ErrorIs(t, err, ErrAllProvidersDown)
+			assert.Equal(t, want, fc.allDownCount.Load())
+			// Expire the window so the next call re-evaluates providers.
+			fc.allDownUntil.Store(time.Now().Add(-time.Nanosecond).UnixNano())
+		}
+	})
+}

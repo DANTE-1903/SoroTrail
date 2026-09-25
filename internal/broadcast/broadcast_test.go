@@ -167,3 +167,36 @@ func TestBroadcaster_ConcurrentPublish(t *testing.T) {
 		}
 	}
 }
+
+// TestBroadcaster_DisconnectDuringPublishDoesNotPanic covers the acceptance
+// criterion "a disconnect mid-publish does not panic": Publish reads its
+// subscriber list under Broadcaster.mu but sends to each subscriber's
+// channel outside that lock, so a concurrent Close (called from the
+// client's own goroutine, e.g. on a WebSocket read-loop exit) can race a
+// send on the same channel. Subscription.chMu (see broadcast.go) is what
+// makes close and send mutually exclusive; this test fails under -race,
+// or panics with "send on closed channel", if that synchronization
+// regresses.
+func TestBroadcaster_DisconnectDuringPublishDoesNotPanic(t *testing.T) {
+	const publishers = 8
+	const iterations = 200
+
+	for iter := 0; iter < iterations; iter++ {
+		b := New(1000)
+		sub := b.Subscribe(store.EventFilter{Scope: store.WildcardScope()})
+
+		var wg sync.WaitGroup
+		wg.Add(publishers + 1)
+		for g := 0; g < publishers; g++ {
+			go func(n int) {
+				defer wg.Done()
+				b.Publish(context.Background(), []store.Event{mkEvent(fmt.Sprintf("e%d", n), "CA", int64(n))})
+			}(g)
+		}
+		go func() {
+			defer wg.Done()
+			sub.Close()
+		}()
+		wg.Wait()
+	}
+}

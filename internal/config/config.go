@@ -66,20 +66,34 @@ type Config struct {
 	// public endpoint limit; raise it only against paid plans or
 	// self-hosted RPCs whose allowance actually permits it. Ignored while
 	// RPC_URLS is set (the failover path uses RPC_RATE_LIMIT_RPS).
-	RPCRateLimit float64 `env:"RPC_RATE_LIMIT" envDefault:"10"`
-	DatabaseURL  string  `env:"DATABASE_URL"`
+	RPCRateLimit float64       `env:"RPC_RATE_LIMIT" envDefault:"10"`
+	DatabaseURL  string        `env:"DATABASE_URL"`
+	PollInterval time.Duration `env:"POLL_INTERVAL" envDefault:"5s"`
+	// PollIntervalMin and PollIntervalMax bound the ingester's adaptive
+	// poll interval (issue #146): once caught up with the chain, the
+	// effective interval shrinks toward the min when backlog was just
+	// observed and grows toward the max on idle cycles, so a bursty
+	// chain gets polled quickly while a quiet one doesn't waste
+	// requests. Both default to 0, which the ingester treats as "no
+	// explicit bound — use POLL_INTERVAL", collapsing min == max ==
+	// POLL_INTERVAL. That makes the adaptive logic a no-op for any
+	// deployment that only sets POLL_INTERVAL, so existing deployments
+	// keep their exact pre-#146 fixed-interval behavior unless they
+	// opt in by setting these explicitly.
+	PollIntervalMin time.Duration `env:"POLL_INTERVAL_MIN"`
+	PollIntervalMax time.Duration `env:"POLL_INTERVAL_MAX"`
 	// DB pool sizing. Zero means "use the pgx default". These let an operator
 	// bound the Postgres connection pool without a code redeploy.
 	DBMaxConns        int32         `env:"DB_MAX_CONNS" envDefault:"0"`
 	DBMinConns        int32         `env:"DB_MIN_CONNS" envDefault:"0"`
 	DBMaxConnLifetime time.Duration `env:"DB_MAX_CONN_LIFETIME" envDefault:"0"`
 	DBMaxConnIdleTime time.Duration `env:"DB_MAX_CONN_IDLE_TIME" envDefault:"0"`
-	PollInterval      time.Duration `env:"POLL_INTERVAL" envDefault:"5s"`
 	// HTTPAddr is the address the HTTP server listens on (host:port), e.g.
 	// ":8080" or "0.0.0.0:9090". See HTTP_ADDR in .env.example. It must be a
 	// valid host:port pair.
 	HTTPAddr              string        `env:"HTTP_ADDR" envDefault:":8080"`
 	WatchedContracts      []string      `env:"WATCHED_CONTRACTS"`
+	SkipContracts         []string      `env:"SKIP_CONTRACTS"`
 	StartLedger           uint32        `env:"START_LEDGER"`
 	StartLedgerRaw        string        `env:"START_LEDGER_RAW"`
 	RetentionLedgers      uint32        `env:"RETENTION_LEDGERS" envDefault:"17280"`
@@ -204,9 +218,9 @@ type Config struct {
 	// authentication"). Defaults to false so existing deployments see no
 	// behavior change. Keys are created/revoked via `sorotrail apikey`
 	// or the /apikeys endpoints.
-	APIKeyAuthEnabled bool `env:"API_KEY_AUTH_ENABLED" envDefault:"false"`
-	HourlyQuota           int64   `env:"HOURLY_QUOTA"`
-	DailyQuota            int64   `env:"DAILY_QUOTA"`
+	APIKeyAuthEnabled bool  `env:"API_KEY_AUTH_ENABLED" envDefault:"false"`
+	HourlyQuota       int64 `env:"HOURLY_QUOTA"`
+	DailyQuota        int64 `env:"DAILY_QUOTA"`
 
 	// CompressMinSize is the response body size, in bytes, at or above which
 	// responses are gzip/deflate encoded for clients that advertise support.
@@ -366,6 +380,7 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("parsing environment: %w", err)
 	}
 	cfg.WatchedContracts = cleanContractList(cfg.WatchedContracts)
+	cfg.SkipContracts = cleanContractList(cfg.SkipContracts)
 	cfg.RPCURLS = cleanContractList(cfg.RPCURLS)
 	cfg.CORSAllowedOrigins = cleanOrigins(cfg.CORSAllowedOrigins)
 	cfg.Network = strings.ToLower(strings.TrimSpace(cfg.Network))
@@ -503,6 +518,16 @@ func (c Config) Validate() error {
 	if c.PollInterval <= 0 {
 		return fmt.Errorf("POLL_INTERVAL must be positive, got %s", c.PollInterval)
 	}
+	if c.PollIntervalMin < 0 {
+		return fmt.Errorf("POLL_INTERVAL_MIN must be non-negative, got %s", c.PollIntervalMin)
+	}
+	if c.PollIntervalMax < 0 {
+		return fmt.Errorf("POLL_INTERVAL_MAX must be non-negative, got %s", c.PollIntervalMax)
+	}
+	if c.PollIntervalMin > 0 && c.PollIntervalMax > 0 && c.PollIntervalMin > c.PollIntervalMax {
+		return fmt.Errorf("POLL_INTERVAL_MIN (%s) must be <= POLL_INTERVAL_MAX (%s)",
+			c.PollIntervalMin, c.PollIntervalMax)
+	}
 	if c.APIQueryTimeout <= 0 {
 		return fmt.Errorf("API_QUERY_TIMEOUT must be positive, got %s", c.APIQueryTimeout)
 	}
@@ -537,6 +562,11 @@ func (c Config) Validate() error {
 	for _, id := range c.WatchedContracts {
 		if !ValidContractID(id) {
 			return fmt.Errorf("WATCHED_CONTRACTS entry %q is not a valid contract ID (want C... strkey, 56 chars)", id)
+		}
+	}
+	for _, id := range c.SkipContracts {
+		if !ValidContractID(id) {
+			return fmt.Errorf("SKIP_CONTRACTS entry %q is not a valid contract ID (want C... strkey, 56 chars)", id)
 		}
 	}
 	if c.AuditPollInterval <= 0 {
@@ -855,8 +885,11 @@ func (c Config) LoggableFields() []any {
 		"rpc_rate_limit", c.RPCRateLimit,
 		"database_url", dbURL,
 		"poll_interval", c.PollInterval,
+		"poll_interval_min", c.PollIntervalMin,
+		"poll_interval_max", c.PollIntervalMax,
 		"http_addr", c.HTTPAddr,
 		"watched_contracts", len(c.WatchedContracts),
+		"skip_contracts", len(c.SkipContracts),
 		"start_ledger", c.StartLedger,
 		"start_ledger_raw", c.StartLedgerRaw,
 		"retention_ledgers", c.RetentionLedgers,

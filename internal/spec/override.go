@@ -34,10 +34,10 @@ import (
 func ParseOverrideSpec(data []byte) (*ContractSpec, error) {
 	var raw struct {
 		Events []struct {
-			Name       string       `json:"name"`
-			Doc        string       `json:"doc"`
-			TopicSpecs []FieldSpec  `json:"topic_specs"`
-			ValueSpec  *FieldSpec   `json:"value_spec"`
+			Name       string      `json:"name"`
+			Doc        string      `json:"doc"`
+			TopicSpecs []FieldSpec `json:"topic_specs"`
+			ValueSpec  *FieldSpec  `json:"value_spec"`
 		} `json:"events"`
 	}
 

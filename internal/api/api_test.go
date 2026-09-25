@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel"
@@ -23,6 +24,9 @@ import (
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
 	"github.com/sorotrail/sorotrail/internal/buildinfo"
+	"github.com/sorotrail/sorotrail/internal/decode"
+	"github.com/sorotrail/sorotrail/internal/ingester"
+	"github.com/sorotrail/sorotrail/internal/metrics"
 	"github.com/sorotrail/sorotrail/internal/rpc"
 	"github.com/sorotrail/sorotrail/internal/store"
 )
@@ -196,23 +200,6 @@ func (s *stubStore) AggregateEvents(_ context.Context, f store.EventFilter, buck
 	s.lastAggregateFilter = f
 	return s.aggregateBuckets, s.aggregateErr
 }
-
-// API key stubs — the single-tenant key-management endpoints are unused by
-// most API tests, but store.Store requires them.
-func (s *stubStore) CreateAPIKey(_ context.Context, k store.APIKey) (store.APIKey, error) {
-	k.ID = 1
-	return k, nil
-}
-func (s *stubStore) GetAPIKey(context.Context, int64) (store.APIKey, error) {
-	return store.APIKey{}, store.ErrNotFound
-}
-func (s *stubStore) LookupAPIKeyByPrefix(context.Context, string) (store.APIKey, error) {
-	return store.APIKey{}, store.ErrNotFound
-}
-func (s *stubStore) ListAPIKeys(context.Context) ([]store.APIKey, error) {
-	return nil, nil
-}
-func (s *stubStore) RevokeAPIKey(context.Context, int64) error { return nil }
 
 // LedgerRangeCensus, ReplaceEventsInRange, and the audit_state/findings
 // methods are unused by API tests but needed to satisfy store.Store now.
@@ -406,6 +393,22 @@ func (s *stubStore) UpsertEvents(context.Context, []store.Event) (int64, error) 
 	return 0, nil
 }
 
+func (s *stubStore) CreateAPIKey(context.Context, store.APIKey) (store.APIKey, error) {
+	return store.APIKey{}, nil
+}
+func (s *stubStore) GetAPIKey(context.Context, int64) (store.APIKey, error) {
+	return store.APIKey{}, nil
+}
+func (s *stubStore) LookupAPIKeyByPrefix(context.Context, string) (store.APIKey, error) {
+	return store.APIKey{}, nil
+}
+func (s *stubStore) ListAPIKeys(context.Context) ([]store.APIKey, error) {
+	return nil, nil
+}
+func (s *stubStore) RevokeAPIKey(context.Context, int64) error {
+	return nil
+}
+
 func (s *stubStore) GetContractCursor(_ context.Context, contractID string) (store.ContractCursor, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -476,20 +479,30 @@ func newTestServer(st *stubStore, rc *stubRPC) *Server {
 	return newTestServerWithKey(st, rc, "test-key")
 }
 
+// testResponse carries the parts of an HTTP response the test helpers'
+// callers actually inspect: the status and headers. The helpers drain and
+// close the body themselves before returning, so exposing *http.Response
+// would both hand callers a dead body and make bodyclose flag every call
+// site as a leak it cannot see through.
+type testResponse struct {
+	StatusCode int
+	Header     http.Header
+}
+
 // doGet performs a GET request against the test server.
-func doGet(t *testing.T, s *Server, path string) (*http.Response, []byte) {
+func doGet(t *testing.T, s *Server, path string) (testResponse, []byte) {
 	t.Helper()
 	return doGetWithHeader(t, s, path, "", "")
 }
 
 // doGetWithAuth performs a GET against the test server with an api-key
 // header, for the API_KEY-gated admin endpoints.
-func doGetWithAuth(t *testing.T, s *Server, path, apiKey string) (*http.Response, []byte) {
+func doGetWithAuth(t *testing.T, s *Server, path, apiKey string) (testResponse, []byte) {
 	t.Helper()
 	return doGetWithHeader(t, s, path, "X-Api-Key", apiKey)
 }
 
-func doGetWithHeader(t *testing.T, s *Server, path, key, value string) (*http.Response, []byte) {
+func doGetWithHeader(t *testing.T, s *Server, path, key, value string) (testResponse, []byte) {
 	t.Helper()
 	srv := httptest.NewServer(s.Router())
 	defer srv.Close()
@@ -503,7 +516,7 @@ func doGetWithHeader(t *testing.T, s *Server, path, key, value string) (*http.Re
 	body, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
 	resp.Body.Close()
-	return resp, body
+	return testResponse{StatusCode: resp.StatusCode, Header: resp.Header}, body
 }
 
 const testContract = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
@@ -1611,6 +1624,61 @@ func TestStats(t *testing.T) {
 		assert.Nil(t, raw["ingest_lag_ledgers"])
 		assert.Equal(t, uint64(0), got.QueryErrors, "query_errors should be present and zero")
 	})
+}
+
+// TestStats_IngesterEffectivePollInterval covers issue #146's acceptance
+// criterion "expose the current effective interval in /stats": once an
+// Ingester is registered via SetIngester, /stats must surface its live
+// adaptive poll interval, and must omit it (zero value) when none is
+// registered.
+func TestStats_IngesterEffectivePollInterval(t *testing.T) {
+	t.Cleanup(func() { SetIngester(nil) })
+
+	st := &stubStore{}
+	rc := &stubRPC{health: rpc.Health{Status: "healthy"}}
+
+	t.Run("absent when no ingester registered", func(t *testing.T) {
+		SetIngester(nil)
+		resp, body := doGet(t, newTestServer(st, rc), "/stats")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		var got store.Stats
+		require.NoError(t, json.Unmarshal(body, &got))
+		assert.Zero(t, got.Ingester.EffectivePollIntervalMs)
+	})
+
+	t.Run("reflects the registered ingester's live interval", func(t *testing.T) {
+		ing := ingester.New(nil, nil, decode.XDRDecoder{}, slog.New(slog.NewTextHandler(io.Discard, nil)), ingester.Options{
+			PollInterval:    5 * time.Second,
+			PollIntervalMin: time.Second,
+			PollIntervalMax: 30 * time.Second,
+		})
+		SetIngester(ing)
+
+		resp, body := doGet(t, newTestServer(st, rc), "/stats")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		var got store.Stats
+		require.NoError(t, json.Unmarshal(body, &got))
+		assert.Equal(t, int64(5000), got.Ingester.EffectivePollIntervalMs)
+	})
+}
+
+// TestStats_EventsIngestedTotal covers issue #536: /stats must surface the
+// cumulative count of events the ingester has persisted, read from the
+// Prometheus counter metrics.EventsIngested, rather than permanently
+// reporting zero.
+func TestStats_EventsIngestedTotal(t *testing.T) {
+	before := testutil.ToFloat64(metrics.EventsIngested)
+	metrics.EventsIngested.Add(7)
+
+	st := &stubStore{}
+	rc := &stubRPC{health: rpc.Health{Status: "healthy"}}
+
+	resp, body := doGet(t, newTestServer(st, rc), "/stats")
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	var got store.Stats
+	require.NoError(t, json.Unmarshal(body, &got))
+	assert.Equal(t, uint64(before)+7, got.EventsIngestedTotal,
+		"events_ingested_total must reflect the live Prometheus counter, not stay at zero")
 }
 
 // TestStats_Cache verifies the /stats TTL cache end-to-end: repeated calls

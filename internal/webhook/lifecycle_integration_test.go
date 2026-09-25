@@ -55,8 +55,8 @@ func TestWebhookSubscriptionLifecycle_EndToEnd(t *testing.T) {
 
 	// Matching event
 	event := store.Event{
-		ID:                "100-0",
-		ContractID:        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+		ID:               "100-0",
+		ContractID:       "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
 		Ledger:           100,
 		Type:             "contract",
 		TxHash:           "deadbeef",
@@ -79,7 +79,7 @@ func TestWebhookSubscriptionLifecycle_EndToEnd(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	attempts, err := st.ListDeliveryAttempts(ctx, sub.ID, 10, store.SubscriptionOwner{})
+	attempts, err := st.ListDeliveryAttempts(ctx, sub.ID, 10, store.AllSubscriptions())
 	require.NoError(t, err)
 	require.Len(t, attempts, 1)
 	assert.Equal(t, store.DeliverySuccess, attempts[0].Status)
@@ -87,8 +87,8 @@ func TestWebhookSubscriptionLifecycle_EndToEnd(t *testing.T) {
 
 	// ── 2. A non-matching event producing no delivery ──
 	nonMatchingEvent := store.Event{
-		ID:                "101-0",
-		ContractID:        "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+		ID:               "101-0",
+		ContractID:       "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
 		Ledger:           101,
 		Type:             "contract",
 		TxHash:           "feedface",
@@ -101,7 +101,7 @@ func TestWebhookSubscriptionLifecycle_EndToEnd(t *testing.T) {
 	require.NoError(t, err)
 
 	// Filtering checks ensure subscriptions with specific contract IDs skip non-matching events
-	retrievedSub, err := st.GetSubscription(ctx, sub.ID, store.SubscriptionOwner{})
+	retrievedSub, err := st.GetSubscription(ctx, sub.ID, store.AllSubscriptions())
 	require.NoError(t, err)
 	assert.Equal(t, "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", retrievedSub.Filters.ContractID)
 
@@ -111,25 +111,33 @@ func TestWebhookSubscriptionLifecycle_EndToEnd(t *testing.T) {
 		Scope: scope,
 	})
 	require.NoError(t, err)
-	assert.Empty(t, eventsForTenant, "tenant scope restricted to contract B must not see contract A events")
+	require.Len(t, eventsForTenant, 1, "the scope sees contract B's event and nothing else")
+	assert.Equal(t, nonMatchingEvent.ID, eventsForTenant[0].ID,
+		"tenant scope restricted to contract B must not see contract A events")
 
 	// ── 4. Failures incrementing the counter and triggering backoff ──
+	// The third argument is the threshold at which the subscription is
+	// disabled, not the amount to add: each call increments by exactly one.
 	newCount, disabled, err := st.IncrementSubscriptionFailures(ctx, sub.ID, 3)
 	require.NoError(t, err)
-	assert.Equal(t, 3, newCount)
-	assert.False(t, disabled, "3 failures should not disable subscription yet")
+	assert.Equal(t, 1, newCount)
+	assert.False(t, disabled, "one failure is below the threshold of 3")
 
-	// ── 5. Persistent failure disabling or backing off as designed ──
-	// Increment beyond threshold or simulate consecutive failures
-	_, disabled, err = st.IncrementSubscriptionFailures(ctx, sub.ID, 10)
+	// ── 5. Persistent failure disabling the subscription ──
+	newCount, disabled, err = st.IncrementSubscriptionFailures(ctx, sub.ID, 3)
 	require.NoError(t, err)
-	// Depending on implementation, further failures or specific threshold marks it disabled
-	_ = disabled
+	assert.Equal(t, 2, newCount)
+	assert.False(t, disabled, "two failures is still below the threshold")
+
+	newCount, disabled, err = st.IncrementSubscriptionFailures(ctx, sub.ID, 3)
+	require.NoError(t, err)
+	assert.Equal(t, 3, newCount)
+	assert.True(t, disabled, "reaching the threshold disables the subscription")
 
 	// ── 6. Deletion stopping delivery immediately ──
-	err = st.DeleteSubscription(ctx, sub.ID, store.SubscriptionOwner{})
+	err = st.DeleteSubscription(ctx, sub.ID, store.AllSubscriptions())
 	require.NoError(t, err)
 
-	_, err = st.GetSubscription(ctx, sub.ID, store.SubscriptionOwner{})
+	_, err = st.GetSubscription(ctx, sub.ID, store.AllSubscriptions())
 	assert.ErrorIs(t, err, store.ErrNotFound, "deleted subscription must no longer exist or be fetchable")
 }

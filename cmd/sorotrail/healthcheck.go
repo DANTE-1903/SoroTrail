@@ -3,8 +3,6 @@ package main
 import (
 	"flag"
 	"fmt"
-	"io"
-	"net/http"
 	"os"
 	"strings"
 	"time"
@@ -102,51 +100,10 @@ flags:
 	target := resolveHealthcheckAddr(*addrFlag)
 	url := "http://" + target + *endpoint
 
-	client := &http.Client{Timeout: *timeout}
-	// We deliberately don't follow redirects: /health is a fixed
-	// local path, and a 3xx would mean the indexer is misconfigured,
-	// not "the answer is elsewhere". Following a redirect could mask
-	// a real misconfiguration behind a successful probe.
-	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-		return http.ErrUseLastResponse
-	}
-
-	req, err := http.NewRequest(http.MethodGet, url, nil)
-	if err != nil {
-		// Only malformed URLs hit this path; we constructed url
-		// ourselves, so it's effectively unreachable in practice,
-		// but we still surface the error cleanly.
-		fmt.Fprintf(os.Stderr, "healthcheck: build request: %v\n", err)
-		return 1
-	}
-	req.Header.Set("User-Agent", "sorotrail-healthcheck/1")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		// Connection refused (server not listening yet), timeout
-		// (probe hung), DNS failure (broken --addr). All are
-		// "not healthy right now" — same exit code, terse message
-		// so `docker inspect` shows a useful one-liner without an
-		// avalanche of stack frames.
-		fmt.Fprintf(os.Stderr, "healthcheck: probe %s failed: %v\n", url, err)
-		return 1
-	}
-	defer resp.Body.Close()
-	// Drain a bounded prefix so the connection can be reused by
-	// the keep-alive pool. /health responses are tiny (a small
-	// JSON envelope) but we cap the read rather than reading
-	// until EOF, so a malicious or misbehaving server can't pin
-	// the process open after we've already decided the probe's
-	// outcome from the status line.
-	_, _ = io.CopyN(io.Discard, resp.Body, 4096)
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		fmt.Fprintf(os.Stderr,
-			"healthcheck: probe %s returned status %d\n",
-			url, resp.StatusCode)
-		return 1
-	}
-	return 0
+	// The probe itself lives in probeEndpoint (health.go), shared with
+	// the `sorotrail health` subcommand — same semantics, same exit
+	// codes, only the label on stderr messages differs.
+	return probeEndpoint("healthcheck", url, *timeout)
 }
 
 // resolveHealthcheckAddr picks the probe target from (in order):

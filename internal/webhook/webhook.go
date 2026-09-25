@@ -22,6 +22,7 @@ import (
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
 
+	"github.com/sorotrail/sorotrail/internal/requestid"
 	"github.com/sorotrail/sorotrail/internal/store"
 )
 
@@ -82,10 +83,12 @@ func NewNotifier(st store.Store, log *slog.Logger) *Notifier {
 	queue := make(chan deliveryTask, WorkerQueueSize)
 	client := &http.Client{Timeout: DeliveryTimeout}
 	n := &Notifier{
-		store:       st,
-		queue:       queue,
-		sendOnly:    queue,
-		log:         log,
+		store:    st,
+		queue:    queue,
+		sendOnly: queue,
+		// Deliveries are background work; tagging their log lines with a
+		// stable job id keeps the correlation field meaningful for them too.
+		log:         log.With(requestid.Field, requestid.JobWebhook),
 		client:      client,
 		maxAttempts: MaxDeliveryAttempts,
 		backoffFunc: backoffDuration,
@@ -140,6 +143,9 @@ func (n *Notifier) NotifyEvents(ctx context.Context, events []store.Event) {
 // Run starts the worker pool and blocks until ctx is cancelled. Workers
 // drain the delivery queue and POST events to subscriber URLs.
 func (n *Notifier) Run(ctx context.Context) {
+	// Carry the job id on the context so delivery-time store writes are
+	// tagged with "webhook" in their slow-query logs.
+	ctx = requestid.WithJob(ctx, requestid.JobWebhook)
 	n.log.Info("webhook delivery workers starting",
 		"workers", NumWorkers, "queue_size", WorkerQueueSize)
 	for i := 0; i < NumWorkers; i++ {

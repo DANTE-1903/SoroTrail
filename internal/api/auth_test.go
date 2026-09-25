@@ -111,8 +111,11 @@ func newAuthServer(st store.Store, enabled bool) *Server {
 	return s
 }
 
-// doReq runs a request against the server and returns the response.
-func doReq(t *testing.T, s *Server, method, path, body string, headers map[string]string) (*http.Response, []byte) {
+// doReq runs a request against the server and returns the drained
+// testResponse rather than a *http.Response with a dead body; the helper
+// consumes and closes the body itself so bodyclose can see the response
+// is fully handled.
+func doReq(t *testing.T, s *Server, method, path, body string, headers map[string]string) (testResponse, []byte) {
 	t.Helper()
 	srv := httptest.NewServer(s.Router())
 	defer srv.Close()
@@ -126,7 +129,7 @@ func doReq(t *testing.T, s *Server, method, path, body string, headers map[strin
 	rb, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
 	resp.Body.Close()
-	return resp, rb
+	return testResponse{StatusCode: resp.StatusCode, Header: resp.Header}, rb
 }
 
 // --- Auth disabled: existing behavior is preserved ---
@@ -147,6 +150,7 @@ func TestAuth_DisabledKeepsWritesOpen(t *testing.T) {
 	defer srv.Close()
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "/events/ws"
 	_, respWS, err := websocket.Dial(ctx, wsURL, nil)
+	drainWSResp(respWS)
 	require.Error(t, err)
 	require.NotNil(t, respWS)
 	assert.Equal(t, http.StatusNotImplemented, respWS.StatusCode, "streaming must not require a key when auth is off")
@@ -199,6 +203,7 @@ func TestAuth_EnabledGatesWebSocket(t *testing.T) {
 
 	// Without a key the upgrade is rejected with 401.
 	_, resp, err := websocket.Dial(ctx, wsURL, nil)
+	drainWSResp(resp)
 	require.Error(t, err)
 	require.NotNil(t, resp)
 	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
@@ -208,6 +213,7 @@ func TestAuth_EnabledGatesWebSocket(t *testing.T) {
 	key := st.addKey(t, "streamer")
 	hdr := http.Header{"Authorization": {"Bearer " + key}}
 	_, resp, err = websocket.Dial(ctx, wsURL, &websocket.DialOptions{HTTPHeader: hdr})
+	drainWSResp(resp)
 	require.Error(t, err)
 	require.NotNil(t, resp)
 	assert.Equal(t, http.StatusNotImplemented, resp.StatusCode)

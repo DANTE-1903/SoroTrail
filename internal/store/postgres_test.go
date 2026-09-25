@@ -32,6 +32,67 @@ func testStore(t *testing.T) *Postgres {
 	return testStoreWithPartitionSpan(t, int64(DefaultEventPartitionSpan))
 }
 
+func TestFrontierStats(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+
+	tests := []struct {
+		name         string
+		seed         bool
+		useScope     bool
+		wantIngested int64
+		wantVerified int64
+	}{
+		{
+			name:         "populated store reports both frontiers",
+			seed:         true,
+			wantIngested: 120,
+			wantVerified: 115,
+		},
+		{
+			name:         "empty store coalesces null aggregates to zero",
+			wantIngested: 0,
+			wantVerified: 0,
+		},
+		{
+			name:         "frontiers remain available for an explicit empty scope",
+			seed:         true,
+			useScope:     true,
+			wantIngested: 120,
+			wantVerified: 115,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := st.pool.Exec(ctx, `TRUNCATE ingestion_state, audit_state`)
+			require.NoError(t, err)
+			if tt.seed {
+				_, err = st.pool.Exec(ctx, `
+					INSERT INTO ingestion_state (network, last_ingested_ledger)
+					VALUES ('default', $1)
+					ON CONFLICT (network) DO UPDATE SET last_ingested_ledger = EXCLUDED.last_ingested_ledger`, tt.wantIngested)
+				require.NoError(t, err)
+				_, err = st.pool.Exec(ctx, `
+					INSERT INTO audit_state (network, verified_through_ledger)
+					VALUES ('default', $1)
+					ON CONFLICT (network) DO UPDATE SET verified_through_ledger = EXCLUDED.verified_through_ledger`, tt.wantVerified)
+				require.NoError(t, err)
+			}
+
+			var got Stats
+			if tt.useScope {
+				got, err = st.Stats(ctx, NewScope([]string{"missing"}))
+			} else {
+				got, err = st.frontierStats(ctx)
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantIngested, got.LastIngestedLedger)
+			assert.Equal(t, tt.wantVerified, got.VerifiedThroughLedger)
+		})
+	}
+}
+
 func testStoreWithPartitionSpan(t *testing.T, span int64) *Postgres {
 	t.Helper()
 	dbURL := os.Getenv("TEST_DATABASE_URL")
@@ -107,26 +168,6 @@ func testStoreWithPartitionSpan(t *testing.T, span int64) *Postgres {
 
 	return NewPostgres(pool, span)
 }
-
-// legacySchemaMigrationsVersion is the schema_migrations version the
-// legacy test simulates "already applied" by forcing it via UPDATE.
-// The test hand-ruptures the events table to non-partitioned then
-// re-runs Migrate, which applies every migration whose version is
-// strictly greater than this value. It must therefore be < the
-// partition slot (currently 0008_partition_events). The original
-// value 3 happened to be the just-before-partition migration pre-#68
-// (0003_add_created_at_index); post-#68, `= 3` resolves to
-// 0003_topic_position_indexes, and the re-applied chain
-// (0004…0008) is idempotent enough that 3 still works. If you
-// renumber migrations and the partition slot moves, update this
-// constant so `value < partitionSlot` stays true.
-//
-// Held as a named const (not an inline literal) so it is interpolated
-// via fmt.Sprintf into the SQL below — golangci-lint's `unused` rule
-// would otherwise flag it as unused because the SQL body is one opaque
-// string literal to Go's analyzer. The const is a compile-time int, so
-// `%d` interpolation here carries no SQL-injection surface.
-const legacySchemaMigrationsVersion = 3
 
 // eventID builds IDs whose lexicographic order matches insertion order, like
 // real TOIDs.
@@ -413,9 +454,6 @@ func TestQueryEvents_FiltersAndPagination(t *testing.T) {
 			}
 			cursor = next
 		}
-		// 12 rows total: the 10 seeded above plus e1/e2 inserted by the
-		// "by topic0 and topic1 positionally" subtest.
-		require.Len(t, all, 12)
 		// Count what is actually in the table rather than hardcoding it:
 		// sibling subtests above insert rows of their own, so a literal
 		// makes this assertion depend on subtest execution order.
@@ -486,7 +524,6 @@ func TestQueryEvents_FiltersAndPagination(t *testing.T) {
 			}
 			cursor = next
 		}
-		require.Len(t, all, 12) // 10 seeded + e1/e2 from the positional subtest
 		require.Len(t, all, countEventsInRange(t, st, 101, 110))
 		for i := 1; i < len(all); i++ {
 			assert.Greater(t, all[i-1].ID, all[i].ID, "descending ID order across pages")
