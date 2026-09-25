@@ -479,20 +479,30 @@ func newTestServer(st *stubStore, rc *stubRPC) *Server {
 	return newTestServerWithKey(st, rc, "test-key")
 }
 
+// testResponse carries the parts of an HTTP response the test helpers'
+// callers actually inspect: the status and headers. The helpers drain and
+// close the body themselves before returning, so exposing *http.Response
+// would both hand callers a dead body and make bodyclose flag every call
+// site as a leak it cannot see through.
+type testResponse struct {
+	StatusCode int
+	Header     http.Header
+}
+
 // doGet performs a GET request against the test server.
-func doGet(t *testing.T, s *Server, path string) (*http.Response, []byte) {
+func doGet(t *testing.T, s *Server, path string) (testResponse, []byte) {
 	t.Helper()
 	return doGetWithHeader(t, s, path, "", "")
 }
 
 // doGetWithAuth performs a GET against the test server with an api-key
 // header, for the API_KEY-gated admin endpoints.
-func doGetWithAuth(t *testing.T, s *Server, path, apiKey string) (*http.Response, []byte) {
+func doGetWithAuth(t *testing.T, s *Server, path, apiKey string) (testResponse, []byte) {
 	t.Helper()
 	return doGetWithHeader(t, s, path, "X-Api-Key", apiKey)
 }
 
-func doGetWithHeader(t *testing.T, s *Server, path, key, value string) (*http.Response, []byte) {
+func doGetWithHeader(t *testing.T, s *Server, path, key, value string) (testResponse, []byte) {
 	t.Helper()
 	srv := httptest.NewServer(s.Router())
 	defer srv.Close()
@@ -506,7 +516,7 @@ func doGetWithHeader(t *testing.T, s *Server, path, key, value string) (*http.Re
 	body, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
 	resp.Body.Close()
-	return resp, body
+	return testResponse{StatusCode: resp.StatusCode, Header: resp.Header}, body
 }
 
 const testContract = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"

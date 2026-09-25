@@ -1260,6 +1260,12 @@ func (s *Server) handleGetEventTransaction(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusInternalServerError, errors.New("loading transaction events failed"))
 		return
 	}
+	// GetEventsByTxHash has no Scope parameter of its own: a transaction can
+	// touch contracts beyond the one that authorized this request, so its
+	// result must be filtered by the caller's scope before it leaves this
+	// handler. Without this, a tenant granted only contractA could read
+	// contractB's events merely by sharing a transaction with contractA.
+	siblings = filterEventsByScope(siblings, scope)
 
 	mode := decodeModeFromQuery(r)
 
@@ -1287,6 +1293,24 @@ func (s *Server) handleGetEventTransaction(w http.ResponseWriter, r *http.Reques
 	} else {
 		writeJSON(w, http.StatusOK, map[string]any{"events": projectEvents(siblings, fields)})
 	}
+}
+
+// filterEventsByScope returns only the events whose contract is readable
+// under scope, preserving order. It exists for store methods like
+// GetEventsByTxHash that have no Scope parameter of their own and so return
+// rows spanning every contract in the transaction, not just the ones the
+// caller is authorized for.
+func filterEventsByScope(events []store.Event, scope store.Scope) []store.Event {
+	if scope.IsWildcard() {
+		return events
+	}
+	out := make([]store.Event, 0, len(events))
+	for _, ev := range events {
+		if scope.Allows(ev.ContractID) {
+			out = append(out, ev)
+		}
+	}
+	return out
 }
 
 func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request) {
@@ -1673,11 +1697,15 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.getStatsCache().Put(key, stats, time.Now())
+	if s.enricher != nil {
+		d := s.enricher.DecodeStats()
+		stats.Decode = &d
+	}
 	if sc := getSpecCache(); sc != nil {
 		stats.SpecCache = sc.SpecCacheStats()
 	}
 
+	s.getStatsCache().Put(key, stats, time.Now())
 	writeCacheHeaders(w, cacheNoStore, 0, "")
 	writeJSON(w, http.StatusOK, stats)
 }
@@ -2532,6 +2560,14 @@ func ptr[T any](v T) *T { return &v }
 // the GraphQL resolvers in internal/api/graphql can reuse them — there is
 // exactly one source of truth for which topic positions are valid, what
 // counts as an "invalid order", etc.
+// FilterFromQuery exports filterFromQuery for cross-transport parity
+// tests: internal/api/graphql asserts that REST and GraphQL produce an
+// identical store.EventFilter for equivalent inputs, which requires a
+// handle on this package's own query-parsing entry point.
+func FilterFromQuery(r *http.Request) (store.EventFilter, error) {
+	return filterFromQuery(r)
+}
+
 func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 
 	q := r.URL.Query()
@@ -2621,6 +2657,7 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 		// historical single-ID behaviour, while a comma-separated list is
 		// carried by ContractIDs below.
 		ContractID:       singleID,
+		ContractIDs:      contractIDs,
 		ContractIDPrefix: q.Get("contract_id_prefix"),
 		Types:            types,
 		Topic:            topic,
@@ -2637,6 +2674,41 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 		Order:            q.Get("order"),
 		OrderBy:          q.Get("order_by"),
 		Cursor:           q.Get("cursor"),
+	}
+
+	if rawTx := q.Get("tx_index"); rawTx != "" {
+		txIdx, terr := strconv.Atoi(rawTx)
+		if terr != nil || txIdx < 0 {
+			return store.EventFilter{}, fmt.Errorf("invalid tx_index %q (want a non-negative integer)", rawTx)
+		}
+		args.TxIndex = ptr(int32(txIdx))
+	}
+	if rawOp := q.Get("op_index"); rawOp != "" {
+		opIdx, oerr := strconv.Atoi(rawOp)
+		if oerr != nil || opIdx < 0 {
+			return store.EventFilter{}, fmt.Errorf("invalid op_index %q (want a non-negative integer)", rawOp)
+		}
+		args.OpIndex = ptr(int32(opIdx))
+	}
+	switch raw := q.Get("in_successful_call"); raw {
+	case "":
+		// nil — no constraint
+	case "true":
+		args.InSuccessfulCall = ptr(true)
+	case "false":
+		args.InSuccessfulCall = ptr(false)
+	default:
+		return store.EventFilter{}, fmt.Errorf("invalid in_successful_call %q (want true or false)", raw)
+	}
+	switch raw := q.Get("has_value"); raw {
+	case "":
+		// nil — no constraint
+	case "true":
+		args.HasValue = ptr(true)
+	case "false":
+		args.HasValue = ptr(false)
+	default:
+		return store.EventFilter{}, fmt.Errorf("has_value must be true or false, got %q", raw)
 	}
 
 	// ?limit=N: explicit validation here so an explicit `?limit=0` (or
@@ -2657,10 +2729,6 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 		return f, err
 
 	}
-	// ContractIDs is set outside EventFilterArgs because the shared queries
-	// package (used by GraphQL) has no multi-ID concept yet; the store
-	// turns a non-empty list into `contract_id = ANY($N)`.
-	f.ContractIDs = contractIDs
 
 	// Scope is attached here, the single place REST list filters are built:
 	// queries.BuildEventFilter is shared with the GraphQL resolvers and
@@ -2678,32 +2746,6 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 
 	if f.Cursor != "" && !config.ValidCursor(f.Cursor) {
 		return f, fmt.Errorf("invalid cursor %q", f.Cursor)
-	}
-
-	if rawTx := q.Get("tx_index"); rawTx != "" {
-		txIdx, err := strconv.Atoi(rawTx)
-		if err != nil || txIdx < 0 {
-			return f, fmt.Errorf("invalid tx_index %q (want a non-negative integer)", rawTx)
-		}
-		f.TxIndex = ptr(int32(txIdx))
-	}
-	if rawOp := q.Get("op_index"); rawOp != "" {
-		opIdx, err := strconv.Atoi(rawOp)
-		if err != nil || opIdx < 0 {
-			return f, fmt.Errorf("invalid op_index %q (want a non-negative integer)", rawOp)
-		}
-		f.OpIndex = ptr(int32(opIdx))
-	}
-
-	switch raw := q.Get("in_successful_call"); raw {
-	case "":
-		// nil — no constraint
-	case "true":
-		f.InSuccessfulCall = ptr(true)
-	case "false":
-		f.InSuccessfulCall = ptr(false)
-	default:
-		return f, fmt.Errorf("invalid in_successful_call %q (want true or false)", raw)
 	}
 
 	// order/order_by/topic/topic0..topic3/topic_contains/from_ledger/
@@ -2748,19 +2790,6 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 		}
 		f.Order = "desc"
 		f.Limit = n
-	}
-
-	if raw := q.Get("has_value"); raw != "" {
-		switch raw {
-		case "true":
-			t := true
-			f.HasValue = &t
-		case "false":
-			v := false
-			f.HasValue = &v
-		default:
-			return f, fmt.Errorf("has_value must be true or false, got %q", raw)
-		}
 	}
 
 	return f, nil

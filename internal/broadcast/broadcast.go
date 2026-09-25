@@ -37,6 +37,17 @@ type Subscription struct {
 	// grants and revocations that happen after it was opened; see SetScope.
 	scopeMu sync.RWMutex
 	scope   store.Scope
+
+	// chMu serializes every send on ch against closeChannel. Publish reads
+	// its subscriber list under Broadcaster.mu but sends outside that lock,
+	// so without chMu a client disconnecting (Subscription.Close, called
+	// from a request's own goroutine) could close ch while a concurrent
+	// Publish is mid-send on it, panicking with "send on closed channel" —
+	// the ingestion goroutine crashing because of an unrelated client
+	// hanging up. chMu makes "is ch closed" and "send on ch" one atomic
+	// step from the broadcaster's point of view, at either end.
+	chMu   sync.Mutex
+	closed bool
 }
 
 // New creates a Broadcaster.
@@ -96,11 +107,35 @@ func (s *Subscription) currentScope() store.Scope {
 
 func (b *Broadcaster) unsubscribe(id string) {
 	b.mu.Lock()
-	defer b.mu.Unlock()
-	if s, ok := b.subs[id]; ok {
-		close(s.ch)
+	s, ok := b.subs[id]
+	if ok {
 		delete(b.subs, id)
 	}
+	b.mu.Unlock()
+	// Closed outside b.mu, under s.chMu instead, so it can never block
+	// waiting for a concurrent Publish's send on this same subscriber to
+	// finish — and so that send and close stay mutually exclusive; see
+	// closeChannel.
+	if ok {
+		s.closeChannel()
+	}
+}
+
+// closeChannel closes s.ch exactly once, synchronized against Publish's
+// send on the same channel via chMu, so a disconnect that lands while a
+// publish is in flight for this subscriber can never race a send against
+// the close (see chMu's doc comment). Both Close (via unsubscribe) and
+// Publish's slow-consumer eviction call this, and both may race to do so
+// for the same subscriber, so the guard has to live here rather than at
+// either call site.
+func (s *Subscription) closeChannel() {
+	s.chMu.Lock()
+	defer s.chMu.Unlock()
+	if s.closed {
+		return
+	}
+	s.closed = true
+	close(s.ch)
 }
 
 // SubscriberCount returns the number of subscribers currently registered.
@@ -119,40 +154,55 @@ func (b *Broadcaster) Publish(ctx context.Context, events []store.Event) {
 	}
 	b.mu.RUnlock()
 
-	var evict []string
+	var evict []*Subscription
 	for _, s := range subs {
-		// Read the scope once per subscriber per publish rather than once
-		// per event: it cannot change mid-batch in a way that matters, and
-		// taking the lock per event would put it on the hot path.
-		scope := s.currentScope()
-		for _, ev := range events {
-			// Authorization first, and independently of the user's filter,
-			// so no filter expression can be crafted to bypass it.
-			if !scope.Allows(ev.ContractID) {
-				continue
-			}
-			if !eventMatches(ev, s.filter) {
-				continue
-			}
-			select {
-			case s.ch <- ev:
-			default:
-				evict = append(evict, s.id)
-				goto nextSub
-			}
+		if s.publishTo(events) {
+			evict = append(evict, s)
 		}
-	nextSub:
 	}
 	if len(evict) > 0 {
 		b.mu.Lock()
-		for _, id := range evict {
-			if s, ok := b.subs[id]; ok {
-				close(s.ch)
-				delete(b.subs, id)
-			}
+		for _, s := range evict {
+			delete(b.subs, s.id)
 		}
 		b.mu.Unlock()
+		for _, s := range evict {
+			s.closeChannel()
+		}
 	}
+}
+
+// publishTo sends every event in events that s's scope and filter allow,
+// returning true if s must be evicted for being too slow to keep up (its
+// buffer was full). The whole attempt runs under s.chMu, so a concurrent
+// Close cannot close s.ch out from under an in-flight send — see chMu's
+// doc comment on Subscription.
+func (s *Subscription) publishTo(events []store.Event) bool {
+	s.chMu.Lock()
+	defer s.chMu.Unlock()
+	if s.closed {
+		return false
+	}
+	// Read the scope once per subscriber per publish rather than once per
+	// event: it cannot change mid-batch in a way that matters, and taking
+	// the lock per event would put it on the hot path.
+	scope := s.currentScope()
+	for _, ev := range events {
+		// Authorization first, and independently of the user's filter, so
+		// no filter expression can be crafted to bypass it.
+		if !scope.Allows(ev.ContractID) {
+			continue
+		}
+		if !eventMatches(ev, s.filter) {
+			continue
+		}
+		select {
+		case s.ch <- ev:
+		default:
+			return true
+		}
+	}
+	return false
 }
 
 // Events returns a receive-only channel of events matching the subscriber's filter.

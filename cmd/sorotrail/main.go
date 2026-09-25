@@ -7,6 +7,7 @@
 //	sorotrail apikey create|list|revoke
 //	sorotrail contracts add|list|remove
 //	sorotrail backfill --contract C... --from-ledger N [--to-ledger M]
+//	sorotrail migrate up|down|status [--steps N]
 package main
 
 import (
@@ -34,6 +35,7 @@ import (
 	"github.com/sorotrail/sorotrail/internal/decode"
 	"github.com/sorotrail/sorotrail/internal/ingester"
 	"github.com/sorotrail/sorotrail/internal/pruner"
+	"github.com/sorotrail/sorotrail/internal/requestid"
 	"github.com/sorotrail/sorotrail/internal/rpc"
 	"github.com/sorotrail/sorotrail/internal/spec"
 	"github.com/sorotrail/sorotrail/internal/store"
@@ -81,6 +83,8 @@ func dispatch(args []string) error {
 		return runBackfill(args[1:])
 	case "index-addresses":
 		return runIndexAddresses(args[1:])
+	case "migrate":
+		return runMigrate(args[1:])
 	case "healthcheck":
 		// The healthcheck subcommand manages its own exit codes
 		// (0 healthy, 1 unhealthy, 2 usage error) — the docker
@@ -136,6 +140,8 @@ subcommands:
                    (sorotrail backfill --help)
   index-addresses  rebuild the address→event inverted index from stored events
                    (sorotrail index-addresses --help)
+  migrate          apply, roll back, or inspect database migrations
+                   (sorotrail migrate --help)
   health           probe the API /health and exit nonzero on failure
                    (sorotrail health --help)
   healthcheck      probe /health and exit (used by docker HEALTHCHECK)
@@ -372,7 +378,10 @@ func runService(dryRun bool) error {
 		}
 	}
 
-	ing := ingester.New(countingClient, st, decode.XDRDecoder{}, log, ingester.Options{
+	// The decoder is wrapped in a memoizing cache: ingestion re-decodes the
+	// same topic symbols and values constantly, so hashing the raw XDR and
+	// serving repeats from an LRU removes that redundant work.
+	ing := ingester.New(countingClient, st, decode.NewCachingDecoder(decode.XDRDecoder{}, 0), log, ingester.Options{
 		PollInterval:            cfg.PollInterval,
 		PollIntervalMin:         cfg.PollIntervalMin,
 		PollIntervalMax:         cfg.PollIntervalMax,
@@ -622,7 +631,8 @@ func runService(dryRun bool) error {
 	if ingesterEnabled {
 		remaining++ // + ingester
 		go func() {
-			log.Info("ingester starting", "rpc_urls", rpcURLsForLog(cfg), "poll_interval", cfg.PollInterval)
+			log.Info("ingester starting", requestid.Field, requestid.JobIngester,
+				"rpc_urls", rpcURLsForLog(cfg), "poll_interval", cfg.PollInterval)
 			if err := ing.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 				errCh <- fmt.Errorf("ingester: %w", err)
 			} else {
@@ -644,7 +654,7 @@ func runService(dryRun bool) error {
 	if aud != nil {
 		remaining++ // + auditor
 		go func() {
-			log.Info("auditor starting",
+			log.Info("auditor starting", requestid.Field, requestid.JobAuditor,
 				"budget_share", cfg.AuditBudgetShare,
 				"batch_ledgers", cfg.AuditBatchLedgers,
 				"lag_threshold", cfg.AuditLagThreshold,
@@ -672,7 +682,7 @@ func runService(dryRun bool) error {
 	remaining++ // + pruner
 	go func() {
 		if cfg.RetentionEnabled() {
-			log.Info("pruner starting",
+			log.Info("pruner starting", requestid.Field, requestid.JobPruner,
 				"max_age", cfg.RetentionMaxAge,
 				"min_ledger", cfg.RetentionMinLedger,
 				"batch_size", cfg.RetentionBatchSize,

@@ -559,3 +559,121 @@ func TestEventsCSV_ResponseHeaders(t *testing.T) {
 	assert.Equal(t, "no-store", resp.Header.Get("Cache-Control"),
 		"CSV export must use no-store to prevent stale caching")
 }
+
+// TestEventsCSV_NDJSONFormat verifies that /events.csv — despite its
+// historical name — accepts ?format=ndjson exactly like
+// /contracts/{id}/export, closing the parity gap issue #578 tracks: a
+// client switching between the two export endpoints must not have to
+// rediscover which formats each one accepts.
+func TestEventsCSV_NDJSONFormat(t *testing.T) {
+	st := &stubStore{
+		events: []store.Event{
+			{
+				ID:         "0000000001-0000000100",
+				ContractID: testContract,
+				Ledger:     100,
+				Type:       "contract",
+				TxHash:     "hash100",
+				Topics:     json.RawMessage(`["simple"]`),
+				Value:      json.RawMessage(`{"n":1}`),
+			},
+			{
+				ID:         "0000000001-0000000101",
+				ContractID: testContract,
+				Ledger:     101,
+				Type:       "system",
+				TxHash:     "hash101",
+				Topics:     json.RawMessage(`["other"]`),
+				Value:      json.RawMessage(`{"n":2}`),
+			},
+		},
+	}
+	s := newTestServer(st, nil)
+	resp, body := doGet(t, s, "/events.csv?format=ndjson")
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	assert.Equal(t, "application/x-ndjson", resp.Header.Get("Content-Type"))
+	assert.Contains(t, resp.Header.Get("Content-Disposition"), `attachment; filename="events.ndjson"`)
+	assert.Equal(t, "no-store", resp.Header.Get("Cache-Control"))
+
+	dec := json.NewDecoder(strings.NewReader(string(body)))
+	var ids []string
+	for dec.More() {
+		var ev store.Event
+		require.NoError(t, dec.Decode(&ev))
+		ids = append(ids, ev.ID)
+	}
+	require.Len(t, ids, 2)
+	assert.Equal(t, "0000000001-0000000100", ids[0])
+	assert.Equal(t, "0000000001-0000000101", ids[1])
+}
+
+// TestEventsCSV_RejectsUnknownFormat mirrors
+// TestExport_RejectsUnknownFormat for the events endpoint: both export
+// endpoints share parseExportFormat, so an unsupported value must be
+// rejected the same way on both.
+func TestEventsCSV_RejectsUnknownFormat(t *testing.T) {
+	s := newTestServer(&stubStore{}, nil)
+	resp, body := doGet(t, s, "/events.csv?format=xml")
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	var e map[string]string
+	require.NoError(t, json.Unmarshal(body, &e))
+	assert.Contains(t, e["error"], "invalid format")
+	assert.Contains(t, e["error"], "csv or ndjson",
+		"the 400 must name the formats it does support")
+}
+
+// TestEventsCSV_StreamsLargeResultAcrossPages exercises the same
+// cursor-walking loop TestExport_CSVStreamsAllEventsInRange exercises for
+// /contracts/{id}/export, but through /events.csv: fakeExportStore only
+// ever hands back exportQueryBatchSize-sized pages and asserts the
+// handler mirrors its cursor back on every subsequent call, so a
+// handler that buffered the whole result before writing (instead of
+// streaming page by page) would fail this test by never advancing past
+// the first page's cursor.
+func TestEventsCSV_StreamsLargeResultAcrossPages(t *testing.T) {
+	contract := testContractID
+	const total = 50
+	events := make([]store.Event, 0, total)
+	for l := int64(0); l < total; l++ {
+		events = append(events, store.Event{
+			ID:         fmt.Sprintf("0000000001-%010d", l),
+			ContractID: contract,
+			Ledger:     l,
+			Type:       "contract",
+			TxHash:     fmt.Sprintf("hash%d", l),
+			Topics:     json.RawMessage(`[]`),
+			Value:      json.RawMessage(`{}`),
+		})
+	}
+	st := newFakeExportStore(events)
+	srv := testServer(t, st, 0)
+
+	for _, format := range []string{"", "csv", "ndjson"} {
+		t.Run("format="+format, func(t *testing.T) {
+			path := "/events.csv?contract_id=" + contract
+			if format != "" {
+				path += "&format=" + format
+			}
+			req := httptest.NewRequest(http.MethodGet, path, nil)
+			rec := httptest.NewRecorder()
+			st.position, st.cursor = 0, ""
+			srv.ServeHTTP(rec, req)
+
+			require.Equal(t, http.StatusOK, rec.Code)
+			if format == "ndjson" {
+				dec := json.NewDecoder(rec.Body)
+				n := 0
+				for dec.More() {
+					var ev store.Event
+					require.NoError(t, dec.Decode(&ev))
+					n++
+				}
+				assert.Equal(t, total, n)
+			} else {
+				lines := strings.Split(strings.TrimRight(rec.Body.String(), "\n"), "\n")
+				require.Len(t, lines, total+1, "header + one row per event")
+			}
+		})
+	}
+}

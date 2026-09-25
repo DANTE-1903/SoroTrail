@@ -14,10 +14,10 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-func TestSQLite_Conformance(t *testing.T) {
-	runStoreTests(t, newSQLiteStore)
-}
-
+// newSQLiteStore is the SQLite entry in the shared conformance suite's
+// backend table (see conformance_test.go). It is deliberately not a test
+// itself: TestStoreConformance runs the same assertions against every
+// registered backend, so adding one does not add a near-duplicate test.
 func newSQLiteStore(t *testing.T) Store {
 	t.Helper()
 	db, err := sql.Open("sqlite", ":memory:")
