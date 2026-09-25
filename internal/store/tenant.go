@@ -39,11 +39,11 @@ type Tenant struct {
 	CreatedAt           time.Time `json:"created_at"`
 }
 
-// APIKey is a credential belonging to a tenant. The secret itself is never
+// TenantAPIKey is a credential belonging to a tenant. The secret itself is never
 // stored or returned after creation — only its SHA-256 digest lives in the
-// database, and Secret is populated exactly once, by CreateAPIKey, for the
+// database, and Secret is populated exactly once, by CreateTenantAPIKey, for the
 // response that hands it to the operator.
-type APIKey struct {
+type TenantAPIKey struct {
 	ID         int64      `json:"id"`
 	TenantID   int64      `json:"tenant_id"`
 	Name       string     `json:"name"`
@@ -116,23 +116,23 @@ type TenantStore interface {
 	// ListTenantWatchedContracts returns just this tenant's claims.
 	ListTenantWatchedContracts(ctx context.Context, tenantID int64) ([]string, error)
 
-	// CreateAPIKey stores the digest of secret and returns the key record.
-	CreateAPIKey(ctx context.Context, tenantID int64, name, prefix string, digest []byte) (APIKey, error)
-	// CreateAPIKeyIfAbsent is CreateAPIKey made idempotent on the prefix,
+	// CreateTenantAPIKey stores the digest of secret and returns the key record.
+	CreateTenantAPIKey(ctx context.Context, tenantID int64, name, prefix string, digest []byte) (TenantAPIKey, error)
+	// CreateTenantAPIKeyIfAbsent is CreateTenantAPIKey made idempotent on the prefix,
 	// for the startup bootstrap path: an operator-supplied key must survive
 	// process restarts without erroring on the second boot.
-	CreateAPIKeyIfAbsent(ctx context.Context, tenantID int64, name, prefix string, digest []byte) error
-	// LookupAPIKey returns the key with the given prefix along with its
+	CreateTenantAPIKeyIfAbsent(ctx context.Context, tenantID int64, name, prefix string, digest []byte) error
+	// LookupTenantAPIKey returns the key with the given prefix along with its
 	// tenant, or ErrNotFound. Revoked keys are not returned. The caller is
 	// responsible for comparing the secret half against Digest in constant
 	// time — this method deliberately does not take the secret, so the
 	// comparison cannot accidentally become a SQL equality test (which
 	// would be both timing-leaky and index-searchable).
-	LookupAPIKey(ctx context.Context, prefix string) (key APIKey, digest []byte, t Tenant, err error)
-	// TouchAPIKey records that a key was used. Best-effort and advisory.
-	TouchAPIKey(ctx context.Context, id int64) error
-	ListAPIKeys(ctx context.Context, tenantID int64) ([]APIKey, error)
-	RevokeAPIKey(ctx context.Context, id int64) error
+	LookupTenantAPIKey(ctx context.Context, prefix string) (key TenantAPIKey, digest []byte, t Tenant, err error)
+	// TouchTenantAPIKey records that a key was used. Best-effort and advisory.
+	TouchTenantAPIKey(ctx context.Context, id int64) error
+	ListTenantAPIKeys(ctx context.Context, tenantID int64) ([]TenantAPIKey, error)
+	RevokeTenantAPIKey(ctx context.Context, id int64) error
 
 	// AddUsage applies a batch of per-tenant increments in one statement.
 	AddUsage(ctx context.Context, day time.Time, deltas map[int64]UsageDelta) error

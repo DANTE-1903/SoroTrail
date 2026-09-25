@@ -100,11 +100,6 @@ func getSpecCache() SpecCacheStatsSource {
 	return specCacheSource
 }
 
-// Enricher is the spec-based event enrichment interface used by the API.
-type Enricher interface {
-	EnrichEvents(ctx context.Context, events []store.Event) []store.EnrichedEvent
-}
-
 // SetRPCCounter registers the CountingClient so /stats can expose
 // per-method RPC error totals. Call this before ListenAndServe.
 // The setter is guarded by a RWMutex so concurrent /stats readers
@@ -126,30 +121,6 @@ func getRPCCounter() *rpc.CountingClient {
 	return rpcCounter
 }
 
-// SpecCacheStatsSource supplies spec-cache metrics for /stats. Mirrors
-// the SetAuditor pattern: one setter, called before ListenAndServe.
-// nil (the default) leaves the /stats spec_cache field omitted.
-type SpecCacheStatsSource interface {
-	SpecCacheStats() store.SpecCacheStats
-}
-
-var (
-	specCacheMu     sync.RWMutex
-	specCacheSource SpecCacheStatsSource
-)
-
-func SetSpecCache(src SpecCacheStatsSource) {
-	specCacheMu.Lock()
-	specCacheSource = src
-	specCacheMu.Unlock()
-}
-
-func getSpecCache() SpecCacheStatsSource {
-	specCacheMu.RLock()
-	defer specCacheMu.RUnlock()
-	return specCacheSource
-}
-
 // Enricher is the spec-based event enrichment interface used by the API.
 // Defined here so the API package doesn't import internal/spec directly.
 // DecodeStats lets /stats surface the enrichment decode failure rate when a
@@ -162,35 +133,23 @@ type Enricher interface {
 
 // Server holds the API's dependencies.
 type Server struct {
-	store    store.Store
-	rpc      rpc.Client
-	enricher Enricher
-	log      *slog.Logger
-	limiter  *RateLimiter
-	bcast    *broadcast.Broadcaster
+	store            store.Store
+	rpc              rpc.Client
+	enricher         Enricher
+	log              *slog.Logger
+	apiKey           string
+	limiter          *RateLimiter
+	bcast            *broadcast.Broadcaster
+	recoverer        *Recoverer
+	metrics          *metrics.HTTPMetrics
+	tracer           trace.Tracer
+	retentionLedgers uint32
+	enableMetrics    bool
 
 	// apiKeyAuth turns on API key authentication for the write,
 	// streaming, subscription-management, and key-management routes.
 	// Off by default: the API behaves exactly as before.
 	apiKeyAuth bool
-}
-
-// New builds the API server. rpcClient is only used by /health.
-// enricher is optional — pass nil to disable spec decoding.
-func New(st store.Store, rpcClient rpc.Client, log *slog.Logger, enricher ...Enricher) *Server {
-	s := &Server{store: st, rpc: rpcClient, log: log}
-	store            store.Store
-	rpc              rpc.Client
-	log              *slog.Logger
-	apiKey           string
-	limiter          *RateLimiter
-	bcast            *broadcast.Broadcaster
-	enricher         Enricher
-	enableMetrics    bool
-	recoverer        *Recoverer
-	metrics          *metrics.HTTPMetrics
-	tracer           trace.Tracer
-	retentionLedgers uint32
 
 	httpRequestBodyLimit int64 // max accepted request body size, in bytes
 
@@ -550,16 +509,9 @@ func (s *Server) router() chi.Router {
 		r.Use(protect)
 		r.Get("/events/ws", s.handleEventStreamWS)
 		r.Post("/subscriptions", s.handleCreateSubscription)
-		r.Get("/subscriptions", s.handleListSubscriptions)
-		r.Get("/subscriptions/{id}", s.handleGetSubscription)
 		r.Put("/subscriptions/{id}", s.handleUpdateSubscription)
 		r.Delete("/subscriptions/{id}", s.handleDeleteSubscription)
-		r.Get("/subscriptions/{id}/deliveries", s.handleListDeliveries)
 	})
-	// Subscription CRUD and delivery history.
-	r.Post("/subscriptions", s.handleCreateSubscription)
-	r.Put("/subscriptions/{id}", s.handleUpdateSubscription)
-	r.Delete("/subscriptions/{id}", s.handleDeleteSubscription)
 
 	// List endpoints: responses can be large (many events, many
 	// subscriptions), so compression is negotiated per request.
@@ -578,9 +530,9 @@ func (s *Server) router() chi.Router {
 		r.Get("/contracts/{id}/events", s.handleContractEvents)
 		r.Get("/contracts/{id}/export", s.handleContractExport)
 		r.Get("/events.csv", s.handleEventsCSV)
-		r.Get("/subscriptions", s.handleListSubscriptions)
-		r.Get("/subscriptions/{id}", s.handleGetSubscription)
-		r.Get("/subscriptions/{id}/deliveries", s.handleListDeliveries)
+		r.With(protect).Get("/subscriptions", s.handleListSubscriptions)
+		r.With(protect).Get("/subscriptions/{id}", s.handleGetSubscription)
+		r.With(protect).Get("/subscriptions/{id}/deliveries", s.handleListDeliveries)
 		r.With(watchedMW).Get("/watched-contracts", s.handleListWatchedChains)
 	})
 

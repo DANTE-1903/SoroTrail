@@ -24,10 +24,7 @@ type Enricher struct {
 
 	decodes        atomic.Uint64
 	decodeFailures atomic.Uint64
-	fetcher       *Fetcher
-	cache         *Cache
-	log           *slog.Logger
-	overrideStore SpecOverrideStore
+	overrideStore  SpecOverrideStore
 }
 
 // SpecOverrideStore is the subset of store.Store needed to read

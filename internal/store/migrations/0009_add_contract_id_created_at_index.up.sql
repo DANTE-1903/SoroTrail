@@ -4,6 +4,6 @@
 -- a separate sort step.
 --
 -- IF NOT EXISTS keeps this safe across partial re-applies (same pattern as
--- 0004_add_created_at_index and the CREATE INDEX statements in 0008).
+-- 0004_add_created_at_index and the CREATE INDEX statements in 0007).
 CREATE INDEX IF NOT EXISTS idx_events_contract_id_created_at
     ON events (contract_id, created_at);

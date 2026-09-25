@@ -34,6 +34,24 @@ type clickHouseConfig struct {
 
 // Contract metadata (token enrichment) is Postgres-only; the ClickHouse
 // backend reports "not found"/empty so the enrichment worker stays a no-op.
+// API keys are not implemented for the ClickHouse backend: it serves
+// read replicas only, and management writes belong to the primary store.
+func (c *ClickHouse) CreateAPIKey(context.Context, APIKey) (APIKey, error) {
+	return APIKey{}, errUnsupported("clickhouse", "CreateAPIKey")
+}
+func (c *ClickHouse) GetAPIKey(context.Context, int64) (APIKey, error) {
+	return APIKey{}, errUnsupported("clickhouse", "GetAPIKey")
+}
+func (c *ClickHouse) LookupAPIKeyByPrefix(context.Context, string) (APIKey, error) {
+	return APIKey{}, errUnsupported("clickhouse", "LookupAPIKeyByPrefix")
+}
+func (c *ClickHouse) ListAPIKeys(context.Context) ([]APIKey, error) {
+	return nil, errUnsupported("clickhouse", "ListAPIKeys")
+}
+func (c *ClickHouse) RevokeAPIKey(context.Context, int64) error {
+	return errUnsupported("clickhouse", "RevokeAPIKey")
+}
+
 func (c *ClickHouse) ListContractIDs(context.Context) ([]string, error) { return nil, nil }
 func (c *ClickHouse) GetContractMeta(context.Context, string) (ContractMeta, error) {
 	return ContractMeta{}, ErrNotFound

@@ -177,12 +177,12 @@ func (f *fakeTenants) addTenant(t *testing.T, tenant store.Tenant, grants ...str
 	return plaintext
 }
 
-func (f *fakeTenants) LookupAPIKey(_ context.Context, prefix string) (store.APIKey, []byte, store.Tenant, error) {
+func (f *fakeTenants) LookupTenantAPIKey(_ context.Context, prefix string) (store.TenantAPIKey, []byte, store.Tenant, error) {
 	rec, ok := f.keys[prefix]
 	if !ok {
-		return store.APIKey{}, nil, store.Tenant{}, store.ErrNotFound
+		return store.TenantAPIKey{}, nil, store.Tenant{}, store.ErrNotFound
 	}
-	return store.APIKey{ID: rec.id, TenantID: rec.tenantID}, rec.digest, f.tenants[rec.tenantID], nil
+	return store.TenantAPIKey{ID: rec.id, TenantID: rec.tenantID}, rec.digest, f.tenants[rec.tenantID], nil
 }
 
 func (f *fakeTenants) ScopeForTenant(_ context.Context, t store.Tenant) (store.Scope, error) {
@@ -210,11 +210,11 @@ func (f *fakeTenants) ListTenants(_ context.Context) ([]store.Tenant, error) {
 	}
 	return out, nil
 }
-func (f *fakeTenants) ListAPIKeys(_ context.Context, tenantID int64) ([]store.APIKey, error) {
-	var out []store.APIKey
+func (f *fakeTenants) ListTenantAPIKeys(_ context.Context, tenantID int64) ([]store.TenantAPIKey, error) {
+	var out []store.TenantAPIKey
 	for _, rec := range f.keys {
 		if rec.tenantID == tenantID {
-			out = append(out, store.APIKey{ID: rec.id, TenantID: rec.tenantID})
+			out = append(out, store.TenantAPIKey{ID: rec.id, TenantID: rec.tenantID})
 		}
 	}
 	return out, nil
@@ -237,7 +237,7 @@ func (f *fakeTenants) RemoveTenantWatchedContract(_ context.Context, tenantID in
 	f.watched[tenantID] = out
 	return nil
 }
-func (f *fakeTenants) TouchAPIKey(context.Context, int64) error { return nil }
+func (f *fakeTenants) TouchTenantAPIKey(context.Context, int64) error { return nil }
 func (f *fakeTenants) AddUsage(_ context.Context, _ time.Time, deltas map[int64]store.UsageDelta) error {
 	for id, d := range deltas {
 		f.usage[id] = append(f.usage[id], store.TenantUsage{

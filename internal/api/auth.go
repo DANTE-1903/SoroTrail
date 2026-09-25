@@ -16,17 +16,23 @@
 package api
 
 import (
+	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/base32"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 
-	"github.com/khaylebfortune/sorotrail/internal/apikey"
-	"github.com/khaylebfortune/sorotrail/internal/store"
+	"github.com/sorotrail/sorotrail/internal/apikey"
+	"github.com/sorotrail/sorotrail/internal/store"
 )
 
 // errInvalidAPIKey is the single unauthenticated response for missing,
@@ -176,22 +182,7 @@ func (s *Server) handleRevokeAPIKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
-package api
-
-import (
-	"context"
-	"crypto/rand"
-	"crypto/sha256"
-	"crypto/subtle"
-	"encoding/base32"
-	"errors"
-	"fmt"
-	"net/http"
-	"strconv"
-	"strings"
-
-	"github.com/sorotrail/sorotrail/internal/store"
-)
+}
 
 // API key authentication (#17) and tenant resolution (#48).
 //
@@ -382,13 +373,13 @@ func (s *Server) authenticate(next http.Handler) http.Handler {
 			return
 		}
 
-		key, storedDigest, tenant, err := s.tenants.LookupAPIKey(r.Context(), prefix)
+		key, storedDigest, tenant, err := s.tenants.LookupTenantAPIKey(r.Context(), prefix)
 		if errors.Is(err, store.ErrNotFound) {
 			writeUnauthorized(w, "unknown or revoked API key")
 			return
 		}
 		if err != nil {
-			s.log.Error("looking up api key", "error", err)
+			loggerFromContext(r.Context()).Error("looking up api key", "error", err)
 			writeError(w, http.StatusInternalServerError, errors.New("authentication failed"))
 			return
 		}
@@ -409,13 +400,13 @@ func (s *Server) authenticate(next http.Handler) http.Handler {
 
 		scope, err := s.tenants.ScopeForTenant(r.Context(), tenant)
 		if err != nil {
-			s.log.Error("resolving tenant scope", "tenant", tenant.ID, "error", err)
+			loggerFromContext(r.Context()).Error("resolving tenant scope", "tenant", tenant.ID, "error", err)
 			writeError(w, http.StatusInternalServerError, errors.New("authentication failed"))
 			return
 		}
 
 		// Advisory; a failure here must not deny an otherwise valid request.
-		if err := s.tenants.TouchAPIKey(r.Context(), key.ID); err != nil {
+		if err := s.tenants.TouchTenantAPIKey(r.Context(), key.ID); err != nil {
 			s.log.Debug("recording api key use", "key", key.ID, "error", err)
 		}
 

@@ -1341,6 +1341,191 @@
         }
       }
     },
+    "/apikeys": {
+      "get": {
+        "operationId": "listAPIKeys",
+        "summary": "List API keys",
+        "description": "Returns the metadata for every API key on this instance. The plaintext key is never returned — it is visible only in the response to POST /apikeys, at creation time.\nThis endpoint is authenticated regardless of API_KEY_AUTH_ENABLED: an unauthenticated key-management surface would let any caller mint a key and bypass authentication entirely. The first key is issued out of band with `sorotrail apikey`.",
+        "tags": [
+          "Auth"
+        ],
+        "security": [
+          {
+            "TenantAuth": []
+          },
+          {
+            "TenantAuthHeader": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/APIKey"
+                  }
+                },
+                "example": [
+                  {
+                    "id": 1,
+                    "name": "ci-reader",
+                    "prefix": "a1b2c3d4e5f6g7h8",
+                    "created_at": "2026-09-01T12:00:00Z"
+                  }
+                ]
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      },
+      "post": {
+        "operationId": "createAPIKey",
+        "summary": "Create an API key",
+        "description": "Mints a new API key and returns it. The `key` field in the response is the only time the plaintext key is ever available — only a bcrypt hash of its secret half is persisted, so a lost key cannot be recovered and must be revoked and reissued.\nThe request body is optional; omitting it creates an unnamed key.",
+        "tags": [
+          "Auth"
+        ],
+        "security": [
+          {
+            "TenantAuth": []
+          },
+          {
+            "TenantAuthHeader": []
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string",
+                    "maxLength": 100,
+                    "description": "A human-readable label for the key, to make it identifiable in the list response. At most 100 characters."
+                  }
+                },
+                "example": {
+                  "name": "ci-reader"
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/APIKey"
+                    },
+                    {
+                      "type": "object",
+                      "required": [
+                        "key"
+                      ],
+                      "properties": {
+                        "key": {
+                          "type": "string",
+                          "description": "The plaintext key, in the form `st_<prefix>_<secret>`. Returned once and never again; store it before discarding the response."
+                        }
+                      }
+                    }
+                  ]
+                },
+                "example": {
+                  "id": 1,
+                  "name": "ci-reader",
+                  "prefix": "a1b2c3d4e5f6g7h8",
+                  "created_at": "2026-09-01T12:00:00Z",
+                  "key": "st_a1b2c3d4e5f6g7h8_Zm9vYmFyYmF6cXV4..."
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/apikeys/{id}": {
+      "delete": {
+        "operationId": "revokeAPIKey",
+        "summary": "Revoke an API key",
+        "description": "Marks the key revoked. The row is kept so the key's history stays auditable, but the key stops authenticating immediately. Revoking an already-revoked key is not an error.",
+        "tags": [
+          "Auth"
+        ],
+        "security": [
+          {
+            "TenantAuth": []
+          },
+          {
+            "TenantAuthHeader": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "The key's database ID, as returned by POST /apikeys — not its public prefix and not the plaintext key. Must be a positive integer.",
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 1
+            },
+            "example": 1
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Revoked"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
     "/contracts": {
       "get": {
         "operationId": "listContracts",
@@ -3726,16 +3911,51 @@
       "Decoded": {
         "name": "decoded",
         "in": "query",
-        "description": "When \"true\", enrich events with spec-driven named fields. Any other value leaves the response undecoded; only the exact string \"true\" turns enrichment on. Enrichment is skipped silently when no contract spec is available, so a decoded request is never an error.",
+        "description": "Controls how stored event bodies are rendered. \"true\" enriches events with spec-driven named fields; enrichment is skipped silently when no contract spec is available, so a decoded request is never an error. \"false\" is the opt-out: the stored columns are returned exactly as they are, without the additive sep41_event envelope the default rendering attaches. Omitting the parameter, or passing any other value, keeps that default rendering.",
         "schema": {
           "type": "string",
           "enum": [
-            "true"
+            "true",
+            "false"
           ]
         }
       }
     },
     "schemas": {
+      "APIKey": {
+        "type": "object",
+        "description": "API key metadata. The secret half of the key is never included — only a bcrypt hash of it is stored, and the plaintext is returned exactly once, by POST /apikeys.",
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Database ID, used to revoke the key."
+          },
+          "name": {
+            "type": "string",
+            "description": "Human-readable label, empty for an unnamed key."
+          },
+          "prefix": {
+            "type": "string",
+            "description": "The non-secret 16-character lookup handle stored in the clear. It identifies the key without revealing it."
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "revoked_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the key was revoked. Absent while the key is active."
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "prefix",
+          "created_at"
+        ]
+      },
       "ErrorResponse": {
         "type": "object",
         "description": "Standard error envelope",

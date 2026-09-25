@@ -66,11 +66,18 @@ CREATE TABLE IF NOT EXISTS tenant_watched_contracts (
 
 CREATE INDEX IF NOT EXISTS idx_tenant_watched_contract ON tenant_watched_contracts (contract_id);
 
--- API keys (#17). Only the SHA-256 of the key is stored, so a database
--- disclosure does not yield usable credentials. prefix is the non-secret
--- lookup handle: it selects the candidate row by index, and the secret half
--- is then compared in constant time.
-CREATE TABLE IF NOT EXISTS api_keys (
+-- Tenant API keys (#17). A separate table from the operator-level api_keys
+-- (migration 0010): that one is a single, un-tenanted credential set for
+-- the simple single-instance deployment, and its "prefix" and key_hash
+-- (bcrypt, text) namespaces are unrelated to a tenant's. Giving this
+-- feature its own table avoids retrofitting a NOT NULL tenant_id and a
+-- bytea key_hash onto a table that may already carry operator keys.
+--
+-- Only the SHA-256 of the key is stored, so a database disclosure does not
+-- yield usable credentials. prefix is the non-secret lookup handle: it
+-- selects the candidate row by index, and the secret half is then compared
+-- in constant time.
+CREATE TABLE IF NOT EXISTS tenant_api_keys (
     id           bigserial PRIMARY KEY,
     tenant_id    bigint NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
     name         text NOT NULL DEFAULT '',
@@ -83,7 +90,7 @@ CREATE TABLE IF NOT EXISTS api_keys (
     revoked_at   timestamptz
 );
 
-CREATE INDEX IF NOT EXISTS idx_api_keys_tenant ON api_keys (tenant_id) WHERE revoked_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_tenant_api_keys_tenant ON tenant_api_keys (tenant_id) WHERE revoked_at IS NULL;
 
 -- Usage is aggregated per tenant per UTC day. Per-request rows would grow
 -- without bound and buy nothing: billing and quota questions are asked by

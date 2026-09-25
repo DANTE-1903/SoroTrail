@@ -14,6 +14,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/sorotrail/sorotrail/internal/sep41"
@@ -444,6 +445,20 @@ const (
 // be decoded for the requested sort. The API maps it to 400.
 var ErrInvalidContractsCursor = errors.New("invalid contracts cursor")
 
+// ErrUnsupported is returned by a backend that cannot serve an operation at
+// all, as opposed to one that merely found no data. Callers detect it with
+// errors.Is and map it to a clear status (501 or the backend's documented
+// fallback) rather than trusting the empty result.
+var ErrUnsupported = errors.New("operation not supported by this store backend")
+
+// errUnsupported builds a backend's explicit refusal for one operation. It
+// names both the operation and the backend so the API layer can map it to a
+// clear status and an operator reading a log knows exactly which capability
+// is missing, while wrapping ErrUnsupported so errors.Is works uniformly.
+func errUnsupported(backend, op string) error {
+	return fmt.Errorf("%s: not supported by the %s backend: %w", op, backend, ErrUnsupported)
+}
+
 // DeadLetter is one event that the ingester could not persist into the
 // events table. It carries enough context (raw XDR + the error) for an
 // operator to inspect the row, hand-replay it through a future
@@ -618,6 +633,7 @@ type APIKey struct {
 
 // Revoked reports whether the key has been revoked.
 func (k APIKey) Revoked() bool { return k.RevokedAt != nil }
+
 // IsAll reports whether the owner filter is unrestricted.
 func (o SubscriptionOwner) IsAll() bool { return o.all }
 
@@ -703,6 +719,12 @@ type Stats struct {
 	// Decode counters are populated only when a spec enricher is wired;
 	// omitted from JSON when it is nil (decoded=true is unavailable).
 	Decode *DecodeStats `json:"decode,omitempty"`
+	// Spec-cache counters are populated only when the API layer is given
+	// a spec cache; omitted from JSON otherwise.
+	SpecCache SpecCacheStats `json:"spec_cache,omitempty"`
+	// Pruner counters are populated only when retention is configured;
+	// omitted from JSON when the pruner is a no-op.
+	Pruner PrunerStats `json:"pruner,omitempty"`
 }
 
 // DecodeStats is a JSON-friendly view of spec-enrichment decode counters,

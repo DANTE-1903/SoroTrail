@@ -624,7 +624,7 @@ func bootstrapAdminKey(ctx context.Context, ts store.TenantStore, key string, lo
 	if err != nil {
 		return fmt.Errorf("loading default tenant: %w", err)
 	}
-	err = ts.CreateAPIKeyIfAbsent(ctx, tenant.ID, "bootstrap", prefix, digest)
+	err = ts.CreateTenantAPIKeyIfAbsent(ctx, tenant.ID, "bootstrap", prefix, digest)
 	if err != nil {
 		return fmt.Errorf("installing bootstrap key: %w", err)
 	}

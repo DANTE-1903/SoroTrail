@@ -285,7 +285,7 @@ func (s *Server) handleCreateTenantKey(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, errors.New("generating api key failed"))
 		return
 	}
-	key, err := s.tenants.CreateAPIKey(r.Context(), t.ID, req.Name, prefix, digest)
+	key, err := s.tenants.CreateTenantAPIKey(r.Context(), t.ID, req.Name, prefix, digest)
 	if err != nil {
 		s.log.Error("creating api key", "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("creating api key failed"))
@@ -301,7 +301,7 @@ func (s *Server) handleListTenantKeys(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	keys, err := s.tenants.ListAPIKeys(r.Context(), t.ID)
+	keys, err := s.tenants.ListTenantAPIKeys(r.Context(), t.ID)
 	if err != nil {
 		s.log.Error("listing api keys", "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("listing api keys failed"))
@@ -319,7 +319,7 @@ func (s *Server) handleRevokeTenantKey(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	err := s.tenants.RevokeAPIKey(r.Context(), id)
+	err := s.tenants.RevokeTenantAPIKey(r.Context(), id)
 	if errors.Is(err, store.ErrNotFound) {
 		writeError(w, http.StatusNotFound, fmt.Errorf("api key %d not found", id))
 		return

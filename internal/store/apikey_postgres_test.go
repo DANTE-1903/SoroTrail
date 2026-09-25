@@ -1,3 +1,5 @@
+//go:build integration
+
 package store
 
 // Integration tests for API key persistence. They need a real database

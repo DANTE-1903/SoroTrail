@@ -16,9 +16,9 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/khaylebfortune/sorotrail/internal/apikey"
-	"github.com/khaylebfortune/sorotrail/internal/rpc"
-	"github.com/khaylebfortune/sorotrail/internal/store"
+	"github.com/sorotrail/sorotrail/internal/apikey"
+	"github.com/sorotrail/sorotrail/internal/rpc"
+	"github.com/sorotrail/sorotrail/internal/store"
 )
 
 // authStubStore wraps stubStore with in-memory API key persistence so
@@ -75,7 +75,7 @@ func (s *authStubStore) ListAPIKeys(context.Context) ([]store.APIKey, error) {
 
 // GetSubscription returns a canned subscription so write paths that
 // read-then-update (PUT /subscriptions/{id}) work in tests.
-func (s *authStubStore) GetSubscription(_ context.Context, id int64) (store.Subscription, error) {
+func (s *authStubStore) GetSubscription(_ context.Context, id int64, _ store.SubscriptionOwner) (store.Subscription, error) {
 	return store.Subscription{ID: id, URL: "https://example.com/hook", Secret: "whsec_x", Enabled: true}, nil
 }
 
@@ -106,7 +106,7 @@ func (s *authStubStore) addKey(t *testing.T, name string) string {
 
 func newAuthServer(st store.Store, enabled bool) *Server {
 	rc := &stubRPC{health: rpc.Health{Status: "healthy"}}
-	s := New(st, rc, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	s := New(st, rc, slog.New(slog.NewTextHandler(io.Discard, nil)), "")
 	s.WithAPIKeyAuth(enabled)
 	return s
 }

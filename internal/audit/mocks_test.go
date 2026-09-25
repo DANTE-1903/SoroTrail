@@ -397,22 +397,6 @@ func (m *mockStore) ListAPIKeys(context.Context) ([]store.APIKey, error) {
 }
 func (m *mockStore) RevokeAPIKey(context.Context, int64) error { return nil }
 
-// seedLedgers records pre-existing events in m.events so tests can set up
-// "stored state that diverges from the RPC" without a database. IDs use
-// the same %020d-%05d format as mkEvents, so seeded events and RPC
-// events are comparable by id.
-func (m *mockStore) seedLedgers(ledgers []int, contractID string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	for _, l := range ledgers {
-		id := fmt.Sprintf("%020d-00000", l)
-		m.events[id] = store.Event{
-			ID:         id,
-			ContractID: contractID,
-			Ledger:     int64(l),
-			Type:       "contract",
-		}
-	}
 func (m *mockStore) GetEarliestLedger(ctx context.Context, network, contractID string) (int64, error) {
 	return 0, nil
 }

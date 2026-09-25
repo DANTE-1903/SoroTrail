@@ -65,6 +65,9 @@ func (s *stubSpecStore) GetContractSpec(_ context.Context, wasmHash string) ([]b
 }
 
 func (s *stubSpecStore) SetContractSpec(_ context.Context, wasmHash, _ string, specJSON []byte) error {
+	if s.specs == nil {
+		s.specs = make(map[string][]byte)
+	}
 	s.specs[wasmHash] = specJSON
 	return nil
 }

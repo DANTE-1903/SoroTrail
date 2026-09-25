@@ -31,6 +31,8 @@ func (e *stubEnricher) EnrichEvents(_ context.Context, events []store.Event) []s
 	}}
 }
 
+func (e *stubEnricher) DecodeStats() store.DecodeStats { return store.DecodeStats{} }
+
 // assertImmutable asserts that a response carries the immutable-cache
 // header set: strong ETag (when expected), Vary: Accept-Encoding,
 // Cache-Control: public + max-age + immutable.

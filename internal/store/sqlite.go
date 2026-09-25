@@ -1578,6 +1578,25 @@ func (s *SQLite) ListContracts(context.Context, ContractsFilter) ([]ContractSumm
 	return nil, "", fmt.Errorf("ListContracts: not supported by the sqlite backend")
 }
 
+// API keys are not implemented for the SQLite backend: single-node
+// deployments authenticate via the operator's own reverse proxy or run
+// without the HTTP API's key check entirely.
+func (s *SQLite) CreateAPIKey(context.Context, APIKey) (APIKey, error) {
+	return APIKey{}, errUnsupported("sqlite", "CreateAPIKey")
+}
+func (s *SQLite) GetAPIKey(context.Context, int64) (APIKey, error) {
+	return APIKey{}, errUnsupported("sqlite", "GetAPIKey")
+}
+func (s *SQLite) LookupAPIKeyByPrefix(context.Context, string) (APIKey, error) {
+	return APIKey{}, errUnsupported("sqlite", "LookupAPIKeyByPrefix")
+}
+func (s *SQLite) ListAPIKeys(context.Context) ([]APIKey, error) {
+	return nil, errUnsupported("sqlite", "ListAPIKeys")
+}
+func (s *SQLite) RevokeAPIKey(context.Context, int64) error {
+	return errUnsupported("sqlite", "RevokeAPIKey")
+}
+
 // Per-contract cursors are not implemented for the SQLite backend: watched
 // ingestion always uses the single global ingestion_state row.
 func (s *SQLite) GetContractCursor(context.Context, string) (ContractCursor, error) {
