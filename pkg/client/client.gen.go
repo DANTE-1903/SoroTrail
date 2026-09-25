@@ -41,6 +41,9 @@ var SpecRoutes = []SpecRoute{
 	{Method: "GET", Path: "/admin/tenants/{id}/keys"},
 	{Method: "POST", Path: "/admin/tenants/{id}/keys"},
 	{Method: "GET", Path: "/admin/tenants/{id}/usage"},
+	{Method: "GET", Path: "/apikeys"},
+	{Method: "POST", Path: "/apikeys"},
+	{Method: "DELETE", Path: "/apikeys/{id}"},
 	{Method: "GET", Path: "/contracts"},
 	{Method: "GET", Path: "/contracts/{id}"},
 	{Method: "GET", Path: "/contracts/{id}/events"},
@@ -80,6 +83,14 @@ var SpecRoutes = []SpecRoute{
 	{Method: "GET", Path: "/watched-contracts"},
 	{Method: "POST", Path: "/watched-contracts"},
 	{Method: "DELETE", Path: "/watched-contracts/{id}"},
+}
+
+type APIKey struct {
+	CreatedAt string `json:"created_at"`
+	ID        int64  `json:"id"`
+	Name      string `json:"name"`
+	Prefix    string `json:"prefix"`
+	RevokedAt string `json:"revoked_at,omitempty"`
 }
 
 type ContractSummary struct {
@@ -214,6 +225,12 @@ type ContractStatsResponse struct {
 type CountEventsResponse struct {
 	Count int64 `json:"count,omitempty"`
 }
+
+type CreateAPIKeyRequest struct {
+	Name string `json:"name,omitempty"`
+}
+
+type CreateAPIKeyResponse map[string]any
 
 type CreateTenantKeyResponse map[string]any
 
@@ -449,6 +466,30 @@ func (p TenantUsageParams) values() url.Values {
 		v.Set("days", strconv.FormatInt(p.Days, 10))
 	}
 	return v
+}
+
+// ListAPIKeys List API keys.
+//
+// GET /apikeys
+func (c *Client) ListAPIKeys(ctx context.Context) ([]APIKey, error) {
+	path := "/apikeys"
+	return doSlice[APIKey](c, ctx, "GET", path, nil, nil)
+}
+
+// CreateAPIKey Create an API key.
+//
+// POST /apikeys
+func (c *Client) CreateAPIKey(ctx context.Context, body CreateAPIKeyRequest) (*CreateAPIKeyResponse, error) {
+	path := "/apikeys"
+	return do[CreateAPIKeyResponse](c, ctx, "POST", path, nil, body)
+}
+
+// RevokeAPIKey Revoke an API key.
+//
+// DELETE /apikeys/{id}
+func (c *Client) RevokeAPIKey(ctx context.Context, id int64) error {
+	path := urlEscapePath("/apikeys/{id}", strconv.FormatInt(id, 10))
+	return doNoContent(c, ctx, "DELETE", path, nil, nil)
 }
 
 // ListContracts List indexed contracts.
