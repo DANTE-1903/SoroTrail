@@ -1697,11 +1697,15 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.getStatsCache().Put(key, stats, time.Now())
+	if s.enricher != nil {
+		d := s.enricher.DecodeStats()
+		stats.Decode = &d
+	}
 	if sc := getSpecCache(); sc != nil {
 		stats.SpecCache = sc.SpecCacheStats()
 	}
 
+	s.getStatsCache().Put(key, stats, time.Now())
 	writeCacheHeaders(w, cacheNoStore, 0, "")
 	writeJSON(w, http.StatusOK, stats)
 }
