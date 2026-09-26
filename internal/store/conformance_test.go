@@ -215,7 +215,7 @@ func newClickHouseStoreForTests(t *testing.T) (Store, error) {
 
 func newClickHouseConformanceStore(t *testing.T) Store {
 	t.Helper()
-	st, err := newClickHouseStoreForTests(t)
+	st, err := newClickHouseStoreForTests()
 	require.NoError(t, err)
 	return st
 }
