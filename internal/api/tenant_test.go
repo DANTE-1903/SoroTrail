@@ -41,7 +41,8 @@ const (
 // is proven separately, against a real database, in
 // internal/store/tenant_postgres_test.go.
 type scopedStore struct {
-	store.Store // panics on anything not implemented here
+	store.Store
+	StoreField store.Store // panics on anything not implemented here
 
 	events []store.Event
 
@@ -936,6 +937,8 @@ func TestParseAPIKeyForBootstrapMatchesGeneration(t *testing.T) {
 // return nothing rather than everything. This is the property the whole
 // fail-closed design exists to guarantee.
 func TestForgottenScopeDeniesRatherThanLeaks(t *testing.T) {
+	f := newTenantFixture(t)
+	_ = f
 	st := &scopedStore{events: []store.Event{
 		{ID: "ev-a1", ContractID: contractA},
 		{ID: "ev-b1", ContractID: contractB},
@@ -1350,7 +1353,8 @@ func TestRevokedKeyRejectedOnNextRequest(t *testing.T) {
 // only receive events for contracts it is granted.
 func TestWebSocketSubscriptionsHonourBoundary(t *testing.T) {
 	f := newTenantFixture(t)
-
+	st := f.st
+	st.seenScopes = nil
 	// Verify that the store's scope filtering applies to subscription
 	// paths the same way it does to read endpoints.
 	for _, path := range []string{
