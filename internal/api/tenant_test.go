@@ -41,7 +41,8 @@ const (
 // is proven separately, against a real database, in
 // internal/store/tenant_postgres_test.go.
 type scopedStore struct {
-	store.Store // panics on anything not implemented here
+	store.Store
+	StoreField store.Store // panics on anything not implemented here
 
 	events []store.Event
 
@@ -1352,7 +1353,7 @@ func TestRevokedKeyRejectedOnNextRequest(t *testing.T) {
 // only receive events for contracts it is granted.
 func TestWebSocketSubscriptionsHonourBoundary(t *testing.T) {
 	f := newTenantFixture(t)
-st, ok := f.st.(*scopedStore)
+	st, ok := f.st.(*scopedStore)
 	require.True(t, ok)
 	st.seenScopes = nil
 	// Verify that the store's scope filtering applies to subscription
