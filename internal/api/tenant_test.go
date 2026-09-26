@@ -1353,8 +1353,7 @@ func TestRevokedKeyRejectedOnNextRequest(t *testing.T) {
 // only receive events for contracts it is granted.
 func TestWebSocketSubscriptionsHonourBoundary(t *testing.T) {
 	f := newTenantFixture(t)
-	st, ok := f.st.(*scopedStore)
-	require.True(t, ok)
+	st := f.st
 	st.seenScopes = nil
 	// Verify that the store's scope filtering applies to subscription
 	// paths the same way it does to read endpoints.
