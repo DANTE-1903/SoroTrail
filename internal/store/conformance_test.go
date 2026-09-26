@@ -647,28 +647,6 @@ func TestClickHouse_SuiteSkipsCleanly(t *testing.T) {
 // assertions against any Store implementation to guarantee that backends agree
 // on ErrNotFound, empty collections, and error handling.
 func RunStoreConformanceSuite(t *testing.T, st Store) {
-	t.Helper()
-	ctx := context.Background()
-
-	t.Run("MissingSingleResourceReturnsErrNotFound", func(t *testing.T) {
-		// Querying a non-existent single resource or state must consistently return ErrNotFound.
-		_, err := st.GetEvent(ctx, "nonexistent-event-id", WildcardScope())
-		assert.ErrorIs(t, err, ErrNotFound)
-	})
-
-	t.Run("EmptyCollectionReturnsEmptySliceNeverErrNotFound", func(t *testing.T) {
-		// Querying collections with no matching records must return an empty result set and nil error.
-		contracts, err := st.ListWatchedContracts(ctx)
-		require.NoError(t, err)
-		assert.Empty(t, contracts)
-
-		// QueryEvents with a scope that matches nothing should return an empty slice and nil error.
-		events, _, err := st.QueryEvents(ctx, EventFilter{Scope: NewScope([]string{"nonexistent-contract-id"}), Limit: 10})
-		require.NoError(t, err)
-		assert.Empty(t, events)
-	})
-
-func RunStoreConformanceSuite(t *testing.T, st Store) {
 	runStoreTests(t, conformanceBackend{
 		name:    "custom",
 		factory: func(t *testing.T) Store { return st },
