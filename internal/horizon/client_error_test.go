@@ -17,7 +17,7 @@ func TestHorizonClientErrorPaths(t *testing.T) {
 		}))
 		defer srv.Close()
 
-		client := NewClient(srv.URL)
+		client := New(srv.URL)
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 
@@ -25,14 +25,13 @@ func TestHorizonClientErrorPaths(t *testing.T) {
 		require.Error(t, err)
 		assert.ErrorIs(t, err, context.Canceled)
 	})
-
 	t.Run("bad status code", func(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusInternalServerError)
 		}))
 		defer srv.Close()
 
-		client := NewClient(srv.URL)
+		client := New(srv.URL)
 		_, err := client.GetTransactions(context.Background(), 1)
 		require.Error(t, err)
 	})
