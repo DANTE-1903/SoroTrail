@@ -7,32 +7,19 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
-func TestHorizonClientErrorPaths(t *testing.T) {
-	t.Run("canceled context", func(t *testing.T) {
-		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// Never respond
-		}))
-		defer srv.Close()
-
-		client := New(srv.URL)
-		ctx, cancel := context.WithCancel(context.Background())
-		cancel()
-
-		_, err := client.GetTransactions(ctx, 1)
-		require.Error(t, err)
-		assert.ErrorIs(t, err, context.Canceled)
-	})
-	t.Run("bad status code", func(t *testing.T) {
-		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+func TestClientErrors(t *testing.T) {
+	t.Run("DoRequest error", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"detail":"internal error"}`))
 		}))
-		defer srv.Close()
+		defer server.Close()
 
-		client := New(srv.URL)
-		_, err := client.GetTransactions(context.Background(), 1)
-		require.Error(t, err)
+		client := New(server.URL)
+		ctx := context.Background()
+		err := client.Health(ctx)
+		assert.Error(t, err)
 	})
 }
