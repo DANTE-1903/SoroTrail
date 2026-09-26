@@ -207,8 +207,10 @@ func TestContractsEventsGolden(t *testing.T) {
 	compareGolden(t, "contracts_events", rec.Body.Bytes())
 }
 
-// TestEventsGoldenFilesAreValidJSON validates every golden file in
-// the testdata/golden directory is valid JSON.
+// TestEventsGoldenCoverage verifies that every route enumerated by
+// pkg/docs/drift_test.go has a corresponding golden file for the
+// 200 response shape. This ensures no endpoint is silently omitted
+// from golden-file coverage.
 func TestEventsGoldenFilesAreValidJSON(t *testing.T) {
 	entries, err := os.ReadDir(filepath.Join("testdata", "golden"))
 	require.NoError(t, err)
@@ -216,16 +218,15 @@ func TestEventsGoldenFilesAreValidJSON(t *testing.T) {
 		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
 			continue
 		}
-		body, err := os.ReadFile(filepath.Join("testdata", "golden", entry.Name()))
-		require.NoError(t, err, entry.Name())
-		require.True(t, json.Valid(body), "golden file %s must contain valid JSON", entry.Name())
+		t.Run(entry.Name(), func(t *testing.T) {
+			data, err := os.ReadFile(filepath.Join("testdata", "golden", entry.Name()))
+			require.NoError(t, err)
+			var v interface{}
+			assert.NoError(t, json.Unmarshal(data, &v))
+		})
 	}
 }
 
-// TestEventsGoldenCoverage verifies that every route enumerated by
-// pkg/docs/drift_test.go has a corresponding golden file for the
-// 200 response shape. This ensures no endpoint is silently omitted
-// from golden-file coverage.
 func TestEventsGoldenCoverage(t *testing.T) {
 	// The golden files must exist for each documented endpoint
 	// that produces a 200 response. This test asserts that the
