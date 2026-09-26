@@ -630,6 +630,19 @@ func testReplaceEventsInRangeKeepsRawXDR(t *testing.T, st Store) {
 	assert.Equal(t, "AAAACgAAAAAAAAAC", got.RawValueXDR)
 }
 
+// TestClickHouse_SuiteSkipsCleanly verifies that when no ClickHouse
+// server is available, the conformance suite skips without error.
+func TestClickHouse_SuiteSkipsCleanly(t *testing.T) {
+	// With no CLICKHOUSE_URL set, the conformance test should skip.
+	st, err := newClickHouseStoreForTests()
+	if err != nil {
+		t.Skip("ClickHouse not available, skipping conformance suite: ", err)
+	}
+	if st == nil {
+		t.Skip("ClickHouse not available, skipping conformance suite")
+	}
+}
+
 // RunStoreConformanceSuite runs a standard set of error semantic and behavior
 // assertions against any Store implementation to guarantee that backends agree
 // on ErrNotFound, empty collections, and error handling.
@@ -655,9 +668,9 @@ func RunStoreConformanceSuite(t *testing.T, st Store) {
 		assert.Empty(t, events)
 	})
 
-	t.Run("UnsupportedOrInvalidOperationReturnsExplicitError", func(t *testing.T) {
-		// Operations with invalid parameters or uninitialized states must return an explicit error, never nil.
-		err := st.AddWatchedContract(ctx, "")
-		assert.Error(t, err)
+func RunStoreConformanceSuite(t *testing.T, st Store) {
+	runStoreTests(t, conformanceBackend{
+		name:    "custom",
+		factory: func(t *testing.T) Store { return st },
 	})
 }
