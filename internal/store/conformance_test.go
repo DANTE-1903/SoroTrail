@@ -215,7 +215,7 @@ func newClickHouseStoreForTests(t *testing.T) (Store, error) {
 
 func newClickHouseConformanceStore(t *testing.T) Store {
 	t.Helper()
-	st, err := newClickHouseStoreForTests()
+	st, err := newClickHouseStoreForTests(t)
 	require.NoError(t, err)
 	return st
 }
@@ -647,7 +647,7 @@ func testReplaceEventsInRangeKeepsRawXDR(t *testing.T, st Store) {
 // server is available, the conformance suite skips without error.
 func TestClickHouse_SuiteSkipsCleanly(t *testing.T) {
 	// With no CLICKHOUSE_URL set, the conformance test should skip.
-	st, err := newClickHouseStoreForTests()
+	st, err := newClickHouseStoreForTests(t)
 	if err != nil {
 		t.Skip("ClickHouse not available, skipping conformance suite: ", err)
 	}
