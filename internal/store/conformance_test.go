@@ -194,7 +194,7 @@ func newPostgresConformanceStore(t *testing.T) Store {
 // is configured. The backend currently declares the behavioural suite
 // unsupported, so this is only reached once those stubs grow real
 // implementations; the gate keeps a missing server a skip, never a failure.
-func newClickHouseConformanceStore(t *testing.T) Store {
+func newClickHouseStoreForTests(t *testing.T) Store {
 	t.Helper()
 	url := os.Getenv("TEST_CLICKHOUSE_URL")
 	if url == "" {
@@ -205,6 +205,11 @@ func newClickHouseConformanceStore(t *testing.T) Store {
 	require.NoError(t, err)
 	require.NoError(t, st.Ping(context.Background()))
 	return st
+}
+
+func newClickHouseConformanceStore(t *testing.T) Store {
+	t.Helper()
+	return newClickHouseStoreForTests(t)
 }
 
 func testUpsertEventsIdempotent(t *testing.T, st Store) {
