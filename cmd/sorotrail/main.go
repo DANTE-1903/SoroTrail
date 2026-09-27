@@ -114,8 +114,12 @@ func dispatch(args []string) error {
 		return runMigrateStatus(args[1:])
 	case "completion":
 		return runCompletion(args[1:])
+	case "version", "--version", "-V":
+		return runVersion(args[1:])
 	case "stats":
 		return runStats(args[1:])
+	case "config":
+		return runConfig(args[1:])
 	case "help", "-h", "--help":
 		usage()
 		return nil
@@ -151,8 +155,12 @@ subcommands:
                    (sorotrail migrate-status --help)
   completion       print a shell completion script (bash, zsh, fish)
                    (sorotrail completion --help)
+  version          print the build version, commit, and build date
+                   (sorotrail version --help)
   stats            print store stats as a table
                    (sorotrail stats --help)
+  config           print the effective configuration with secrets redacted
+                   (sorotrail config --help)
 `)
 }
 

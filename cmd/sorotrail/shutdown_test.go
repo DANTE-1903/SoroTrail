@@ -21,6 +21,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -52,6 +53,11 @@ func sorotrailBinary(t *testing.T) string {
 		}
 		lifecycleBinD = dir
 		path := filepath.Join(dir, "sorotrail")
+		if runtime.GOOS == "windows" {
+			// Windows will not execute a file without an executable
+			// extension, and go build writes exactly the -o path given.
+			path += ".exe"
+		}
 		cmd := exec.Command("go", "build", "-o", path, ".")
 		out, err := cmd.CombinedOutput()
 		if err != nil {
@@ -390,7 +396,7 @@ func TestSecondSignalForcesImmediateExit(t *testing.T) {
 	sendSignal(t, c)
 	// Give the first signal time to enter the shutdown path and
 	// unregister the handler before the second one arrives.
-	time.Sleep(time.Second)
+	time.Sleep(200 * time.Millisecond)
 	sendSignal(t, c)
 	secondAt := time.Now()
 
