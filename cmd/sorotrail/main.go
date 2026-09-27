@@ -118,6 +118,8 @@ func dispatch(args []string) error {
 		return runVersion(args[1:])
 	case "stats":
 		return runStats(args[1:])
+	case "config":
+		return runConfig(args[1:])
 	case "help", "-h", "--help":
 		usage()
 		return nil
@@ -157,6 +159,8 @@ subcommands:
                    (sorotrail version --help)
   stats            print store stats as a table
                    (sorotrail stats --help)
+  config           print the effective configuration with secrets redacted
+                   (sorotrail config --help)
 `)
 }
 
