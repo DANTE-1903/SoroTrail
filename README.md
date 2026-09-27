@@ -194,6 +194,7 @@ the struct tags in `internal/config/config.go` to prevent drift.
 | `POLL_INTERVAL_MIN` | duration | unset | Lower bound for the adaptive poll interval. Once caught up, the effective interval shrinks toward this when a cycle just observed backlog. Both `POLL_INTERVAL_MIN` and `POLL_INTERVAL_MAX` unset (the default) disables adaptation — the ingester always polls at exactly `POLL_INTERVAL`. See [Ingestion behavior additions](#ingestion-behavior-additions). |
 | `POLL_INTERVAL_MAX` | duration | unset | Upper bound for the adaptive poll interval. The effective interval grows toward this on an idle cycle. See `POLL_INTERVAL_MIN`. |
 | `WATCHED_CONTRACTS` | CSV | empty | Comma-separated contract IDs (`C...`). Empty = ingest **all** contract events. Each watched contract tracks its own resume cursor; adding a contract triggers a backfill from `latest − RETENTION_LEDGERS`. |
+| `SKIP_CONTRACTS` | CSV | empty | Comma-separated contract IDs (`C...`) to never index events from. |
 | `START_LEDGER` | string | unset | Force cold-start ingestion from this ledger. Accepts an absolute number (≥ 2) or a relative offset like `latest-1000`. |
 | `START_LEDGER_RAW` | string | unset | Raw form of `START_LEDGER` before parsing. Used internally; operators should set `START_LEDGER` instead. |
 | `RETENTION_LEDGERS` | uint32 | `17280` | Cold-start reach-back in ledgers (~24h at 5s/ledger). Clamped to the RPC's oldest retained ledger. |
