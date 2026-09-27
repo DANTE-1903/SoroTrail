@@ -60,3 +60,47 @@ func TestCheckComplexity_WideQuery(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "complexity")
 }
+
+// TestDepth pins the depth walker's counting rules through the real parser:
+// every field or inline-fragment level steps one deeper, siblings take the
+// maximum rather than summing, and a fragment spread counts a single level
+// without descending into the named body (bodies are scored at the root).
+func TestDepth(t *testing.T) {
+	tests := []struct {
+		name  string
+		query string
+		want  int
+	}{
+		// A leaf field still steps from the starting depth to current+1, so
+		// the shallowest non-empty query reports 2 and depth 1 is only the
+		// empty base case. This matches TestCheckDepth_TableBoundaries,
+		// which pins two nesting levels at depth 4.
+		{name: "flat query", query: `{ a }`, want: 2},
+		{name: "one nesting level", query: `{ a { b } }`, want: 3},
+		{name: "two nesting levels", query: `{ a { b { c } } }`, want: 4},
+		{name: "siblings take the maximum", query: `{ a b c }`, want: 2},
+		{name: "deep branch wins over shallow siblings", query: `{ a { b { c } } d }`, want: 4},
+		{name: "inline fragment descends like a field", query: `{ a { ... on T { b } } }`, want: 4},
+		// The fragment body alone would score 3, so 2 proves the spread
+		// counts only its own conservative increment per the documented
+		// intent on the FragmentSpread branch.
+		{name: "fragment spread does not descend into the body", query: `query { ...F } fragment F on Query { a { b } }`, want: 2},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			op := parseOp(t, tt.query)
+			assert.Equal(t, tt.want, depth(op.SelectionSet, 1))
+		})
+	}
+}
+
+// TestDepth_EmptySelectionSet covers the walker's base case: with nothing to
+// descend into it returns the starting depth instead of panicking.
+func TestDepth_EmptySelectionSet(t *testing.T) {
+	var got int
+	assert.NotPanics(t, func() {
+		got = depth(nil, 1)
+	})
+	assert.Equal(t, 1, got, "empty selection set is the depth-1 base case")
+}

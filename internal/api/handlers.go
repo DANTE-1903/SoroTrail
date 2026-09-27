@@ -1260,6 +1260,12 @@ func (s *Server) handleGetEventTransaction(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusInternalServerError, errors.New("loading transaction events failed"))
 		return
 	}
+	// GetEventsByTxHash has no Scope parameter of its own: a transaction can
+	// touch contracts beyond the one that authorized this request, so its
+	// result must be filtered by the caller's scope before it leaves this
+	// handler. Without this, a tenant granted only contractA could read
+	// contractB's events merely by sharing a transaction with contractA.
+	siblings = filterEventsByScope(siblings, scope)
 
 	mode := decodeModeFromQuery(r)
 
@@ -1287,6 +1293,24 @@ func (s *Server) handleGetEventTransaction(w http.ResponseWriter, r *http.Reques
 	} else {
 		writeJSON(w, http.StatusOK, map[string]any{"events": projectEvents(siblings, fields)})
 	}
+}
+
+// filterEventsByScope returns only the events whose contract is readable
+// under scope, preserving order. It exists for store methods like
+// GetEventsByTxHash that have no Scope parameter of their own and so return
+// rows spanning every contract in the transaction, not just the ones the
+// caller is authorized for.
+func filterEventsByScope(events []store.Event, scope store.Scope) []store.Event {
+	if scope.IsWildcard() {
+		return events
+	}
+	out := make([]store.Event, 0, len(events))
+	for _, ev := range events {
+		if scope.Allows(ev.ContractID) {
+			out = append(out, ev)
+		}
+	}
+	return out
 }
 
 func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request) {
@@ -1673,11 +1697,15 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.getStatsCache().Put(key, stats, time.Now())
+	if s.enricher != nil {
+		d := s.enricher.DecodeStats()
+		stats.Decode = &d
+	}
 	if sc := getSpecCache(); sc != nil {
 		stats.SpecCache = sc.SpecCacheStats()
 	}
 
+	s.getStatsCache().Put(key, stats, time.Now())
 	writeCacheHeaders(w, cacheNoStore, 0, "")
 	writeJSON(w, http.StatusOK, stats)
 }

@@ -21,6 +21,7 @@ import (
 	"github.com/sorotrail/sorotrail/internal/ingester"
 	"github.com/sorotrail/sorotrail/internal/metrics"
 	"github.com/sorotrail/sorotrail/internal/pruner"
+	"github.com/sorotrail/sorotrail/internal/requestid"
 	"github.com/sorotrail/sorotrail/internal/rpc"
 	"github.com/sorotrail/sorotrail/internal/store"
 )
@@ -642,8 +643,12 @@ func (s *Server) requestLogger(next http.Handler) http.Handler {
 		ww := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
 		start := time.Now()
 		reqID := middleware.GetReqID(r.Context())
-		log := s.log.With("request_id", reqID, "route", r.Method+" "+r.URL.Path)
+		log := s.log.With(requestid.Field, reqID, "route", r.Method+" "+r.URL.Path)
 		ctx := context.WithValue(r.Context(), loggerCtxKey, log)
+		// Mirror the id onto the context so layers below the router — the
+		// store and RPC decorators in particular — can tag their own slow-
+		// query and error logs without the handler passing it along.
+		ctx = requestid.WithRequestID(ctx, reqID)
 		ww.Header().Set("X-Request-ID", reqID)
 		next.ServeHTTP(ww, r.WithContext(ctx))
 		if span := trace.SpanFromContext(r.Context()); span.IsRecording() {

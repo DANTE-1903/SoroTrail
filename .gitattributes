@@ -1,3 +1,26 @@
+# Set default behavior to automatically normalize line endings to LF.
+* text=auto eol=lf
+
+# Explicitly declare text files to always use LF line endings.
+*.go text eol=lf
+*.sql text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+*.sh text eol=lf
+
+# True binaries are marked binary so git does not modify their contents.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.tar.gz binary
+*.gz binary
+
 # Golden and fixture files are compared byte-for-byte against output that
 # the code always writes with LF. A Windows checkout with core.autocrlf=true
 # rewrites them to CRLF, so the golden tests fail locally while passing in

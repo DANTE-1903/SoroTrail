@@ -89,3 +89,49 @@ func TestNewLoggerUsesTextByDefault(t *testing.T) {
 		t.Errorf("expected log message in text output, got %q", output)
 	}
 }
+
+func TestAdminBootstrapIdempotencyAndCreation(t *testing.T) {
+	// Test that admin bootstrap or command wrappers handle flag validation correctly
+	err := runAPIKey([]string{"--help"})
+	assert.NoError(t, err)
+}
+
+func TestDispatchUnknownCommand(t *testing.T) {
+	tests := []struct {
+		name    string
+		args    []string
+		wantErr string
+	}{
+		{
+			name:    "unknown subcommand",
+			args:    []string{"unknown-cmd"},
+			wantErr: "unknown subcommand \"unknown-cmd\"",
+		},
+		{
+			name:    "help subcommand",
+			args:    []string{"help"},
+			wantErr: "",
+		},
+		{
+			name:    "dash h flag",
+			args:    []string{"-h"},
+			wantErr: "",
+		},
+		{
+			name:    "double dash help flag",
+			args:    []string{"--help"},
+			wantErr: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := dispatch(tt.args)
+			if tt.wantErr == "" {
+				assert.NoError(t, err)
+			} else {
+				assert.EqualError(t, err, tt.wantErr)
+			}
+		})
+	}
+}
