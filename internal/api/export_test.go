@@ -226,6 +226,21 @@ func testServer(t *testing.T, st store.Store, maxRange int64) http.Handler {
 
 const testContractID = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
 
+// exportRangeFilter builds the filter that the old streamExportCSV helper
+// assembled internally from a contract id and a ledger range. main has since
+// unified the CSV and NDJSON paths into streamExport(ctx, w, filter, format),
+// so the cases below pass the filter explicitly and assert exactly what they
+// asserted before.
+func exportRangeFilter(contractID string, from, to int64) store.EventFilter {
+	return store.EventFilter{
+		ContractID: contractID,
+		FromLedger: from,
+		ToLedger:   to,
+		Limit:      exportQueryBatchSize,
+		Scope:      store.WildcardScope(),
+	}
+}
+
 func TestExport_CSVStreamsAllEventsInRange(t *testing.T) {
 	contract := testContractID
 	st := newFakeExportStore(seedEvents(contract))
@@ -755,7 +770,7 @@ func TestStreamExportCSV(t *testing.T) {
 		w := newTestExportWriter()
 		ctx := WithPrincipal(context.Background(), Principal{Scope: store.WildcardScope()})
 
-		s.streamExportCSV(ctx, w, testContractID, 100, 103)
+		s.streamExport(ctx, w, exportRangeFilter(testContractID, 100, 103), formatCSV)
 
 		r := csv.NewReader(&w.buf)
 		header, err := r.Read()
@@ -785,7 +800,7 @@ func TestStreamExportCSV(t *testing.T) {
 		w := newTestExportWriter()
 		ctx := WithPrincipal(context.Background(), Principal{Scope: store.WildcardScope()})
 
-		s.streamExportCSV(ctx, w, testContractID, 100, 200)
+		s.streamExport(ctx, w, exportRangeFilter(testContractID, 100, 200), formatCSV)
 
 		r := csv.NewReader(&w.buf)
 		header, err := r.Read()
@@ -808,7 +823,7 @@ func TestStreamExportCSV(t *testing.T) {
 		var logBuf bytes.Buffer
 		ctx := testContextWithLogger(WithPrincipal(context.Background(), Principal{Scope: store.WildcardScope()}), &logBuf)
 
-		s.streamExportCSV(ctx, w, testContractID, 100, 103)
+		s.streamExport(ctx, w, exportRangeFilter(testContractID, 100, 103), formatCSV)
 
 		// Verify error was logged rather than swallowed silently.
 		assert.Contains(t, logBuf.String(), "export query")
@@ -832,7 +847,7 @@ func TestStreamExportCSV(t *testing.T) {
 		var logBuf bytes.Buffer
 		ctx := testContextWithLogger(WithPrincipal(context.Background(), Principal{Scope: store.WildcardScope()}), &logBuf)
 
-		s.streamExportCSV(ctx, w, testContractID, 100, 103)
+		s.streamExport(ctx, w, exportRangeFilter(testContractID, 100, 103), formatCSV)
 
 		assert.Contains(t, logBuf.String(), "export cursor")
 	})
@@ -848,7 +863,7 @@ func TestStreamExportCSV(t *testing.T) {
 		w := newTestExportWriter()
 		ctx := WithPrincipal(context.Background(), Principal{Scope: store.WildcardScope()})
 
-		s.streamExportCSV(ctx, w, testContractID, 1, 1000)
+		s.streamExport(ctx, w, exportRangeFilter(testContractID, 1, 1000), formatCSV)
 
 		// Verify flusher was called after header and after each of the 10 pages.
 		expectedFlushes := 1 + (totalRows / pageSize)
@@ -868,7 +883,7 @@ func TestStreamExportCSV(t *testing.T) {
 		ctx, cancel := context.WithCancel(WithPrincipal(context.Background(), Principal{Scope: store.WildcardScope()}))
 		cancel() // already canceled
 
-		s.streamExportCSV(ctx, w, testContractID, 100, 103)
+		s.streamExport(ctx, w, exportRangeFilter(testContractID, 100, 103), formatCSV)
 
 		// After the first page, context check returns and does not query remaining pages.
 		assert.Equal(t, 1, st.callCount)
@@ -885,7 +900,7 @@ func TestStreamExportCSV(t *testing.T) {
 		var logBuf bytes.Buffer
 		ctx := testContextWithLogger(WithPrincipal(context.Background(), Principal{Scope: store.WildcardScope()}), &logBuf)
 
-		s.streamExportCSV(ctx, w, testContractID, 100, 103)
+		s.streamExport(ctx, w, exportRangeFilter(testContractID, 100, 103), formatCSV)
 
 		assert.Contains(t, logBuf.String(), "export csv write")
 	})
@@ -901,7 +916,7 @@ func TestStreamExportNDJSON(t *testing.T) {
 		w := newTestExportWriter()
 		ctx := WithPrincipal(context.Background(), Principal{Scope: store.WildcardScope()})
 
-		s.streamExportNDJSON(ctx, w, testContractID, 100, 103)
+		s.streamExport(ctx, w, exportRangeFilter(testContractID, 100, 103), formatNDJSON)
 
 		lines := strings.Split(strings.TrimRight(w.buf.String(), "\n"), "\n")
 		require.Len(t, lines, len(events), "must emit exactly one line per event")
@@ -937,7 +952,7 @@ func TestStreamExportNDJSON(t *testing.T) {
 		w := newTestExportWriter()
 		ctx := WithPrincipal(context.Background(), Principal{Scope: store.WildcardScope()})
 
-		s.streamExportNDJSON(ctx, w, testContractID, 100, 200)
+		s.streamExport(ctx, w, exportRangeFilter(testContractID, 100, 200), formatNDJSON)
 
 		assert.Empty(t, w.buf.String(), "empty result set must produce 0 bytes of NDJSON output")
 	})
@@ -953,7 +968,7 @@ func TestStreamExportNDJSON(t *testing.T) {
 		var logBuf bytes.Buffer
 		ctx := testContextWithLogger(WithPrincipal(context.Background(), Principal{Scope: store.WildcardScope()}), &logBuf)
 
-		s.streamExportNDJSON(ctx, w, testContractID, 100, 103)
+		s.streamExport(ctx, w, exportRangeFilter(testContractID, 100, 103), formatNDJSON)
 
 		assert.Contains(t, logBuf.String(), "export query")
 		assert.Contains(t, logBuf.String(), "ndjson store query failure")
@@ -973,7 +988,7 @@ func TestStreamExportNDJSON(t *testing.T) {
 		var logBuf bytes.Buffer
 		ctx := testContextWithLogger(WithPrincipal(context.Background(), Principal{Scope: store.WildcardScope()}), &logBuf)
 
-		s.streamExportNDJSON(ctx, w, testContractID, 100, 103)
+		s.streamExport(ctx, w, exportRangeFilter(testContractID, 100, 103), formatNDJSON)
 
 		assert.Contains(t, logBuf.String(), "export cursor")
 	})
@@ -989,7 +1004,7 @@ func TestStreamExportNDJSON(t *testing.T) {
 		w := newTestExportWriter()
 		ctx := WithPrincipal(context.Background(), Principal{Scope: store.WildcardScope()})
 
-		s.streamExportNDJSON(ctx, w, testContractID, 1, 1000)
+		s.streamExport(ctx, w, exportRangeFilter(testContractID, 1, 1000), formatNDJSON)
 
 		assert.Equal(t, totalRows/pageSize, w.flushes, "flusher must be called once per page")
 
@@ -1005,7 +1020,7 @@ func TestStreamExportNDJSON(t *testing.T) {
 		ctx, cancel := context.WithCancel(WithPrincipal(context.Background(), Principal{Scope: store.WildcardScope()}))
 		cancel()
 
-		s.streamExportNDJSON(ctx, w, testContractID, 100, 103)
+		s.streamExport(ctx, w, exportRangeFilter(testContractID, 100, 103), formatNDJSON)
 
 		assert.Equal(t, 1, st.callCount)
 	})
@@ -1020,7 +1035,7 @@ func TestStreamExportNDJSON(t *testing.T) {
 		var logBuf bytes.Buffer
 		ctx := testContextWithLogger(WithPrincipal(context.Background(), Principal{Scope: store.WildcardScope()}), &logBuf)
 
-		s.streamExportNDJSON(ctx, w, testContractID, 100, 103)
+		s.streamExport(ctx, w, exportRangeFilter(testContractID, 100, 103), formatNDJSON)
 
 		assert.Contains(t, logBuf.String(), "export ndjson write")
 	})
@@ -1044,7 +1059,7 @@ func TestStreamEventsCSV(t *testing.T) {
 		w := newTestExportWriter()
 		ctx := WithPrincipal(context.Background(), Principal{Scope: store.WildcardScope()})
 
-		s.streamEventsCSV(ctx, w, filter)
+		s.streamExport(ctx, w, filter, formatCSV)
 
 		r := csv.NewReader(&w.buf)
 		header, err := r.Read()
@@ -1074,7 +1089,7 @@ func TestStreamEventsCSV(t *testing.T) {
 		w := newTestExportWriter()
 		ctx := WithPrincipal(context.Background(), Principal{Scope: store.WildcardScope()})
 
-		s.streamEventsCSV(ctx, w, filter)
+		s.streamExport(ctx, w, filter, formatCSV)
 
 		r := csv.NewReader(&w.buf)
 		header, err := r.Read()
@@ -1096,7 +1111,7 @@ func TestStreamEventsCSV(t *testing.T) {
 		var logBuf bytes.Buffer
 		ctx := testContextWithLogger(WithPrincipal(context.Background(), Principal{Scope: store.WildcardScope()}), &logBuf)
 
-		s.streamEventsCSV(ctx, w, filter)
+		s.streamExport(ctx, w, filter, formatCSV)
 
 		assert.Contains(t, logBuf.String(), "export query")
 		assert.Contains(t, logBuf.String(), "events csv query error")
@@ -1118,7 +1133,7 @@ func TestStreamEventsCSV(t *testing.T) {
 		var logBuf bytes.Buffer
 		ctx := testContextWithLogger(WithPrincipal(context.Background(), Principal{Scope: store.WildcardScope()}), &logBuf)
 
-		s.streamEventsCSV(ctx, w, filter)
+		s.streamExport(ctx, w, filter, formatCSV)
 
 		assert.Contains(t, logBuf.String(), "export cursor")
 	})
@@ -1139,7 +1154,7 @@ func TestStreamEventsCSV(t *testing.T) {
 			Limit:      exportQueryBatchSize,
 			Scope:      store.WildcardScope(),
 		}
-		s.streamEventsCSV(ctx, w, bigFilter)
+		s.streamExport(ctx, w, bigFilter, formatCSV)
 
 		expectedFlushes := 1 + (totalRows / pageSize)
 		assert.Equal(t, expectedFlushes, w.flushes)
@@ -1158,7 +1173,7 @@ func TestStreamEventsCSV(t *testing.T) {
 		ctx, cancel := context.WithCancel(WithPrincipal(context.Background(), Principal{Scope: store.WildcardScope()}))
 		cancel()
 
-		s.streamEventsCSV(ctx, w, filter)
+		s.streamExport(ctx, w, filter, formatCSV)
 
 		assert.Equal(t, 1, st.callCount)
 	})
@@ -1174,10 +1189,12 @@ func TestStreamEventsCSV(t *testing.T) {
 		var logBuf bytes.Buffer
 		ctx := testContextWithLogger(WithPrincipal(context.Background(), Principal{Scope: store.WildcardScope()}), &logBuf)
 
-		s.streamEventsCSV(ctx, w, filter)
+		s.streamExport(ctx, w, filter, formatCSV)
 
 		assert.Contains(t, logBuf.String(), "csv write")
 	})
+}
+
 // TestEventsCSV_NDJSONFormat verifies that /events.csv — despite its
 // historical name — accepts ?format=ndjson exactly like
 // /contracts/{id}/export, closing the parity gap issue #578 tracks: a
