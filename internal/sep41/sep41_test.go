@@ -140,12 +140,12 @@ func TestParseTransferValue(t *testing.T) {
 			wantMuxID:  &toMuxedID,
 		},
 		{
-			name:       "missing amount is rejected",
-			value:      txVal{Map: []mapEntry{{Key: symbol("amount"), Val: txVal{String: &corrupted}}}},
+			name:  "missing amount is rejected",
+			value: txVal{Map: []mapEntry{{Key: symbol("amount"), Val: txVal{String: &corrupted}}}},
 		},
 		{
-			name:       "non-transfer envelope is rejected",
-			value:      txVal{Symbol: func() *string { value := "mint"; return &value }()},
+			name:  "non-transfer envelope is rejected",
+			value: txVal{Symbol: func() *string { value := "mint"; return &value }()},
 		},
 		{
 			name:  "empty value is rejected without panicking",
