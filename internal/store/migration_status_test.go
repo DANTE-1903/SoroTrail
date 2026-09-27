@@ -166,6 +166,9 @@ func TestCountEmbeddedMigrations(t *testing.T) {
 func TestGetMigrationStatus_UnreachableDatabaseIsAnError(t *testing.T) {
 	status, err := GetMigrationStatus("postgres://sorotrail:secret@127.0.0.1:1/sorotrail?sslmode=disable&connect_timeout=1")
 	require.Error(t, err, "an unreachable database must be an error, not an unmigrated status")
-	assert.Contains(t, err.Error(), "creating migration client")
+	// The wrapper MigrateStatus actually adds. "creating migration client"
+	// appears nowhere in the package, so the original expectation could never
+	// match whatever the connection failed with.
+	assert.Contains(t, err.Error(), "initializing migration driver")
 	assert.Equal(t, MigrationStatus{}, status, "no partial status is returned alongside the error")
 }
