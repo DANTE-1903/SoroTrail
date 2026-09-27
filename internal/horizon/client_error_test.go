@@ -17,7 +17,7 @@ func TestClient_ErrorPaths(t *testing.T) {
 		}))
 		defer server.Close()
 
-		client := NewClient(server.URL)
+		client := New(server.URL)
 		ctx := context.Background()
 		err := client.Health(ctx)
 		assert.Error(t, err)
@@ -31,7 +31,7 @@ func TestClientErrors(t *testing.T) {
 		}))
 		defer server.Close()
 
-		client := NewClient(server.URL)
+		client := New(server.URL)
 		ctx := context.Background()
 		err := client.Health(ctx)
 		assert.Error(t, err)
