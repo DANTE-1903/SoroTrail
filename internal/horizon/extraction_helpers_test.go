@@ -50,8 +50,9 @@ func TestEventPayloads(t *testing.T) {
 			name:       "topics and value use the RPC decoder shape",
 			body:       scVec(scSymbol("transfer"), scU64(42)),
 			wantTopics: `[{"symbol":"transfer"}]`,
-			wantValue:  `{"u64":"42"}`,
-			wantRaw:    true,
+			// The RPC decoder renders u64 as a JSON number, not a string.
+			wantValue: `{"u64":42}`,
+			wantRaw:   true,
 		},
 		{
 			name:       "empty payload list produces empty topics and null value",
@@ -82,13 +83,23 @@ func TestEventPayloads(t *testing.T) {
 
 func TestDecodeOne(t *testing.T) {
 	tests := []struct {
-		name     string
-		input    string
-		wantJSON string
-		wantOK   bool
+		name         string
+		input        string
+		wantJSON     string
+		wantOK       bool
+		wantContains []string
 	}{
 		{name: "empty XDR is JSON null", input: "", wantJSON: "null", wantOK: true},
-		{name: "malformed XDR is rejected", input: "not-base64-xdr", wantOK: false},
+		{
+			// Malformed XDR is not rejected. The decoder keeps it as a
+			// decode_error envelope carrying the original base64, so a bad
+			// payload stays visible on the row instead of being dropped —
+			// which is the behaviour worth pinning here.
+			name:         "malformed XDR becomes a decode_error envelope",
+			input:        "not-base64-xdr",
+			wantOK:       true,
+			wantContains: []string{`"type":"decode_error"`, "not-base64-xdr"},
+		},
 	}
 
 	for _, tt := range tests {
@@ -96,10 +107,15 @@ func TestDecodeOne(t *testing.T) {
 			got, ok := decodeOne(decode.XDRDecoder{}, tt.input)
 
 			assert.Equal(t, tt.wantOK, ok)
-			if tt.wantOK {
-				assert.JSONEq(t, tt.wantJSON, string(got))
-			} else {
+			switch {
+			case !tt.wantOK:
 				assert.Nil(t, got)
+			case len(tt.wantContains) > 0:
+				for _, want := range tt.wantContains {
+					assert.Contains(t, string(got), want)
+				}
+			default:
+				assert.JSONEq(t, tt.wantJSON, string(got))
 			}
 		})
 	}
