@@ -21,9 +21,9 @@ func TestClientErrors(t *testing.T) {
 		}))
 		defer server.Close()
 
-		client := NewClient(server.URL)
+		client := NewHTTPClient(server.URL, 0)
 		ctx := context.Background()
-		err := client.CheckHealth(ctx)
+		_, err := client.ListContractTransactions(ctx, "CDUMMY", "", 10, false)
 		assert.Error(t, err)
 	})
 }
@@ -34,11 +34,11 @@ func TestHorizonClientErrors(t *testing.T) {
 		}))
 		defer srv.Close()
 
-		client := NewClient(srv.URL)
+		client := NewHTTPClient(srv.URL, 0)
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 
-		err := client.CheckHealth(ctx)
+		_, err := client.ListContractTransactions(ctx, "CDUMMY", "", 10, false)
 		assert.Error(t, err)
 	})
 
@@ -48,8 +48,8 @@ func TestHorizonClientErrors(t *testing.T) {
 		}))
 		defer srv.Close()
 
-		client := NewClient(srv.URL)
-		err := client.CheckHealth(context.Background())
+		client := NewHTTPClient(srv.URL, 0)
+		_, err := client.ListContractTransactions(context.Background(), "CDUMMY", "", 10, false)
 		assert.Error(t, err)
 	})
 }
