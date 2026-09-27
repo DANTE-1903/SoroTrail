@@ -11,7 +11,9 @@ BUILD_DATE ?= $(shell date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo "unknown
 
 LDFLAGS := -ldflags="-X github.com/sorotrail/sorotrail/internal/buildinfo.Version=$(VERSION) -X github.com/sorotrail/sorotrail/internal/buildinfo.Commit=$(COMMIT) -X github/sorotrail/sorotrail/internal/buildinfo.BuildDate=$(BUILD_DATE)"
 
-.PHONY: help build build-all build-all-integration run test test-fast test-db test-ci test-integration simtest simtest-long vet vet-integration lint bench bench-ci ci client cover cover-html migrate-up migrate-down seed docker-up docker-down spec clean
+.PHONY: help build build-all build-all-integration run test test-fast test-db test-ci test-integration simtest simtest-long vet vet-integration lint bench bench-ci ci cover cover-html migrate-up migrate-down seed docker-up docker-down spec clean
+.PHONY: build build-all build-all-integration run test test-fast test-db test-integration vet vet-integration test-ci lint cover cover-html migrate-up migrate-down docker-up docker-down simtest simtest-long clean bench bench-ci seed spec spec-check client ci
+.PHONY: help build build-all build-all-integration run test test-fast test-db test-ci test-integration simtest simtest-long vet vet-integration lint lint-guard bench bench-ci ci client cover cover-html migrate-up migrate-down seed docker-up docker-down spec clean
 
 # ── Self-documenting help ────────────────────────────────────────────────────
 # Every target that starts with a double-hash comment (##) is listed by
@@ -69,8 +71,14 @@ vet: ## Run go vet on all packages
 vet-integration: ## Vet integration-tagged code too
 	go vet -tags=integration ./...
 
-lint: ## Run golangci-lint
+# The guard runs first so a go.mod that outran the pinned linter fails with the
+# fix spelled out, instead of golangci-lint's "lower than the targeted Go
+# version" error. See CONTRIBUTING.md#lint-toolchain-drift.
+lint: lint-guard ## Run golangci-lint (guards go.mod/toolchain drift first)
 	golangci-lint run
+
+lint-guard: ## Fail fast when go.mod targets a newer Go than the pinned linter
+	@scripts/check_lint_toolchain.sh
 
 # ── Benchmarks ───────────────────────────────────────────────────────────────
 
@@ -94,7 +102,7 @@ bench-ci: ## Benchmark smoke run (CI-length, no DB required)
 # Composed from the existing targets so the two cannot drift.
 # Runs as sub-makes so the first failure stops the run.
 
-ci: build-all vet test-ci bench-ci build-all-integration vet-integration test-integration lint ## Reproduce the full CI gate locally (first failure stops)
+ci: build-all vet spec-check test-ci bench-ci build-all-integration vet-integration test-integration lint ## Reproduce the full CI gate locally (first failure stops)
 
 # ── Client ───────────────────────────────────────────────────────────────────
 
@@ -134,9 +142,21 @@ docker-down: ## Tear down docker compose services
 	docker compose down
 
 # ── OpenAPI ──────────────────────────────────────────────────────────────────
+# api/openapi.yaml is the source of truth; internal/api/openapi.json is
+# generated from it. `spec` regenerates the copy, `spec-check` verifies the
+# committed copy is current without writing to the working tree.
 
 spec: ## Regenerate the OpenAPI spec JSON that internal/api embeds
 	go run ./cmd/specgen
+
+spec-check: ## Fail if internal/api/openapi.json is stale relative to api/openapi.yaml
+	@tmp=$$(mktemp); \
+	trap 'rm -f "$$tmp"' EXIT; \
+	go run ./cmd/specgen -out "$$tmp"; \
+	if ! diff -u internal/api/openapi.json "$$tmp"; then \
+		echo "internal/api/openapi.json is stale; run 'make spec'"; \
+		exit 1; \
+	fi
 
 # ── Cleanup ──────────────────────────────────────────────────────────────────
 
