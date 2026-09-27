@@ -26,3 +26,5 @@ The shared conformance suite in `conformance_test.go` runs the same assertions a
 | Server required for tests | `TEST_DATABASE_URL` | no | `TEST_CLICKHOUSE_URL` |
 
 SQLite deliberately stays a single-node backend: per-contract resume positions and the contract inventory endpoints are Postgres-only, and both now refuse explicitly rather than returning an empty result.
+
+ClickHouse now implements the event read path, ingestion/audit state, watched contracts, per-contract cursors, subscriptions and the dead-letter queue, but the conformance registration above still declares it unsupported wholesale: the suite truncates between tests on shared backends, which this backend cannot do over its HTTP interface yet, and topic-filtered event queries return `ErrUnsupported` (the schema stores `topics` as an opaque JSON string, so jsonb containment cannot be expressed). Those tests are therefore skipped until a live `TEST_CLICKHOUSE_URL` server can be used to verify and narrow the declaration.
