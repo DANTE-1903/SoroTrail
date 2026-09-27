@@ -879,14 +879,16 @@ func validateCORSOrigins(in []string) error {
 // LoggableFields returns the configuration as a map of fields suitable for logging,
 // with credentials redacted (e.g., from DATABASE_URL).
 func (c Config) LoggableFields() []any {
-	dbURL := c.DatabaseURL
-	if u, err := url.Parse(c.DatabaseURL); err == nil {
-		u.User = nil
-		dbURL = u.String()
-	}
+	// DATABASE_URL and RPC_URL are both in sensitiveEnvVars: the first carries
+	// the database password, and an RPC_URL commonly carries a provider API key
+	// as basic auth. Redaction goes through redactURLPassword because it fails
+	// closed — anything it cannot parse becomes "<redacted>" rather than being
+	// logged verbatim. Parsing is easy to fail on a perfectly valid password: a
+	// "%", a space or a "[" in the userinfo is enough, and this line runs once
+	// per startup, so failing open leaks the credential into the log forever.
 	return []any{
 		"network", c.Network,
-		"rpc_url", c.RPCURL,
+		"rpc_url", redactURLPassword(c.RPCURL),
 		"metrics_enabled", c.MetricsEnabled,
 		"rpc_max_attempts", c.RPCMaxAttempts,
 		"rpc_base_backoff", c.RPCBaseBackoff,
@@ -897,7 +899,7 @@ func (c Config) LoggableFields() []any {
 		"ingester_jitter_min", c.IngesterJitterMin,
 		"ingester_jitter_max", c.IngesterJitterMax,
 		"rpc_rate_limit", c.RPCRateLimit,
-		"database_url", dbURL,
+		"database_url", redactURLPassword(c.DatabaseURL),
 		"poll_interval", c.PollInterval,
 		"poll_interval_min", c.PollIntervalMin,
 		"poll_interval_max", c.PollIntervalMax,
