@@ -24,8 +24,7 @@ func TestSubscriberFanOut_Lifecycle(t *testing.T) {
 	defer sub2.Close()
 
 	ev := store.Event{ID: "0000000000000001-0000", Ledger: 1, ContractID: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}
-	err := b.Publish(ctx, []store.Event{ev})
-	require.NoError(t, err)
+	b.Publish(ctx, []store.Event{ev})
 
 	select {
 	case got := <-sub1.Events():
@@ -56,8 +55,7 @@ func TestSubscriberFanOut_SlowSubscriberNonBlocking(t *testing.T) {
 	ev2 := store.Event{ID: "0000000000000002-0000", Ledger: 2}
 	ev3 := store.Event{ID: "0000000000000003-0000", Ledger: 3}
 
-	err := b.Publish(ctx, []store.Event{ev1, ev2, ev3})
-	require.NoError(t, err)
+	b.Publish(ctx, []store.Event{ev1, ev2, ev3})
 
 	select {
 	case <-subFast.Events():
@@ -78,8 +76,7 @@ func TestSubscriberFanOut_ScopeFiltering(t *testing.T) {
 	evMatch := store.Event{ID: "0000000000000001-0000", ContractID: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}
 	evMiss := store.Event{ID: "0000000000000002-0000", ContractID: "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"}
 
-	err := b.Publish(ctx, []store.Event{evMiss, evMatch})
-	require.NoError(t, err)
+	b.Publish(ctx, []store.Event{evMiss, evMatch})
 
 	select {
 	case got := <-sub.Events():
@@ -109,8 +106,7 @@ func TestSubscriberFanOut_TopicFiltering(t *testing.T) {
 		Topics:     json.RawMessage(`[{"symbol":"mint"}]`),
 	}
 
-	err := b.Publish(ctx, []store.Event{evMiss, evMatch})
-	require.NoError(t, err)
+	b.Publish(ctx, []store.Event{evMiss, evMatch})
 
 	select {
 	case got := <-sub.Events():
@@ -140,8 +136,7 @@ func TestSubscriberFanOut_ConcurrentRace(t *testing.T) {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			err := b.Publish(ctx, []store.Event{{ID: "0000000000000001-0000", ContractID: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", Ledger: 1}})
-			require.NoError(t, err)
+			b.Publish(ctx, []store.Event{{ID: "0000000000000001-0000", ContractID: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", Ledger: 1}})
 		}(i)
 	}
 
