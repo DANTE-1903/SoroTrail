@@ -32,6 +32,7 @@ var completionCommands = []completionCommand{
 	{"migrate-status", "report pending migrations without applying them"},
 	{"completion", "print a shell completion script"},
 	{"version", "print the build version, commit, and build date"},
+	{"config", "print the effective configuration with secrets redacted"},
 	{"help", "show this help message"},
 }
 
