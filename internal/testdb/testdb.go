@@ -39,7 +39,7 @@ import (
 
 // Setup returns a migrated *pgxpool.Pool scoped to the test. If migrate is
 // nil the caller accepts responsibility for having migrated the database;
-// if it's set, run it before the (optional) troncation.
+// if it's set, run it before the (optional) truncation.
 //
 // On hosts without Docker / testcontainers support, t.Skip is called.
 func Setup(t *testing.T, migrate func(url string) error) *pgxpool.Pool {
