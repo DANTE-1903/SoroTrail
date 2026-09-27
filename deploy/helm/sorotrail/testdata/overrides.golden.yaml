@@ -10,7 +10,6 @@ metadata:
     app.kubernetes.io/instance: sorotrail
     app.kubernetes.io/version: "latest"
     app.kubernetes.io/managed-by: Helm
-
 ---
 # Source: sorotrail/templates/configmap.yaml
 apiVersion: v1
@@ -35,7 +34,6 @@ data:
   CORS_ALLOWED_ORIGINS: "https://app.example.com"
   RATE_LIMIT_RPS: "10"
   RATE_LIMIT_BURST: "20"
-
 ---
 # Source: sorotrail/templates/service.yaml
 apiVersion: v1
@@ -58,7 +56,6 @@ spec:
   selector:
     app.kubernetes.io/name: sorotrail
     app.kubernetes.io/instance: sorotrail
-
 ---
 # Source: sorotrail/templates/deployment.yaml
 apiVersion: apps/v1
@@ -145,7 +142,6 @@ spec:
             requests:
               cpu: 100m
               memory: 128Mi
-
 ---
 # Source: sorotrail/templates/servicemonitor.yaml
 apiVersion: monitoring.coreos.com/v1
