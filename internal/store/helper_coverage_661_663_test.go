@@ -178,11 +178,11 @@ func TestContractsCursorIsOpaque(t *testing.T) {
 
 func TestScopeConstructors(t *testing.T) {
 	tests := []struct {
-		name       string
-		scope      Scope
-		wildcard   bool
-		deniesAll  bool
-		contracts  []string
+		name      string
+		scope     Scope
+		wildcard  bool
+		deniesAll bool
+		contracts []string
 	}{
 		{name: "zero", scope: Scope{}, deniesAll: true},
 		{name: "wildcard", scope: WildcardScope(), wildcard: true},
