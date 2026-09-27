@@ -146,6 +146,9 @@ type Options struct {
 	BatchMaxBackoff time.Duration
 	// MaxBackoff caps the error backoff. Default 1m.
 	MaxBackoff time.Duration
+	// MinBackoff is the floor the error backoff returns to after a
+	// successful cycle. Default 1s.
+	MinBackoff time.Duration
 	// JitterMin and JitterMax bound the random jitter added to error
 	// backoffs. When JitterMax is zero, jitter remains proportional to the
 	// current backoff as it was before these options existed.

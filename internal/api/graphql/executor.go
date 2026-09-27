@@ -107,10 +107,26 @@ func executeOperation(ctx context.Context, req *GraphQLRequest) (*responseEnvelo
 	if len(doc.Operations) == 0 {
 		return nil, fmt.Errorf("no operation in document")
 	}
-	if len(doc.Operations) > 1 {
-		return nil, fmt.Errorf("multiple operations per request not supported")
+	// A named request selects one operation from the document, as the
+	// GraphQL spec requires. A document holding exactly one operation
+	// needs no name; an unnamed request against several is ambiguous
+	// and must be refused rather than silently resolved to the first.
+	var op *ast.OperationDefinition
+	if req.OperationName != "" {
+		for _, candidate := range doc.Operations {
+			if candidate.Name == req.OperationName {
+				op = candidate
+				break
+			}
+		}
+		if op == nil {
+			return nil, fmt.Errorf("operation %q not found in document", req.OperationName)
+		}
+	} else if len(doc.Operations) > 1 {
+		return nil, fmt.Errorf("must specify operation name when document has multiple operations")
+	} else {
+		op = doc.Operations[0]
 	}
-	op := doc.Operations[0]
 	if op.Operation != ast.Query {
 		return nil, fmt.Errorf("only Query operations are supported (got %s)", op.Operation)
 	}

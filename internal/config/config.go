@@ -104,6 +104,11 @@ type Config struct {
 	// would delete without actually removing any rows.
 	RetentionDryRun bool `env:"RETENTION_DRY_RUN"`
 
+	// RetentionAge and RetentionPoll drive the age-based pruner. A zero
+	// RetentionAge disables it; RetentionPoll is how often it sweeps.
+	RetentionAge  time.Duration `env:"RETENTION_AGE"`
+	RetentionPoll time.Duration `env:"RETENTION_POLL_INTERVAL" envDefault:"1h"`
+
 	// Archive configuration. When ARCHIVE_BUCKET is set, pruned events
 	// are exported to S3-compatible object storage as compressed NDJSON
 	// before deletion, ensuring pruned ranges are recoverable. All
