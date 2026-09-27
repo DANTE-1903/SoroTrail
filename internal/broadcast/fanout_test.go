@@ -140,7 +140,7 @@ func TestSubscriberFanOut_ConcurrentRace(t *testing.T) {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			b.Publish(ctx, []store.Event{mkEvent("0000000000000001-0000", "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", 1)})
+			b.Publish(ctx, []store.Event{{ID: "0000000000000001-0000", ContractID: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", Ledger: 1}})
 		}(i)
 	}
 
