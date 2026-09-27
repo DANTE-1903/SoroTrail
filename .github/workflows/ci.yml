@@ -14,6 +14,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     strategy:
+      # Report both Postgres versions even when one fails. With the default
+      # fail-fast the surviving leg is cancelled, so a contributor sees
+      # "test-matrix (16) failure, test-matrix (15) cancelled" and cannot tell
+      # whether the break is version-specific or general — and a failure that
+      # only shows on the cancelled version is hidden entirely. Gating is
+      # unaffected: the aggregate `test` job below still requires every leg.
+      fail-fast: false
       matrix:
         postgres-version: ["15", "16"]
     services:
