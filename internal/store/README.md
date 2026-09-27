@@ -1,16 +1,28 @@
-# Store query timeouts
+# store
 
-Store queries are executed through `GuardedStore`, which applies the configured
-per-query timeout to each store operation. The timeout is exposed through the
-existing `API_QUERY_TIMEOUT` configuration setting and defaults to 25 seconds.
+## Purpose
+The `store` package provides persistence layers and database abstractions for storing indexed ledgers, transactions, events, and contract states, acting as the primary persistence engine for SoroTrail.
 
-The guarded store derives a child context for each operation and passes that
-context to the underlying store implementation. Consequently, the earlier of
-the request's existing deadline and `API_QUERY_TIMEOUT` determines how long the
-query may run. Cancellation is propagated to the database driver, which stops
-the in-flight query and returns the context error.
+## Entry Points & Key Abstractions
+- **`Store`**: Core persistence interface defining methods for writing and querying historical chain data.
+- **`PostgresStore`**: Production PostgreSQL implementation supporting transactions, connection pooling, and optimized indexing for event streams.
+- **`SQLite`** and **`ClickHouse`**: alternative backends selected via `DATABASE_URL`.
 
-`API_SLOW_QUERY_THRESHOLD` controls slow-query logging independently; it does
-not extend the query timeout. The timeout applies to reads and other guarded
-store operations without changing any endpoint, configuration, or database
-schema contracts.
+## Non-Obvious Decisions & Invariants
+- **Idempotency**: All write operations are designed to be fully idempotent, safely handling duplicate ingestion of ledgers or blocks during recovery or replay scenarios.
+- **Cross-Links**: Refer to the architecture document for details on schema partitioning and migration strategies.
+- **Honest gaps**: a backend that does not implement an operation returns an error wrapping `ErrUnsupported` instead of a zero value. A silent empty result reads as success, which is how an unimplemented feature becomes a wrong 200; `ErrUnsupported` makes the gap loud and mappable.
+
+## Backend capability matrix
+The shared conformance suite in `conformance_test.go` runs the same assertions against every registered backend. A backend is registered in `conformanceBackends`; server-backed backends are skipped cleanly when their URL environment variable is unset.
+
+| Capability | Postgres | SQLite | ClickHouse |
+| --- | --- | --- | --- |
+| Events, queries, pagination | yes | yes | declared unsupported |
+| Ingestion/audit state, watched contracts | yes | yes | declared unsupported |
+| Per-contract cursors | yes | `ErrUnsupported` | declared unsupported |
+| Contract inventory (`ListContracts`, summaries, metadata) | yes | `ErrUnsupported` | declared unsupported |
+| API keys | yes | `ErrUnsupported` | `ErrUnsupported` |
+| Server required for tests | `TEST_DATABASE_URL` | no | `TEST_CLICKHOUSE_URL` |
+
+SQLite deliberately stays a single-node backend: per-contract resume positions and the contract inventory endpoints are Postgres-only, and both now refuse explicitly rather than returning an empty result.

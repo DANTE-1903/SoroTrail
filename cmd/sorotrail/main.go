@@ -6,6 +6,7 @@
 //	sorotrail replay --from-ledger N [--to-ledger M]
 //	sorotrail apikey create|list|revoke
 //	sorotrail backfill --contract C... --from-ledger N [--to-ledger M]
+//	sorotrail migrate up|down|status [--steps N]
 package main
 
 import (
@@ -32,6 +33,7 @@ import (
 	"github.com/sorotrail/sorotrail/internal/decode"
 	"github.com/sorotrail/sorotrail/internal/ingester"
 	"github.com/sorotrail/sorotrail/internal/pruner"
+	"github.com/sorotrail/sorotrail/internal/requestid"
 	"github.com/sorotrail/sorotrail/internal/rpc"
 	"github.com/sorotrail/sorotrail/internal/spec"
 	"github.com/sorotrail/sorotrail/internal/store"
@@ -43,13 +45,29 @@ var errInterrupted = errors.New("interrupted")
 
 func main() {
 	err := dispatch(os.Args[1:])
+	code := exitCode(err)
+	if code == 0 {
+		return
+	}
+	if code == 1 {
+		fmt.Fprintln(os.Stderr, "sorotrail:", err)
+	}
+	os.Exit(code)
+}
+
+// exitCode maps dispatch's result onto the process exit status: 0 on
+// success, 2 when a one-shot run was interrupted (scripts re-run to
+// resume, so the distinction from a genuine failure is part of the
+// interface), and 1 for every other error. It is a separate function
+// so the mapping is testable without os.Exit.
+func exitCode(err error) int {
 	switch {
 	case err == nil:
+		return 0
 	case errors.Is(err, errInterrupted):
-		os.Exit(2)
+		return 2
 	default:
-		fmt.Fprintln(os.Stderr, "sorotrail:", err)
-		os.Exit(1)
+		return 1
 	}
 }
 
@@ -68,6 +86,8 @@ func dispatch(args []string) error {
 		return runBackfill(args[1:])
 	case "index-addresses":
 		return runIndexAddresses(args[1:])
+	case "migrate":
+		return runMigrate(args[1:])
 	case "healthcheck":
 		// The healthcheck subcommand manages its own exit codes
 		// (0 healthy, 1 unhealthy, 2 usage error) — the docker
@@ -94,8 +114,12 @@ func dispatch(args []string) error {
 		return runMigrateStatus(args[1:])
 	case "completion":
 		return runCompletion(args[1:])
+	case "version", "--version", "-V":
+		return runVersion(args[1:])
 	case "stats":
 		return runStats(args[1:])
+	case "config":
+		return runConfig(args[1:])
 	case "help", "-h", "--help":
 		usage()
 		return nil
@@ -119,6 +143,8 @@ subcommands:
                    (sorotrail backfill --help)
   index-addresses  rebuild the address→event inverted index from stored events
                    (sorotrail index-addresses --help)
+  migrate          apply, roll back, or inspect database migrations
+                   (sorotrail migrate --help)
   health           probe the API /health and exit nonzero on failure
                    (sorotrail health --help)
   healthcheck      probe /health and exit (used by docker HEALTHCHECK)
@@ -129,8 +155,12 @@ subcommands:
                    (sorotrail migrate-status --help)
   completion       print a shell completion script (bash, zsh, fish)
                    (sorotrail completion --help)
+  version          print the build version, commit, and build date
+                   (sorotrail version --help)
   stats            print store stats as a table
                    (sorotrail stats --help)
+  config           print the effective configuration with secrets redacted
+                   (sorotrail config --help)
 `)
 }
 
@@ -290,7 +320,10 @@ func run() error {
 		}
 	}
 
-	ing := ingester.New(countingClient, st, decode.XDRDecoder{}, log, ingester.Options{
+	// The decoder is wrapped in a memoizing cache: ingestion re-decodes the
+	// same topic symbols and values constantly, so hashing the raw XDR and
+	// serving repeats from an LRU removes that redundant work.
+	ing := ingester.New(countingClient, st, decode.NewCachingDecoder(decode.XDRDecoder{}, 0), log, ingester.Options{
 		PollInterval:            cfg.PollInterval,
 		PollIntervalMin:         cfg.PollIntervalMin,
 		PollIntervalMax:         cfg.PollIntervalMax,
@@ -528,9 +561,18 @@ func run() error {
 		log.Info("cors enabled", "origins", strings.Join(cfg.CORSAllowedOrigins, ","))
 	}
 
-	errCh := make(chan error, 5)
+	// Six reporters can write here: http, webhook, ingester, auditor,
+	// retention pruner, and pruner. The buffer must hold all of them so
+	// no goroutine parks on a send while shutdown is still draining.
+	errCh := make(chan error, 6)
 	go func() {
-		go wh.Run(ctx)
+		// The webhook pool joins the shutdown accounting: Run returns
+		// as soon as ctx is cancelled, and this report is what the
+		// drain loop below waits for. It used to be launched without
+		// a report, which left the loop waiting for a component that
+		// never spoke — every graceful shutdown hung until SIGKILL.
+		wh.Run(ctx)
+		errCh <- nil
 	}()
 
 	// Start the ingester only when the advisory lock was acquired (or
@@ -540,7 +582,8 @@ func run() error {
 	if ingesterEnabled {
 		remaining++ // + ingester
 		go func() {
-			log.Info("ingester starting", "rpc_urls", rpcURLsForLog(cfg), "poll_interval", cfg.PollInterval)
+			log.Info("ingester starting", requestid.Field, requestid.JobIngester,
+				"rpc_urls", rpcURLsForLog(cfg), "poll_interval", cfg.PollInterval)
 			if err := ing.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 				errCh <- fmt.Errorf("ingester: %w", err)
 			} else {
@@ -562,7 +605,7 @@ func run() error {
 	if aud != nil {
 		remaining++ // + auditor
 		go func() {
-			log.Info("auditor starting",
+			log.Info("auditor starting", requestid.Field, requestid.JobAuditor,
 				"budget_share", cfg.AuditBudgetShare,
 				"batch_ledgers", cfg.AuditBatchLedgers,
 				"lag_threshold", cfg.AuditLagThreshold,
@@ -575,6 +618,7 @@ func run() error {
 		}()
 	}
 	if retPruner != nil {
+		remaining++ // + age-based retention pruner
 		go func() {
 			log.Info("event retention pruning starting", "age", cfg.RetentionAge, "poll_interval", cfg.RetentionPoll)
 			if err := retPruner.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
@@ -590,7 +634,7 @@ func run() error {
 	remaining++ // + pruner
 	go func() {
 		if cfg.RetentionEnabled() {
-			log.Info("pruner starting",
+			log.Info("pruner starting", requestid.Field, requestid.JobPruner,
 				"max_age", cfg.RetentionMaxAge,
 				"min_ledger", cfg.RetentionMinLedger,
 				"batch_size", cfg.RetentionBatchSize,
@@ -604,13 +648,35 @@ func run() error {
 		}
 	}()
 
+	// A nil report is a component that finished cleanly before any
+	// shutdown was requested — the disabled pruner emits one the moment
+	// it starts. Reading that as "a component died" used to tear the
+	// process down a second after boot. Only the shutdown signal or a
+	// non-nil report ends the loop; every report, nil or not, consumes
+	// exactly one slot of the accounting above, so the drain below waits
+	// for precisely the messages that are still outstanding.
 	var firstErr error
-	select {
-	case <-ctx.Done():
-		log.Info("shutdown signal received")
-	case firstErr = <-errCh:
-		remaining--
-		stop()
+	stopping := false
+	for !stopping {
+		select {
+		case <-ctx.Done():
+			log.Info("shutdown signal received")
+			// Drop the SIGINT/SIGTERM registration right away: from
+			// here on a second signal takes the runtime's default
+			// action and forces immediate exit, instead of being
+			// swallowed while a stuck drain runs out the grace
+			// period. stop() is idempotent with the deferred call
+			// at function exit.
+			stop()
+			stopping = true
+		case err := <-errCh:
+			remaining--
+			if err != nil {
+				firstErr = err
+				stop()
+				stopping = true
+			}
+		}
 	}
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)

@@ -406,3 +406,30 @@ func TestXDRDecoder_InvalidScValConversion(t *testing.T) {
 		assert.Equal(t, old, decodeErrors.Load())
 	})
 }
+
+func TestUint128String(t *testing.T) {
+	// uint128String renders the full 128-bit range as a decimal string
+	// because JSON numbers lose precision past 2^53.
+	tests := []struct {
+		name string
+		hi   uint64
+		lo   uint64
+		want string
+	}{
+		{"zero renders as 0", 0, 0, "0"},
+		{"one", 0, 1, "1"},
+		{"value above 2^53 stays exact", 0, 9007199254740993, "9007199254740993"},
+		{"low word only", 0, 18446744073709551615, "18446744073709551615"},
+		{"high word only", 1, 0, "18446744073709551616"},
+		{"high bit set stays positive", 0x8000000000000000, 0, "170141183460469231731687303715884105728"},
+		{"maximum u128 renders without truncation", 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, "340282366920938463463374607431768211455"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := uint128String(xdr.UInt128Parts{Hi: xdr.Uint64(tt.hi), Lo: xdr.Uint64(tt.lo)})
+			assert.Equal(t, tt.want, got, "decimal rendering")
+			assert.NotContains(t, got, "-", "unsigned rendering must never carry a minus sign")
+		})
+	}
+}

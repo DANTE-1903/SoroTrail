@@ -15,6 +15,7 @@ import (
 	"golang.org/x/time/rate"
 
 	"github.com/sorotrail/sorotrail/internal/metrics"
+	"github.com/sorotrail/sorotrail/internal/requestid"
 )
 
 // ErrAllProvidersDown is returned when every provider is unhealthy and the
@@ -260,7 +261,8 @@ func (fc *FailoverClient) pickProvider(ctx context.Context) (*provider, int, err
 	// exponential backoff (capped at 30s) with jitter.
 	fc.allDownCount.Add(1)
 	fc.allDownUntil.Store(time.Now().Add(fc.allDownBackoff()).UnixNano())
-	fc.log.Error("all RPC providers are down", "backoff", fc.allDownBackoff())
+	fc.log.Error("all RPC providers are down",
+		append(requestid.Attrs(ctx), "backoff", fc.allDownBackoff())...)
 	return nil, -1, ErrAllProvidersDown
 }
 
@@ -310,7 +312,7 @@ func (fc *FailoverClient) recordSuccess(idx int) {
 	}
 }
 
-func (fc *FailoverClient) recordError(idx int, err error) {
+func (fc *FailoverClient) recordError(ctx context.Context, idx int, err error) {
 	p := fc.providers[idx]
 
 	// Semantic errors do NOT demote. IsLedgerOutOfRange means the provider
@@ -330,14 +332,16 @@ func (fc *FailoverClient) recordError(idx int, err error) {
 	c := p.errCount.Add(1)
 	oldState := ProviderState(p.state.Load())
 
+	// A demotion is an RPC failure, so the line carries the correlation id
+	// of whichever request or job drove the call.
 	if oldState == StateActive && c >= int32(fc.maxConsecutiveErrors) {
 		fc.setProviderState(p, StateDegraded)
-		fc.log.Warn("provider degraded", "url", p.url,
-			"consecutive_errors", c, "state", "degraded")
+		fc.log.Warn("provider degraded",
+			append(requestid.Attrs(ctx), "url", p.url, "consecutive_errors", c, "state", "degraded")...)
 	} else if oldState == StateDegraded && c >= int32(fc.maxConsecutiveErrors*2) {
 		fc.setProviderState(p, StateDown)
-		fc.log.Error("provider down", "url", p.url,
-			"consecutive_errors", c, "state", "down")
+		fc.log.Error("provider down",
+			append(requestid.Attrs(ctx), "url", p.url, "consecutive_errors", c, "state", "down")...)
 	}
 }
 
@@ -430,7 +434,7 @@ func (fc *FailoverClient) GetEvents(ctx context.Context, req GetEventsRequest) (
 	}
 	resp, err := p.client.GetEvents(ctx, req)
 	if err != nil {
-		fc.recordError(idx, err)
+		fc.recordError(ctx, idx, err)
 		return resp, err
 	}
 	fc.recordSuccess(idx)
@@ -447,7 +451,7 @@ func (fc *FailoverClient) GetLatestLedger(ctx context.Context) (LatestLedger, er
 	}
 	resp, err := p.client.GetLatestLedger(ctx)
 	if err != nil {
-		fc.recordError(idx, err)
+		fc.recordError(ctx, idx, err)
 		return resp, err
 	}
 	fc.recordSuccess(idx)
@@ -464,7 +468,7 @@ func (fc *FailoverClient) GetHealth(ctx context.Context) (Health, error) {
 	}
 	resp, err := p.client.GetHealth(ctx)
 	if err != nil {
-		fc.recordError(idx, err)
+		fc.recordError(ctx, idx, err)
 		return resp, err
 	}
 	fc.recordSuccess(idx)
@@ -481,7 +485,7 @@ func (fc *FailoverClient) GetLedgerEntries(ctx context.Context, req GetLedgerEnt
 	}
 	resp, err := p.client.GetLedgerEntries(ctx, req)
 	if err != nil {
-		fc.recordError(idx, err)
+		fc.recordError(ctx, idx, err)
 		return resp, err
 	}
 	fc.recordSuccess(idx)
@@ -498,7 +502,7 @@ func (fc *FailoverClient) SimulateTransaction(ctx context.Context, req SimulateT
 	}
 	resp, err := p.client.SimulateTransaction(ctx, req)
 	if err != nil {
-		fc.recordError(idx, err)
+		fc.recordError(ctx, idx, err)
 		return resp, err
 	}
 	fc.recordSuccess(idx)
@@ -542,7 +546,8 @@ func (fc *FailoverClient) probeDownProviders(ctx context.Context) {
 		}
 		_, err := p.client.GetHealth(ctx)
 		if err != nil {
-			fc.log.Debug("provider probe failed", "url", p.url, "error", err)
+			fc.log.Debug("provider probe failed",
+				append(requestid.Attrs(ctx), "url", p.url, "error", err)...)
 			continue
 		}
 		// Successful probe: advance probation counter.

@@ -32,6 +32,67 @@ func testStore(t *testing.T) *Postgres {
 	return testStoreWithPartitionSpan(t, int64(DefaultEventPartitionSpan))
 }
 
+func TestFrontierStats(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+
+	tests := []struct {
+		name         string
+		seed         bool
+		useScope     bool
+		wantIngested int64
+		wantVerified int64
+	}{
+		{
+			name:         "populated store reports both frontiers",
+			seed:         true,
+			wantIngested: 120,
+			wantVerified: 115,
+		},
+		{
+			name:         "empty store coalesces null aggregates to zero",
+			wantIngested: 0,
+			wantVerified: 0,
+		},
+		{
+			name:         "frontiers remain available for an explicit empty scope",
+			seed:         true,
+			useScope:     true,
+			wantIngested: 120,
+			wantVerified: 115,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := st.pool.Exec(ctx, `TRUNCATE ingestion_state, audit_state`)
+			require.NoError(t, err)
+			if tt.seed {
+				_, err = st.pool.Exec(ctx, `
+					INSERT INTO ingestion_state (network, last_ingested_ledger)
+					VALUES ('default', $1)
+					ON CONFLICT (network) DO UPDATE SET last_ingested_ledger = EXCLUDED.last_ingested_ledger`, tt.wantIngested)
+				require.NoError(t, err)
+				_, err = st.pool.Exec(ctx, `
+					INSERT INTO audit_state (network, verified_through_ledger)
+					VALUES ('default', $1)
+					ON CONFLICT (network) DO UPDATE SET verified_through_ledger = EXCLUDED.verified_through_ledger`, tt.wantVerified)
+				require.NoError(t, err)
+			}
+
+			var got Stats
+			if tt.useScope {
+				got, err = st.Stats(ctx, NewScope([]string{"missing"}))
+			} else {
+				got, err = st.frontierStats(ctx)
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantIngested, got.LastIngestedLedger)
+			assert.Equal(t, tt.wantVerified, got.VerifiedThroughLedger)
+		})
+	}
+}
+
 func testStoreWithPartitionSpan(t *testing.T, span int64) *Postgres {
 	t.Helper()
 	dbURL := os.Getenv("TEST_DATABASE_URL")
