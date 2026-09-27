@@ -35,6 +35,19 @@ import (
 	"github.com/sorotrail/sorotrail/internal/store"
 )
 
+func TestEventsGoldenFilesAreValidJSON(t *testing.T) {
+	entries, err := os.ReadDir(filepath.Join("testdata", "golden"))
+	require.NoError(t, err)
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+			continue
+		}
+		body, err := os.ReadFile(filepath.Join("testdata", "golden", entry.Name()))
+		require.NoError(t, err, entry.Name())
+		require.True(t, json.Valid(body), "golden file %s must contain valid JSON", entry.Name())
+	}
+}
+
 // updateGolden regenerates the golden files instead of comparing against
 // them. Scoped to this package so unrelated packages never rewrite files.
 var updateGolden = flag.Bool("update-golden", false, "rewrite /events golden files for TestEventsGolden")
@@ -226,7 +239,6 @@ func TestEventsGoldenFilesAreValidJSON(t *testing.T) {
 		})
 	}
 }
-
 func TestEventsGoldenCoverage(t *testing.T) {
 	// The golden files must exist for each documented endpoint
 	// that produces a 200 response. This test asserts that the
