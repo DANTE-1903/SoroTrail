@@ -6,6 +6,7 @@
 -- wasm_hash because the spec is a property of the code, not the contract.
 -- Multiple contracts may share the same Wasm hash (same code, different
 -- instance storage), and they share one spec row.
+--
 -- IF NOT EXISTS: TestMigrate_UpgradesLegacyEventsTable rewinds
 -- schema_migrations and re-applies this migration on top of a DB where
 -- this table already exists (only events was reverted to its legacy

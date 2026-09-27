@@ -7,7 +7,6 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 // metricsMockClient satisfies rpc.Client for testing CountingClient.
@@ -28,11 +27,30 @@ func (m *metricsMockClient) GetLedgerEntries(context.Context, GetLedgerEntriesRe
 	return GetLedgerEntriesResponse{}, m.errorToReturn
 }
 func (m *metricsMockClient) SimulateTransaction(context.Context, SimulateTransactionRequest) (SimulateTransactionResponse, error) {
+// countingMockClient satisfies rpc.Client for testing CountingClient.
+type countingMockClient struct {
+	errorToReturn error
+}
+
+func (m *countingMockClient) GetEvents(context.Context, GetEventsRequest) (GetEventsResponse, error) {
+	return GetEventsResponse{}, m.errorToReturn
+}
+func (m *countingMockClient) GetLatestLedger(context.Context) (LatestLedger, error) {
+	return LatestLedger{}, m.errorToReturn
+}
+func (m *countingMockClient) GetHealth(context.Context) (Health, error) {
+	return Health{}, m.errorToReturn
+}
+func (m *countingMockClient) GetLedgerEntries(context.Context, GetLedgerEntriesRequest) (GetLedgerEntriesResponse, error) {
+	return GetLedgerEntriesResponse{}, m.errorToReturn
+}
+func (m *countingMockClient) SimulateTransaction(context.Context, SimulateTransactionRequest) (SimulateTransactionResponse, error) {
 	return SimulateTransactionResponse{}, m.errorToReturn
 }
 
 func TestCountingClient_Accounting(t *testing.T) {
 	m := &metricsMockClient{}
+	m := &countingMockClient{}
 	c := NewCountingClient(m)
 	ctx := context.Background()
 
@@ -58,6 +76,7 @@ func TestCountingClient_Accounting(t *testing.T) {
 
 func TestCountingClient_ConcurrentRace(t *testing.T) {
 	m := &metricsMockClient{errorToReturn: errors.New("fail")}
+	m := &countingMockClient{errorToReturn: errors.New("fail")}
 	c := NewCountingClient(m)
 	ctx := context.Background()
 

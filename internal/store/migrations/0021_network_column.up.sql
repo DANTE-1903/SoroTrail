@@ -1,7 +1,7 @@
 -- Adds the network dimension the store layer already reads and writes.
 --
--- This runs after 0008_partition_events, not before it, and must stay
--- there: 0008 renames events to events_legacy and creates a fresh,
+-- This runs after 0007_partition_events, not before it, and must stay
+-- there: 0007 renames events to events_legacy and creates a fresh,
 -- partitioned events table from an explicit column list. Anything that
 -- adds a column to events at a lower version is silently discarded by
 -- that rebuild, which is exactly how an earlier draft of this migration

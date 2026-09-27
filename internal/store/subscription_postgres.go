@@ -180,7 +180,7 @@ func (p *Postgres) RecordDeliveryAttempt(ctx context.Context, a DeliveryAttempt)
 		VALUES ($1, $2, $3, $4, $5, $6)
 		RETURNING id, created_at`,
 		a.SubscriptionID, a.EventID, a.Status, a.ResponseCode,
-		a.DurationMs, nullableString(a.Error),
+		a.DurationMs, a.Error, // NOT NULL DEFAULT ''; empty means success, never NULL
 	).Scan(&a.ID, &a.CreatedAt)
 	if err != nil {
 		return DeliveryAttempt{}, fmt.Errorf("recording delivery attempt: %w", err)

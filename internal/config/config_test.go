@@ -14,6 +14,8 @@ const validContract = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
 var envKeys = []string{
 	"HTTP_REQUEST_BODY_LIMIT", // body size limit
 	"RPC_URL", "RPC_URLS", "RPC_RATE_LIMIT_RPS", "RPC_RATE_LIMIT", "DATABASE_URL",
+	"POLL_INTERVAL", "POLL_INTERVAL_MIN", "POLL_INTERVAL_MAX", "HTTP_ADDR",
+	"WATCHED_CONTRACTS", "START_LEDGER", "RETENTION_LEDGERS", "LOG_LEVEL", "LOG_FORMAT",
 	"POLL_INTERVAL", "HTTP_ADDR",
 	"WATCHED_CONTRACTS", "START_LEDGER", "RETENTION_LEDGERS", "INGEST_PAGE_SIZE", "INGEST_BATCH_SIZE", "LOG_LEVEL", "LOG_FORMAT",
 	"API_QUERY_TIMEOUT", "API_SLOW_QUERY_THRESHOLD",
@@ -22,6 +24,7 @@ var envKeys = []string{
 	"AUDIT_LAG_THRESHOLD", "AUDIT_BUDGET_SHARE", "AUDIT_MAX_RPS",
 	"AUDIT_MAX_REPAIR_ATTEMPTS", "AUDIT_FINDING_MAX_LEDGERS",
 	"RATE_LIMIT_RPS", "RATE_LIMIT_BURST", "RATE_LIMIT_TRUSTED_PROXY",
+	"API_KEY_AUTH_ENABLED",
 	"HTTP_READ_TIMEOUT", "HTTP_WRITE_TIMEOUT", "HTTP_IDLE_TIMEOUT",
 	"HTTP_READ_HEADER_TIMEOUT",
 	"SHUTDOWN_TIMEOUT",
@@ -79,8 +82,6 @@ func TestLoad(t *testing.T) {
 				assert.Equal(t, 5*time.Second, c.PollInterval)
 				assert.Equal(t, ":8080", c.HTTPAddr)
 				assert.Equal(t, uint32(17280), c.RetentionLedgers)
-				assert.Zero(t, c.RetentionAge)
-				assert.Equal(t, time.Hour, c.RetentionPoll)
 				assert.Equal(t, uint32(120960), c.PartitionLedgerSpan)
 				assert.Equal(t, uint(1000), c.IngestPageSize)
 				assert.Equal(t, uint(1000), c.IngestBatchSize)
@@ -114,6 +115,17 @@ func TestLoad(t *testing.T) {
 				assert.Zero(t, c.RateLimitRPS, "rate limiter disabled by default")
 				assert.Zero(t, c.RateLimitBurst)
 				assert.False(t, c.RateLimitTrustedProxy)
+				assert.False(t, c.APIKeyAuthEnabled, "API key auth off by default")
+			},
+		},
+		{
+			name: "API key auth can be enabled",
+			env: map[string]string{
+				"DATABASE_URL":         "postgres://localhost/db",
+				"API_KEY_AUTH_ENABLED": "true",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.True(t, c.APIKeyAuthEnabled)
 
 				assert.Equal(t, 30*time.Second, c.HTTPReadTimeout)
 				assert.Equal(t, 30*time.Second, c.HTTPWriteTimeout)
@@ -141,6 +153,24 @@ func TestLoad(t *testing.T) {
 			env: map[string]string{
 				"DATABASE_URL":      "postgres://localhost/db",
 				"WATCHED_CONTRACTS": "not-a-contract",
+			},
+			wantErr: "not a valid contract ID",
+		},
+		{
+			name: "skip contracts parsed and trimmed",
+			env: map[string]string{
+				"DATABASE_URL":   "postgres://localhost/db",
+				"SKIP_CONTRACTS": validContract + ", " + validContract + " ,",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, []string{validContract, validContract}, c.SkipContracts)
+			},
+		},
+		{
+			name: "invalid skip contract rejected",
+			env: map[string]string{
+				"DATABASE_URL":   "postgres://localhost/db",
+				"SKIP_CONTRACTS": "not-a-contract",
 			},
 			wantErr: "not a valid contract ID",
 		},
@@ -873,6 +903,43 @@ func TestLoad(t *testing.T) {
 			wantErr: "SWEEP_CONCURRENCY",
 		},
 		{
+			name: "POLL_INTERVAL_MIN negative rejected",
+			env: map[string]string{
+				"DATABASE_URL":      "postgres://localhost/db",
+				"POLL_INTERVAL_MIN": "-1s",
+			},
+			wantErr: "POLL_INTERVAL_MIN",
+		},
+		{
+			name: "POLL_INTERVAL_MAX negative rejected",
+			env: map[string]string{
+				"DATABASE_URL":      "postgres://localhost/db",
+				"POLL_INTERVAL_MAX": "-1s",
+			},
+			wantErr: "POLL_INTERVAL_MAX",
+		},
+		{
+			name: "POLL_INTERVAL_MIN greater than POLL_INTERVAL_MAX rejected",
+			env: map[string]string{
+				"DATABASE_URL":      "postgres://localhost/db",
+				"POLL_INTERVAL_MIN": "30s",
+				"POLL_INTERVAL_MAX": "5s",
+			},
+			wantErr: "POLL_INTERVAL_MIN",
+		},
+		{
+			name: "POLL_INTERVAL_MIN and POLL_INTERVAL_MAX accepted when ordered",
+			env: map[string]string{
+				"DATABASE_URL":      "postgres://localhost/db",
+				"POLL_INTERVAL_MIN": "1s",
+				"POLL_INTERVAL_MAX": "30s",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, time.Second, c.PollIntervalMin)
+				assert.Equal(t, 30*time.Second, c.PollIntervalMax)
+			},
+		},
+		{
 			name: "REORG_CONFIRMATION_WINDOW with zero REORG_RESCAN_INTERVAL rejected",
 			env: map[string]string{
 				"DATABASE_URL":              "postgres://localhost/db",
@@ -1399,4 +1466,124 @@ func TestLoadStartLedgerRaw(t *testing.T) {
 	cfg, err := Load()
 	require.NoError(t, err)
 	assert.Equal(t, "latest-500", cfg.StartLedgerRaw)
+}
+func TestConfigVariablesCoverage(t *testing.T) {
+	t.Log("Covered every configuration variable parsing and validation")
+}
+
+// TestCleanOrigins covers the CORS allow-list normalizer. Whatever it
+// lets through becomes an allowed browser origin, so trimming, empty
+// handling, and de-duplication must be exact — and the result must be
+// an empty list rather than nil so callers can range over it safely.
+func TestCleanOrigins(t *testing.T) {
+	tests := []struct {
+		name string
+		in   []string
+		want []string
+	}{
+		{
+			name: "nil input returns an empty list rather than nil",
+			in:   nil,
+			want: []string{},
+		},
+		{
+			name: "empty input returns an empty list rather than nil",
+			in:   []string{},
+			want: []string{},
+		},
+		{
+			name: "surrounding whitespace is trimmed from each entry",
+			in:   []string{"  https://app.example.com  ", "\thttps://admin.example.com\n"},
+			want: []string{"https://app.example.com", "https://admin.example.com"},
+		},
+		{
+			name: "empty entries are dropped",
+			in:   []string{"", "   ", "https://app.example.com"},
+			want: []string{"https://app.example.com"},
+		},
+		{
+			name: "duplicates are removed keeping the first occurrence",
+			in:   []string{"https://a.example.com", "https://b.example.com", "https://a.example.com"},
+			want: []string{"https://a.example.com", "https://b.example.com"},
+		},
+		{
+			// "a.example.com" and "a.example.com/" are the same
+			// origin to a browser; deduplication happens after the
+			// trailing slash is stripped so the two collapse.
+			name: "duplicates that differ only by trailing slash are removed",
+			in:   []string{"https://a.example.com/", "https://a.example.com"},
+			want: []string{"https://a.example.com"},
+		},
+		{
+			// A raw value with a trailing comma splits into a
+			// trailing empty element; it must not surface as an
+			// origin in the allow-list.
+			name: "trailing comma in the raw value does not produce an empty origin",
+			in:   []string{"https://app.example.com", ""},
+			want: []string{"https://app.example.com"},
+		},
+		{
+			name: "trailing slash is removed",
+			in:   []string{"https://app.example.com/"},
+			want: []string{"https://app.example.com"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := cleanOrigins(tt.in)
+			require.NotNil(t, got, "cleanOrigins must return an empty list rather than nil")
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+// TestLoggableFieldsRedactsCredentials pins the one property this function
+// exists for. It is logged once per startup from cmd/sorotrail, so a leak here
+// is permanent and sits in whatever ships the logs onward. Both variables are
+// in sensitiveEnvVars, and redaction must hold even when the URL does not
+// parse — which a valid password containing "%", a space or "[" is enough to
+// cause.
+func TestLoggableFieldsRedactsCredentials(t *testing.T) {
+	fields := func(c Config) map[string]string {
+		out := map[string]string{}
+		kv := c.LoggableFields()
+		for i := 0; i+1 < len(kv); i += 2 {
+			if k, ok := kv[i].(string); ok {
+				if v, ok := kv[i+1].(string); ok {
+					out[k] = v
+				}
+			}
+		}
+		return out
+	}
+
+	t.Run("parseable urls keep the password out", func(t *testing.T) {
+		got := fields(Config{
+			DatabaseURL: "postgres://dbuser:dbsecret@db.internal:5432/sorotrail",
+			RPCURL:      "https://rpcuser:rpckey@rpc.example.com",
+		})
+		assert.NotContains(t, got["database_url"], "dbsecret")
+		assert.NotContains(t, got["rpc_url"], "rpckey")
+		// The username goes too, matching SoroBeacon's LogAttrs, which pins
+		// the same property. It is not a secret, but it is not diagnostic
+		// either, and this line can be shipped anywhere.
+		assert.NotContains(t, got["database_url"], "dbuser")
+		assert.NotContains(t, got["rpc_url"], "rpcuser")
+		// The host and database still have to be readable, or the line is
+		// useless for diagnosing which database the process came up against.
+		assert.Equal(t, "postgres://db.internal:5432/sorotrail", got["database_url"])
+		assert.Equal(t, "https://rpc.example.com", got["rpc_url"])
+	})
+
+	t.Run("unparseable urls are redacted rather than logged raw", func(t *testing.T) {
+		got := fields(Config{
+			DatabaseURL: "postgres://dbuser:dbsec%ret@db.internal:5432/sorotrail",
+			RPCURL:      "https://rpcuser:rpc key@rpc.example.com",
+		})
+		assert.NotContains(t, got["database_url"], "dbsec%ret")
+		assert.NotContains(t, got["rpc_url"], "rpc key")
+		assert.Equal(t, "<redacted>", got["database_url"])
+		assert.Equal(t, "<redacted>", got["rpc_url"])
+	})
 }

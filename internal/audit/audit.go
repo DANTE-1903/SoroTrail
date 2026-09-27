@@ -13,7 +13,7 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/trace"
 
-	"github.com/sorotrail/sorotrail/internal/ingester"
+	"github.com/sorotrail/sorotrail/internal/requestid"
 	"github.com/sorotrail/sorotrail/internal/rpc"
 	"github.com/sorotrail/sorotrail/internal/store"
 )
@@ -93,8 +93,11 @@ func New(client rpc.Client, st store.Store, reingest Reingester, log *slog.Logge
 		client:   client,
 		store:    st,
 		reingest: reingest,
-		log:      log,
-		opts:     opts,
+		// The same correlation field HTTP requests use carries the
+		// auditor's stable job id, so one field always identifies the
+		// originating work.
+		log:  log.With(requestid.Field, requestid.JobAuditor),
+		opts: opts,
 	}
 }
 
@@ -105,6 +108,9 @@ func (a *Auditor) Network() string { return a.opts.Network }
 // ingester, errors are logged and retried with jittered exponential
 // backoff; the only terminal condition is context cancellation.
 func (a *Auditor) Run(ctx context.Context) error {
+	// Carry the job id on the context so the store and RPC decorators tag
+	// this loop's slow-query and error logs with "auditor".
+	ctx = requestid.WithJob(ctx, requestid.JobAuditor)
 	backoff := time.Second
 	for {
 		worked, err := a.PassOnce(ctx)
@@ -522,8 +528,6 @@ func (a *Auditor) advanceHWM(ctx context.Context, network string, ledger uint32)
 	_, err := a.store.SaveAuditStateIfGreater(ctx, a.opts.Network, int64(ledger))
 	return err
 }
-
-var _ Reingester = (*ingester.Ingester)(nil)
 
 func sleepCtx(ctx context.Context, d time.Duration) bool {
 	if d <= 0 {

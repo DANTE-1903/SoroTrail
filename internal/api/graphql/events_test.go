@@ -65,6 +65,16 @@ func (s *stubStore) ListWatchedContracts(_ context.Context) ([]store.WatchedCont
 	return s.watchedList, s.watchedListErr
 }
 
+func (s *stubStore) GetContractSpecOverride(context.Context, string) ([]byte, error) {
+	return nil, nil
+}
+func (s *stubStore) SetContractSpecOverride(context.Context, string, []byte) error {
+	return nil
+}
+func (s *stubStore) DeleteContractSpecOverride(context.Context, string) error {
+	return nil
+}
+
 // newGraphQLTestServer wires the stub store and returns a Handler.
 func newGraphQLTestServer(t *testing.T, st *stubStore) *Handler {
 	t.Helper()
@@ -265,6 +275,7 @@ func TestBuildEventFilterDirectly(t *testing.T) {
 				ContractID:    knownContractID,
 				Types:         []string{"contract", "system"},
 				Topics:        &TopicPositionInput{T0: json.RawMessage(`"t0val"`)},
+				Topic:         json.RawMessage(`["topic0"]`),
 				TopicContains: json.RawMessage(`["contains"]`),
 				TxHash:        "abcdef",
 				FromLedger:    &fromLedge,
@@ -286,6 +297,7 @@ func TestBuildEventFilterDirectly(t *testing.T) {
 		assert.Equal(t, []string{"contract", "system"}, filter.Types)
 		assert.Nil(t, filter.Topic, "topic and topic0 are mutually exclusive")
 		assert.JSONEq(t, `"t0val"`, string(filter.Topic0))
+		assert.JSONEq(t, `["topic0"]`, string(filter.Topic))
 		assert.JSONEq(t, `["contains"]`, string(filter.TopicContains))
 		assert.Equal(t, "abcdef", filter.TxHash)
 		assert.Equal(t, int64(100), filter.FromLedger)

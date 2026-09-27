@@ -252,6 +252,7 @@ func (p *Postgres) PruneEventsBefore(ctx context.Context, cutoff time.Time) (int
 // stored via the coalesce() clauses in the UPDATE branch (`sorotrail replay`
 // relies on that).
 func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
+	batch := &pgx.Batch{}
 	conflict := `ON CONFLICT (network, ledger, id) DO NOTHING`
 	if onUpdate {
 		conflict = `ON CONFLICT (network, ledger, id) DO UPDATE SET
@@ -275,7 +276,6 @@ func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
 			 raw_topic_xdr, raw_value_xdr)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 		` + conflict
-	batch := &pgx.Batch{}
 	for _, e := range events {
 		// 14 placeholders → 14 args. nullable helpers turn empty raw XDR
 		// into SQL NULL so the column has one representation of "absent"
@@ -1605,6 +1605,45 @@ func (p *Postgres) SetContractSpec(ctx context.Context, wasmHash, contractID str
 	)
 	if err != nil {
 		return fmt.Errorf("saving contract spec for %s: %w", wasmHash, err)
+	}
+	return nil
+}
+
+func (p *Postgres) GetContractSpecOverride(ctx context.Context, contractID string) ([]byte, error) {
+	var specJSON []byte
+	err := p.pool.QueryRow(ctx,
+		`SELECT spec_json FROM contract_spec_overrides WHERE contract_id = $1`, contractID,
+	).Scan(&specJSON)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("loading contract spec override for %s: %w", contractID, err)
+	}
+	return specJSON, nil
+}
+
+func (p *Postgres) SetContractSpecOverride(ctx context.Context, contractID string, specJSON []byte) error {
+	_, err := p.pool.Exec(ctx, `
+		INSERT INTO contract_spec_overrides (contract_id, spec_json, updated_at)
+		VALUES ($1, $2, now())
+		ON CONFLICT (contract_id) DO UPDATE SET
+			spec_json  = EXCLUDED.spec_json,
+			updated_at = now()`,
+		contractID, specJSON,
+	)
+	if err != nil {
+		return fmt.Errorf("saving contract spec override for %s: %w", contractID, err)
+	}
+	return nil
+}
+
+func (p *Postgres) DeleteContractSpecOverride(ctx context.Context, contractID string) error {
+	_, err := p.pool.Exec(ctx,
+		`DELETE FROM contract_spec_overrides WHERE contract_id = $1`, contractID,
+	)
+	if err != nil {
+		return fmt.Errorf("deleting contract spec override for %s: %w", contractID, err)
 	}
 	return nil
 }

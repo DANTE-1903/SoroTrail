@@ -501,3 +501,135 @@ func TestIsContextErr_Table(t *testing.T) {
 		})
 	}
 }
+
+// TestRPCErrFromErr pins the unwrapping contract behind every retry and
+// failover decision: an *Error is returned whether it sits at the top of the
+// chain or underneath wrapping layers built with %w; a chain with no *Error
+// at all yields nil so callers fall through to transport classification
+// (isTransientHTTP) rather than treating the failure as a protocol error;
+// and a nil error yields nil — not an empty *Error value, which would turn
+// every "no error" result into a misclassified protocol failure. The
+// returned pointer must be the very error in the chain (not a copy), so
+// mutations like inspecting Code or Message reflect what the server sent,
+// and the wrapping layers must stay intact for errors.Is/errors.As.
+func TestRPCErrFromErr(t *testing.T) {
+	// transportErr stands in for the connection-level failures (refused,
+	// reset, EOF) that HTTPClient produces when no JSON-RPC error object
+	// exists — the classification branch rpcErrFromErr must NOT capture.
+	transportErr := errors.New("calling getHealth: connection refused")
+	// target is the JSON-RPC error object the table expects to find, either
+	// bare or as the root cause of a wrapped chain.
+	target := &Error{Code: -32000, Message: "ledger out of range"}
+
+	tests := []struct {
+		name string
+		err  error
+		want *Error // nil means no *Error should be found in the chain
+	}{
+		{
+			// The common production shape: HTTPClient wraps the decoded
+			// JSON-RPC error object with fmt.Errorf("%s: %w", method, err).
+			// The *Error sits one level down, so finding it here is what
+			// makes isRetryable see server errors as retryable.
+			name: "wrapped *Error is found through the chain",
+			err:  fmt.Errorf("getHealth: %w", target),
+			want: target,
+		},
+		{
+			// Deep wrapping (errors.Join or layered middleware) must not
+			// hide the *Error; the walk follows Unwrap to arbitrary depth.
+			name: "deeply wrapped *Error is found",
+			err:  fmt.Errorf("outer: %w", fmt.Errorf("middle: %w", target)),
+			want: target,
+		},
+		{
+			// The top-level case skips the walk entirely — the returned
+			// pointer must be the original, not a decoded copy, so callers
+			// mutating or comparing the error see the server's values.
+			name: "top-level *Error is returned as-is",
+			err:  target,
+			want: target,
+		},
+		{
+			// Transport failures carry no JSON-RPC error object. Returning
+			// non-nil here would make isRetryable treat "connection
+			// refused" as a protocol error instead of falling through to
+			// isTransientHTTP — silently changing what gets retried.
+			name: "transport error has no *Error",
+			err:  transportErr,
+			want: nil,
+		},
+		{
+			// A transport failure wrapping a non-RPC error (the real
+			// *url.Error shape) must likewise produce nil.
+			name: "wrapped non-RPC error has no *Error",
+			err:  fmt.Errorf("outer: %w", transportErr),
+			want: nil,
+		},
+		{
+			// nil in, nil out: doWithRetry calls this on the success path,
+			// so an empty *Error value here would misclassify every
+			// successful call as a protocol failure.
+			name: "nil error returns nil",
+			err:  nil,
+			want: nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := rpcErrFromErr(tt.err)
+			if tt.want == nil {
+				assert.Nil(t, got, "expected no *Error in the chain")
+				return
+			}
+			require.NotNil(t, got, "expected the *Error to be found")
+			// Same pointer, not an equal-looking copy: the function's
+			// contract is to hand back the error that is in the chain.
+			assert.Same(t, tt.want, got)
+			assert.Equal(t, tt.want.Code, got.Code)
+			assert.Equal(t, tt.want.Message, got.Message)
+		})
+	}
+
+	// The classification must compose with the standard library: whatever
+	// rpcErrFromErr found by walking Unwrap chains has to stay reachable
+	// through errors.Is/errors.As so callers wrapping on top (as
+	// doWithRetry does with "exhausted %d retries: %w") still see it.
+	t.Run("chain stays unwrappable with errors.Is and errors.As", func(t *testing.T) {
+		wrapped := fmt.Errorf("exhausted 3 retries: %w", fmt.Errorf("getHealth: %w", target))
+		require.Error(t, wrapped)
+		assert.ErrorIs(t, wrapped, target, "errors.Is must reach the *Error through the wrappers")
+		var got *Error
+		require.ErrorAs(t, wrapped, &got)
+		assert.Same(t, target, got)
+		// The transport branch composes the other way: no *Error is
+		// extractable, and the original transport error itself stays
+		// intact for isTransientHTTP's message matching.
+		transportWrapped := fmt.Errorf("exhausted 3 retries: %w", transportErr)
+		assert.Nil(t, rpcErrFromErr(transportWrapped))
+		assert.ErrorIs(t, transportWrapped, transportErr)
+	})
+
+	// HTTPClient.call prefixes every JSON-RPC error with the method name
+	// ("getEvents: rpc error …") — the RPC URL never enters the error path.
+	// That matters because RPC URLs may carry basic-auth credentials (see
+	// providerLabel in failover.go), and an error that named the endpoint by
+	// its URL would leak them into logs and metric labels. Pinning the
+	// message shape here guards the invariant the retry layer's log lines
+	// inherit: errors identify the endpoint by method, never by URL.
+	t.Run("message names the endpoint without leaking credentials", func(t *testing.T) {
+		// Mirrors the wrapping in HTTPClient.call: method name plus the
+		// decoded *Error, with the URL (carrying credentials here) absent.
+		err := fmt.Errorf("getEvents: %w", &Error{Code: -32000, Message: "ledger out of range"})
+		msg := err.Error()
+		assert.Contains(t, msg, "getEvents", "the error must identify which endpoint failed")
+		assert.NotContains(t, msg, "user:secret", "credentials from the RPC URL must never leak into error messages")
+		assert.NotContains(t, msg, "@", "a URL with userinfo must not appear in the error message")
+		// The unwrapped *Error keeps its own credential-free shape.
+		rpcErr := rpcErrFromErr(err)
+		require.NotNil(t, rpcErr)
+		assert.Contains(t, rpcErr.Error(), "rpc error -32000")
+		assert.NotContains(t, rpcErr.Error(), "user:secret")
+	})
+}

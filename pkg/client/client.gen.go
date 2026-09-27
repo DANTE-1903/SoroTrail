@@ -41,10 +41,16 @@ var SpecRoutes = []SpecRoute{
 	{Method: "GET", Path: "/admin/tenants/{id}/keys"},
 	{Method: "POST", Path: "/admin/tenants/{id}/keys"},
 	{Method: "GET", Path: "/admin/tenants/{id}/usage"},
+	{Method: "GET", Path: "/apikeys"},
+	{Method: "POST", Path: "/apikeys"},
+	{Method: "DELETE", Path: "/apikeys/{id}"},
 	{Method: "GET", Path: "/contracts"},
 	{Method: "GET", Path: "/contracts/{id}"},
 	{Method: "GET", Path: "/contracts/{id}/events"},
 	{Method: "GET", Path: "/contracts/{id}/export"},
+	{Method: "DELETE", Path: "/contracts/{id}/spec"},
+	{Method: "GET", Path: "/contracts/{id}/spec"},
+	{Method: "PUT", Path: "/contracts/{id}/spec"},
 	{Method: "GET", Path: "/contracts/{id}/stats"},
 	{Method: "GET", Path: "/dead-letters"},
 	{Method: "DELETE", Path: "/dead-letters/{id}"},
@@ -77,6 +83,14 @@ var SpecRoutes = []SpecRoute{
 	{Method: "GET", Path: "/watched-contracts"},
 	{Method: "POST", Path: "/watched-contracts"},
 	{Method: "DELETE", Path: "/watched-contracts/{id}"},
+}
+
+type APIKey struct {
+	CreatedAt string `json:"created_at"`
+	ID        int64  `json:"id"`
+	Name      string `json:"name"`
+	Prefix    string `json:"prefix"`
+	RevokedAt string `json:"revoked_at,omitempty"`
 }
 
 type ContractSummary struct {
@@ -212,6 +226,12 @@ type CountEventsResponse struct {
 	Count int64 `json:"count,omitempty"`
 }
 
+type CreateAPIKeyRequest struct {
+	Name string `json:"name,omitempty"`
+}
+
+type CreateAPIKeyResponse map[string]any
+
 type CreateTenantKeyResponse map[string]any
 
 type CreateTenantResponse map[string]any
@@ -219,6 +239,11 @@ type CreateTenantResponse map[string]any
 type CurrentTenantResponse map[string]any
 
 type CurrentTenantUsageResponse map[string]any
+
+type DeleteContractSpecOverrideResponse struct {
+	ContractID string `json:"contract_id"`
+	Deleted    bool   `json:"deleted"`
+}
 
 type DeleteEventsResponse struct {
 	Deleted int64 `json:"deleted,omitempty"`
@@ -230,6 +255,11 @@ type GetContractResponse struct {
 	FirstLedger int64  `json:"first_ledger"`
 	LastLedger  int64  `json:"last_ledger"`
 	LastSeen    string `json:"last_seen"`
+}
+
+type GetContractSpecOverrideResponse struct {
+	ContractID string         `json:"contract_id"`
+	Spec       map[string]any `json:"spec"`
 }
 
 type GetEventResponse = Event
@@ -247,6 +277,13 @@ type ListTenantKeysResponse map[string]any
 type ListTenantsResponse map[string]any
 
 type ListWatchedContractsResponse map[string]any
+
+type PutContractSpecOverrideRequest map[string]any
+
+type PutContractSpecOverrideResponse struct {
+	ContractID string         `json:"contract_id"`
+	Spec       map[string]any `json:"spec"`
+}
 
 type RawEventResponse struct {
 	TopicsXdr []string `json:"topics_xdr,omitempty"`
@@ -431,6 +468,30 @@ func (p TenantUsageParams) values() url.Values {
 	return v
 }
 
+// ListAPIKeys List API keys.
+//
+// GET /apikeys
+func (c *Client) ListAPIKeys(ctx context.Context) ([]APIKey, error) {
+	path := "/apikeys"
+	return doSlice[APIKey](c, ctx, "GET", path, nil, nil)
+}
+
+// CreateAPIKey Create an API key.
+//
+// POST /apikeys
+func (c *Client) CreateAPIKey(ctx context.Context, body CreateAPIKeyRequest) (*CreateAPIKeyResponse, error) {
+	path := "/apikeys"
+	return do[CreateAPIKeyResponse](c, ctx, "POST", path, nil, body)
+}
+
+// RevokeAPIKey Revoke an API key.
+//
+// DELETE /apikeys/{id}
+func (c *Client) RevokeAPIKey(ctx context.Context, id int64) error {
+	path := urlEscapePath("/apikeys/{id}", strconv.FormatInt(id, 10))
+	return doNoContent(c, ctx, "DELETE", path, nil, nil)
+}
+
 // ListContracts List indexed contracts.
 //
 // GET /contracts
@@ -589,6 +650,30 @@ func (p ContractExportParams) values() url.Values {
 		v.Set("format", p.Format)
 	}
 	return v
+}
+
+// DeleteContractSpecOverride Delete a contract spec override.
+//
+// DELETE /contracts/{id}/spec
+func (c *Client) DeleteContractSpecOverride(ctx context.Context, id string) (*DeleteContractSpecOverrideResponse, error) {
+	path := urlEscapePath("/contracts/{id}/spec", id)
+	return do[DeleteContractSpecOverrideResponse](c, ctx, "DELETE", path, nil, nil)
+}
+
+// GetContractSpecOverride Get a contract spec override.
+//
+// GET /contracts/{id}/spec
+func (c *Client) GetContractSpecOverride(ctx context.Context, id string) (*GetContractSpecOverrideResponse, error) {
+	path := urlEscapePath("/contracts/{id}/spec", id)
+	return do[GetContractSpecOverrideResponse](c, ctx, "GET", path, nil, nil)
+}
+
+// PutContractSpecOverride Upload a contract spec override.
+//
+// PUT /contracts/{id}/spec
+func (c *Client) PutContractSpecOverride(ctx context.Context, id string, body PutContractSpecOverrideRequest) (*PutContractSpecOverrideResponse, error) {
+	path := urlEscapePath("/contracts/{id}/spec", id)
+	return do[PutContractSpecOverrideResponse](c, ctx, "PUT", path, nil, body)
 }
 
 // ContractStats Get per-contract statistics.

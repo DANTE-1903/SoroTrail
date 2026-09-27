@@ -14,6 +14,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/sorotrail/sorotrail/internal/sep41"
@@ -93,11 +94,21 @@ func (e *Event) WithSEP41() {
 	}
 }
 
+// EnrichedEvent wraps an Event with decoded field information derived from
+// the contract's spec. The original Event is preserved in full; DecodedEvent
+// carries the enriched view when decoding succeeded.
+//
+// When enrichment fails to decode the event's payload, DecodeError carries a
+// human-readable reason so consumers can see *why* an event was not decoded.
+// The raw Event is always available alongside it (embedded above), so a
+// failed decode returns the original payload plus decode_error rather than
+// silently dropping the event.
 // EnrichedEvent wraps an Event with decoded field information.
 type EnrichedEvent struct {
 	Event        `json:",inline"`
 	DecodedEvent *DecodedEventResponse `json:"decoded_event,omitempty"`
 	Decoded      bool                  `json:"decoded"`
+	DecodeError  string                `json:"decode_error,omitempty"`
 }
 
 // DecodedEventResponse is the JSON shape returned when an event is successfully
@@ -434,6 +445,22 @@ const (
 // be decoded for the requested sort. The API maps it to 400.
 var ErrInvalidContractsCursor = errors.New("invalid contracts cursor")
 
+// ErrUnsupported is returned by a Store implementation for an operation it
+// deliberately does not implement. It exists so a backend can be honest about
+// its gaps: an unimplemented method returns this instead of a zero value that
+// reads as success, which is how a missing feature silently becomes an empty
+// 200. Callers detect it with errors.Is and map it to a clear status (501 or
+// the backend's documented fallback) rather than trusting the empty result.
+var ErrUnsupported = errors.New("operation not supported by this store backend")
+
+// errUnsupported builds a backend's explicit refusal for one operation. It
+// names both the operation and the backend so the API layer can map it to a
+// clear status and an operator reading a log knows exactly which capability
+// is missing, while wrapping ErrUnsupported so errors.Is works uniformly.
+func errUnsupported(backend, op string) error {
+	return fmt.Errorf("%s: not supported by the %s backend: %w", op, backend, ErrUnsupported)
+}
+
 // DeadLetter is one event that the ingester could not persist into the
 // events table. It carries enough context (raw XDR + the error) for an
 // operator to inspect the row, hand-replay it through a future
@@ -588,6 +615,27 @@ func OwnedBy(tenantID int64) SubscriptionOwner {
 	return SubscriptionOwner{tenantID: tenantID}
 }
 
+// APIKey is a stored API key. Only the bcrypt hash of the secret token
+// is persisted (KeyHash, never serialized); Prefix identifies the key in
+// the full token and is the indexed lookup key. RevokedAt is non-nil
+// once the key has been revoked — revoked keys fail validation
+// immediately.
+type APIKey struct {
+	ID        int64      `json:"id"`
+	Name      string     `json:"name"`
+	Prefix    string     `json:"prefix"`
+	CreatedAt time.Time  `json:"created_at"`
+	RevokedAt *time.Time `json:"revoked_at,omitempty"`
+
+	// KeyHash is the bcrypt hash of the secret part of the key. It is
+	// write-only: it is set on create and compared on validation, but
+	// never returned to callers.
+	KeyHash string `json:"-"`
+}
+
+// Revoked reports whether the key has been revoked.
+func (k APIKey) Revoked() bool { return k.RevokedAt != nil }
+
 // IsAll reports whether the owner filter is unrestricted.
 func (o SubscriptionOwner) IsAll() bool { return o.all }
 
@@ -639,8 +687,14 @@ type Stats struct {
 	OldestStoredLedger    int64  `json:"oldest_stored_ledger"`
 	ChainHeadLedger       *int64 `json:"chain_head_ledger"`
 	IngestLagLedgers      *int64 `json:"ingest_lag_ledgers"`
-	ContractCount         int64  `json:"contract_count"`
-	WatchedContracts      int64  `json:"watched_contracts"`
+	// LastSuccessfulPoll is the wall-clock time of the most recent poll
+	// cycle that completed without error, as recorded by the ingester and
+	// persisted in ingestion_state. Absent (omitted) until the ingester has
+	// finished its first successful pass, so a fresh instance reports
+	// "never polled" rather than a fake zero timestamp.
+	LastSuccessfulPoll *time.Time `json:"last_successful_poll,omitempty"`
+	ContractCount      int64      `json:"contract_count"`
+	WatchedContracts   int64      `json:"watched_contracts"`
 	// TableSizeBytes is the approximate on-disk size of the events table
 	// (including partitions, indexes, and TOAST). 0 when the backend does
 	// not report it.
@@ -651,8 +705,9 @@ type Stats struct {
 	// directly or when no errors have occurred.
 	QueryErrors uint64 `json:"query_errors"`
 	// EventsIngestedTotal is the total number of events successfully
-	// persisted to the store since process start. Populated by the
-	// ingester; zero when the ingester is not wired.
+	// persisted to the store since process start, read from the
+	// sorotrail_events_ingested_total Prometheus counter. It resets across
+	// restarts, same as every other in-memory counter in this struct.
 	EventsIngestedTotal uint64 `json:"events_ingested_total"`
 	// PanicsRecovered is the number of panics the HTTP middleware has
 	// recovered since process start. Set by the API handler.
@@ -664,15 +719,53 @@ type Stats struct {
 	// Auditor counters are populated only when the audit package is
 	// active; omitted from JSON when the auditor is nil.
 	Auditor AuditStats `json:"auditor,omitempty"`
+	// Decode counters are populated only when a spec enricher is wired;
+	// omitted from JSON when it is nil (decoded=true is unavailable).
+	Decode *DecodeStats `json:"decode,omitempty"`
+	// Spec-cache counters are populated only when the API layer is given
+	// a spec cache; omitted from JSON otherwise.
+	SpecCache SpecCacheStats `json:"spec_cache,omitempty"`
 	// Pruner counters are populated only when retention is configured;
 	// omitted from JSON when the pruner is a no-op.
 	Pruner PrunerStats `json:"pruner,omitempty"`
+	// Ingester surfaces adaptive-polling state (issue #146); populated
+	// only when an ingester is wired via api.SetIngester, omitted from
+	// JSON otherwise.
+	Ingester IngesterStats `json:"ingester,omitempty"`
+}
+
+// DecodeStats is a JSON-friendly view of spec-enrichment decode counters,
+// surfaced via /stats so the decode failure rate is observable. Failures over
+// Decodes is the per-frame decode failure rate: when the enricher is disabled
+// the field stays nil and is omitted from JSON.
+type DecodeStats struct {
+	Decodes        uint64 `json:"decodes"`
+	DecodeFailures uint64 `json:"decode_failures"`
+}
+
+// SpecCacheStats is a JSON-friendly view of spec.CacheStats. Defined here
+// so json.Marshal sees concrete field tags (same pattern as AuditStats).
+type SpecCacheStats struct {
+	CachedSpecs   int    `json:"cached_specs"`
+	Hits          uint64 `json:"hits"`
+	Misses        uint64 `json:"misses"`
+	Fetches       uint64 `json:"fetches"`
+	Expiries      uint64 `json:"expiries"`
+	Invalidations uint64 `json:"invalidations"`
 }
 
 // PrunerStats is a JSON-friendly view of pruner.Metrics.
 type PrunerStats struct {
 	RunsCompleted   uint64 `json:"runs_completed"`
 	TotalRowsPurged int64  `json:"total_rows_purged"`
+}
+
+// IngesterStats is a JSON-friendly view of the ingester's adaptive
+// polling state (issue #146). EffectivePollIntervalMs follows the same
+// "_ms" millisecond-integer convention already used for durations in
+// this package (see DeliveryAttempt.DurationMs).
+type IngesterStats struct {
+	EffectivePollIntervalMs int64 `json:"effective_poll_interval_ms"`
 }
 
 // RPCErrorStats is a JSON-friendly snapshot of per-method RPC error counts.
@@ -885,6 +978,28 @@ type Store interface {
 
 	// ListEnabledSubscriptions returns all subscriptions with enabled=true.
 	ListEnabledSubscriptions(ctx context.Context) ([]Subscription, error)
+
+	// API key management. Keys are stored as bcrypt hashes; the plaintext
+	// secret is shown to the caller once at creation and never persisted.
+	// CreateAPIKey persists k (KeyHash must already be the bcrypt hash of
+	// the secret) and returns it with ID and CreatedAt populated.
+	CreateAPIKey(ctx context.Context, k APIKey) (APIKey, error)
+	// GetAPIKey returns the key with the given ID, or ErrNotFound.
+	GetAPIKey(ctx context.Context, id int64) (APIKey, error)
+	// LookupAPIKeyByPrefix returns the active (non-revoked) key with the
+	// given prefix, or ErrNotFound. Validation always goes through this
+	// method so a revocation takes effect on the next request.
+	LookupAPIKeyByPrefix(ctx context.Context, prefix string) (APIKey, error)
+	// ListAPIKeys returns every key, oldest first, including revoked ones.
+	ListAPIKeys(ctx context.Context) ([]APIKey, error)
+	// RevokeAPIKey marks the key with the given ID revoked. Returns
+	// ErrNotFound when the key does not exist; revoking an already
+	// revoked key is a no-op.
+	RevokeAPIKey(ctx context.Context, id int64) error
+
+	// IncrementSubscriptionFailures atomically increments failure_count
+	// and returns the new value. When newCount >= maxFailures the
+	// subscription is also disabled.
 	IncrementSubscriptionFailures(ctx context.Context, id int64, maxFailures int) (newCount int, disabled bool, err error)
 	ResetSubscriptionFailures(ctx context.Context, id int64) error
 	RecordDeliveryAttempt(ctx context.Context, a DeliveryAttempt) (DeliveryAttempt, error)
@@ -901,6 +1016,17 @@ type Store interface {
 	// or ErrNotFound when no spec is cached for that hash.
 	GetContractSpec(ctx context.Context, wasmHash string) ([]byte, error)
 	SetContractSpec(ctx context.Context, wasmHash, contractID string, specJSON []byte) error
+
+	// Contract spec overrides: user-supplied spec JSON per contract_id,
+	// preferred over the RPC-fetched spec during enrichment. Used when a
+	// contract does not expose a fetchable spec.
+	// GetContractSpecOverride returns the stored spec JSON for the contract,
+	// or ErrNotFound when no override exists.
+	GetContractSpecOverride(ctx context.Context, contractID string) ([]byte, error)
+	// SetContractSpecOverride upserts the override for the contract.
+	SetContractSpecOverride(ctx context.Context, contractID string, specJSON []byte) error
+	// DeleteContractSpecOverride removes the override. Idempotent.
+	DeleteContractSpecOverride(ctx context.Context, contractID string) error
 
 	// DeleteEventsBeforeLedger deletes all events with a ledger strictly less than
 	// the given ledger number. It returns the number of rows deleted.

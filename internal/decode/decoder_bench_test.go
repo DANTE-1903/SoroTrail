@@ -2,6 +2,7 @@ package decode
 
 import (
 	"encoding/json"
+	"fmt"
 	"testing"
 
 	"github.com/stellar/go-stellar-sdk/xdr"
@@ -153,3 +154,45 @@ func BenchmarkEventTopicsValue_JSONPassthrough(b *testing.B) {
 }
 
 func ptrUint64(v uint64) *uint64 { return &v }
+
+// BenchmarkFullPageJSONSerialization benchmarks JSON marshaling of a full page of events
+// to ensure serialization performance and allocation counts remain optimal.
+func BenchmarkFullPageJSONSerialization(b *testing.B) {
+	type Page struct {
+		Events     []map[string]any `json:"events"`
+		NextCursor string           `json:"next_cursor"`
+		Limit      int              `json:"limit"`
+	}
+
+	items := make([]map[string]any, 50)
+	for i := 0; i < 50; i++ {
+		items[i] = map[string]any{
+			"id":                 fmt.Sprintf("%019d-%010d", 1000000+i, 0),
+			"contract_id":        "C0000000000000000000000000000000000000000000000000000001",
+			"ledger":             1000000,
+			"type":               "contract",
+			"tx_hash":            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+			"tx_index":           0,
+			"op_index":           0,
+			"in_successful_call": true,
+			"topics":             []string{"transfer"},
+			"value":              map[string]any{"u64": 100000},
+			"created_at":         "2026-01-01T00:00:00Z",
+		}
+	}
+
+	page := Page{
+		Events:     items,
+		NextCursor: "0000001000000-0000000000",
+		Limit:      50,
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_, err := json.Marshal(page)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}

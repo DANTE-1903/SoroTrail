@@ -928,9 +928,10 @@ func (s *SQLite) GetIngestionState(ctx context.Context) (IngestionState, error) 
 func (s *SQLite) GetIngestionStateForNetwork(ctx context.Context, network string) (IngestionState, error) {
 	var st IngestionState
 	var ts string
+	var poll *string
 	err := s.db.QueryRowContext(ctx,
-		`SELECT network, last_ingested_ledger, last_cursor, updated_at FROM ingestion_state WHERE network = ?`, defaultNetwork(network),
-	).Scan(&st.Network, &st.LastIngestedLedger, &st.LastCursor, &ts)
+		`SELECT network, last_ingested_ledger, last_cursor, last_successful_poll, updated_at FROM ingestion_state WHERE network = ?`, defaultNetwork(network),
+	).Scan(&st.Network, &st.LastIngestedLedger, &st.LastCursor, &poll, &ts)
 	if errors.Is(err, sql.ErrNoRows) {
 		return IngestionState{}, ErrNotFound
 	}
@@ -938,20 +939,33 @@ func (s *SQLite) GetIngestionStateForNetwork(ctx context.Context, network string
 		return IngestionState{}, fmt.Errorf("loading ingestion state: %w", err)
 	}
 	st.UpdatedAt = parseTime(ts)
+	if poll != nil {
+		parsed := parseTime(*poll)
+		st.LastSuccessfulPoll = &parsed
+	}
 	return st, nil
 }
 
 func (s *SQLite) SaveIngestionState(ctx context.Context, st IngestionState) error {
 	st.Network = defaultNetwork(st.Network)
 	now := formatTime(time.Now().UTC())
+	// last_successful_poll mirrors the Postgres backend: the UPSERT sets
+	// it to EXCLUDED.last_successful_poll, so a nil value overwrites with
+	// NULL (not the previous timestamp). A non-nil poll is stored as an
+	// sqliteTimeLayout string that parseTime round-trips on read.
+	var poll any
+	if st.LastSuccessfulPoll != nil {
+		poll = formatTime(*st.LastSuccessfulPoll)
+	}
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO ingestion_state (network, last_ingested_ledger, last_cursor, updated_at)
-		VALUES (?, ?, ?, ?)
+		INSERT INTO ingestion_state (network, last_ingested_ledger, last_cursor, last_successful_poll, updated_at)
+		VALUES (?, ?, ?, ?, ?)
 		ON CONFLICT (network) DO UPDATE SET
 			last_ingested_ledger = excluded.last_ingested_ledger,
 			last_cursor          = excluded.last_cursor,
+			last_successful_poll = excluded.last_successful_poll,
 			updated_at           = excluded.updated_at`,
-		st.Network, st.LastIngestedLedger, st.LastCursor, now,
+		st.Network, st.LastIngestedLedger, st.LastCursor, poll, now,
 	)
 	if err != nil {
 		return fmt.Errorf("saving ingestion state: %w", err)
@@ -1264,7 +1278,7 @@ func (s *SQLite) RecordDeliveryAttempt(ctx context.Context, a DeliveryAttempt) (
 		VALUES (?, ?, ?, ?, ?, ?)
 		RETURNING id, created_at`,
 		a.SubscriptionID, a.EventID, a.Status, a.ResponseCode,
-		a.DurationMs, nullableText(a.Error),
+		a.DurationMs, a.Error, // NOT NULL DEFAULT ''; empty means success, never NULL
 	).Scan(&a.ID, &a.CreatedAt)
 	if err != nil {
 		return DeliveryAttempt{}, fmt.Errorf("recording delivery attempt: %w", err)
@@ -1354,6 +1368,45 @@ func (s *SQLite) SetContractSpec(ctx context.Context, wasmHash, contractID strin
 	)
 	if err != nil {
 		return fmt.Errorf("saving contract spec for %s: %w", wasmHash, err)
+	}
+	return nil
+}
+
+func (s *SQLite) GetContractSpecOverride(ctx context.Context, contractID string) ([]byte, error) {
+	var specJSON string
+	err := s.db.QueryRowContext(ctx,
+		`SELECT spec_json FROM contract_spec_overrides WHERE contract_id = ?`, contractID,
+	).Scan(&specJSON)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("loading contract spec override for %s: %w", contractID, err)
+	}
+	return []byte(specJSON), nil
+}
+
+func (s *SQLite) SetContractSpecOverride(ctx context.Context, contractID string, specJSON []byte) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO contract_spec_overrides (contract_id, spec_json, updated_at)
+		VALUES (?, ?, datetime('now'))
+		ON CONFLICT (contract_id) DO UPDATE SET
+			spec_json  = excluded.spec_json,
+			updated_at = excluded.updated_at`,
+		contractID, string(specJSON),
+	)
+	if err != nil {
+		return fmt.Errorf("saving contract spec override for %s: %w", contractID, err)
+	}
+	return nil
+}
+
+func (s *SQLite) DeleteContractSpecOverride(ctx context.Context, contractID string) error {
+	_, err := s.db.ExecContext(ctx,
+		`DELETE FROM contract_spec_overrides WHERE contract_id = ?`, contractID,
+	)
+	if err != nil {
+		return fmt.Errorf("deleting contract spec override for %s: %w", contractID, err)
 	}
 	return nil
 }
@@ -1464,11 +1517,21 @@ func scanSubscriptionsSQLite(rows *sql.Rows) ([]Subscription, error) {
 	return subs, rows.Err()
 }
 
+// sqliteTimeLayout is RFC3339 with a fixed nine-digit fraction. SQLite has
+// no timestamp type, so ORDER BY and range filters on these columns compare
+// the stored strings byte by byte. time.RFC3339Nano trims trailing zeros,
+// which makes "…:00Z" sort after "…:00.5Z"; padding every value to the same
+// width keeps string order identical to chronological order. parseTime still
+// reads it through its RFC3339Nano branch.
+const sqliteTimeLayout = "2006-01-02T15:04:05.000000000Z07:00"
+
+// formatTime renders t in UTC with sqliteTimeLayout. The zero time maps to
+// "" so optional columns and filters read as unset rather than year 1.
 func formatTime(t time.Time) string {
 	if t.IsZero() {
 		return ""
 	}
-	return t.UTC().Format(time.RFC3339Nano)
+	return t.UTC().Format(sqliteTimeLayout)
 }
 
 func parseTime(s string) time.Time {
@@ -1496,42 +1559,82 @@ func nullableXDRTopics(s []string) any {
 	return string(b)
 }
 
-// Contract metadata (token enrichment) is Postgres-only; the SQLite backend
-// reports "not found"/empty so the enrichment worker stays a no-op.
-func (s *SQLite) ListContractIDs(context.Context) ([]string, error) { return nil, nil }
-func (s *SQLite) GetContractMeta(context.Context, string) (ContractMeta, error) {
-	return ContractMeta{}, ErrNotFound
+// Contract metadata (token enrichment) is Postgres-only. The SQLite backend
+// refuses these operations explicitly rather than reporting empty results:
+// a silent zero here would make token enrichment and the per-contract event
+// count read as "nothing to do" instead of "this backend cannot answer",
+// which is the bug the conformance suite exists to catch.
+func (s *SQLite) ListContractIDs(context.Context) ([]string, error) {
+	return nil, errUnsupported("sqlite", "ListContractIDs")
 }
-func (s *SQLite) UpsertContractMeta(context.Context, ContractMeta) error     { return nil }
-func (s *SQLite) CountContractEvents(context.Context, string) (int64, error) { return 0, nil }
+func (s *SQLite) GetContractMeta(context.Context, string) (ContractMeta, error) {
+	return ContractMeta{}, errUnsupported("sqlite", "GetContractMeta")
+}
+func (s *SQLite) UpsertContractMeta(context.Context, ContractMeta) error {
+	return errUnsupported("sqlite", "UpsertContractMeta")
+}
+func (s *SQLite) CountContractEvents(context.Context, string) (int64, error) {
+	return 0, errUnsupported("sqlite", "CountContractEvents")
+}
 func (s *SQLite) ListContractsNeedingRefresh(context.Context, time.Time) ([]string, error) {
-	return nil, nil
+	return nil, errUnsupported("sqlite", "ListContractsNeedingRefresh")
 }
 
 // ListContracts is not implemented for the SQLite backend: the contract
 // inventory endpoint is Postgres-only.
 
-// GetContractSummary is not implemented for the SQLite backend.
-func (s *SQLite) GetContractSummary(ctx context.Context, contractID string) (ContractSummary, error) {
-	return ContractSummary{}, fmt.Errorf("GetContractSummary: not supported by the sqlite backend")
+// API keys are not implemented for the SQLite backend: single-node
+// deployments authenticate via the operator's own reverse proxy or run
+// without the HTTP API's key check entirely.
+func (s *SQLite) CreateAPIKey(context.Context, APIKey) (APIKey, error) {
+	return APIKey{}, errUnsupported("sqlite", "CreateAPIKey")
+}
+
+func (s *SQLite) GetAPIKey(context.Context, int64) (APIKey, error) {
+	return APIKey{}, errUnsupported("sqlite", "GetAPIKey")
+}
+
+func (s *SQLite) LookupAPIKeyByPrefix(context.Context, string) (APIKey, error) {
+	return APIKey{}, errUnsupported("sqlite", "LookupAPIKeyByPrefix")
+}
+
+func (s *SQLite) ListAPIKeys(context.Context) ([]APIKey, error) {
+	return nil, errUnsupported("sqlite", "ListAPIKeys")
+}
+
+func (s *SQLite) RevokeAPIKey(context.Context, int64) error {
+	return errUnsupported("sqlite", "RevokeAPIKey")
+}
+
+// GetContractSummary is not implemented for the SQLite backend: the contract
+// statistics endpoint is Postgres-only.
+func (s *SQLite) GetContractSummary(context.Context, string) (ContractSummary, error) {
+	return ContractSummary{}, errUnsupported("sqlite", "GetContractSummary")
 }
 
 // ContractEventTypeCounts is not implemented for the SQLite backend.
-func (s *SQLite) ContractEventTypeCounts(ctx context.Context, contractID string) ([]ContractEventTypeCount, error) {
-	return nil, fmt.Errorf("ContractEventTypeCounts: not supported by the sqlite backend")
+func (s *SQLite) ContractEventTypeCounts(context.Context, string) ([]ContractEventTypeCount, error) {
+	return nil, errUnsupported("sqlite", "ContractEventTypeCounts")
 }
 
 func (s *SQLite) ListContracts(context.Context, ContractsFilter) ([]ContractSummary, string, error) {
-	return nil, "", fmt.Errorf("ListContracts: not supported by the sqlite backend")
+	return nil, "", errUnsupported("sqlite", "ListContracts")
 }
 
 // Per-contract cursors are not implemented for the SQLite backend: watched
-// ingestion always uses the single global ingestion_state row.
+// ingestion there always uses the single global ingestion_state row. These
+// refuse explicitly instead of returning a zero cursor, so a caller that
+// expects per-contract resume positions learns the capability is absent
+// rather than silently resuming from ledger 0.
 func (s *SQLite) GetContractCursor(context.Context, string) (ContractCursor, error) {
-	return ContractCursor{}, ErrNotFound
+	return ContractCursor{}, errUnsupported("sqlite", "GetContractCursor")
 }
-func (s *SQLite) SaveContractCursor(context.Context, ContractCursor) error { return nil }
-func (s *SQLite) DeleteContractCursor(context.Context, string) error       { return nil }
+func (s *SQLite) SaveContractCursor(context.Context, ContractCursor) error {
+	return errUnsupported("sqlite", "SaveContractCursor")
+}
+func (s *SQLite) DeleteContractCursor(context.Context, string) error {
+	return errUnsupported("sqlite", "DeleteContractCursor")
+}
 func (s *SQLite) ListContractCursors(context.Context) ([]ContractCursor, error) {
-	return nil, nil
+	return nil, errUnsupported("sqlite", "ListContractCursors")
 }

@@ -4,7 +4,9 @@
 // With no arguments it runs the indexer. Subcommands cover maintenance:
 //
 //	sorotrail replay --from-ledger N [--to-ledger M]
+//	sorotrail apikey create|list|revoke
 //	sorotrail backfill --contract C... --from-ledger N [--to-ledger M]
+//	sorotrail migrate up|down|status [--steps N]
 package main
 
 import (
@@ -31,6 +33,7 @@ import (
 	"github.com/sorotrail/sorotrail/internal/decode"
 	"github.com/sorotrail/sorotrail/internal/ingester"
 	"github.com/sorotrail/sorotrail/internal/pruner"
+	"github.com/sorotrail/sorotrail/internal/requestid"
 	"github.com/sorotrail/sorotrail/internal/rpc"
 	"github.com/sorotrail/sorotrail/internal/spec"
 	"github.com/sorotrail/sorotrail/internal/store"
@@ -42,13 +45,29 @@ var errInterrupted = errors.New("interrupted")
 
 func main() {
 	err := dispatch(os.Args[1:])
+	code := exitCode(err)
+	if code == 0 {
+		return
+	}
+	if code == 1 {
+		fmt.Fprintln(os.Stderr, "sorotrail:", err)
+	}
+	os.Exit(code)
+}
+
+// exitCode maps dispatch's result onto the process exit status: 0 on
+// success, 2 when a one-shot run was interrupted (scripts re-run to
+// resume, so the distinction from a genuine failure is part of the
+// interface), and 1 for every other error. It is a separate function
+// so the mapping is testable without os.Exit.
+func exitCode(err error) int {
 	switch {
 	case err == nil:
+		return 0
 	case errors.Is(err, errInterrupted):
-		os.Exit(2)
+		return 2
 	default:
-		fmt.Fprintln(os.Stderr, "sorotrail:", err)
-		os.Exit(1)
+		return 1
 	}
 }
 
@@ -61,10 +80,14 @@ func dispatch(args []string) error {
 	switch args[0] {
 	case "replay":
 		return runReplay(args[1:])
+	case "apikey":
+		return runAPIKey(args[1:])
 	case "backfill":
 		return runBackfill(args[1:])
 	case "index-addresses":
 		return runIndexAddresses(args[1:])
+	case "migrate":
+		return runMigrate(args[1:])
 	case "healthcheck":
 		// The healthcheck subcommand manages its own exit codes
 		// (0 healthy, 1 unhealthy, 2 usage error) — the docker
@@ -76,10 +99,27 @@ func dispatch(args []string) error {
 			os.Exit(code)
 		}
 		return nil
+	case "health":
+		// Like healthcheck, manages its own exit codes (0 healthy,
+		// 1 unhealthy, 2 usage) so external probes — k8s liveness,
+		// load balancers, CI gates — read the outcome directly.
+		code := runHealth(args[1:])
+		if code != 0 {
+			os.Exit(code)
+		}
+		return nil
 	case "schema-inspect":
 		return runSchemaInspect(args[1:])
 	case "migrate-status":
 		return runMigrateStatus(args[1:])
+	case "completion":
+		return runCompletion(args[1:])
+	case "version", "--version", "-V":
+		return runVersion(args[1:])
+	case "stats":
+		return runStats(args[1:])
+	case "config":
+		return runConfig(args[1:])
 	case "help", "-h", "--help":
 		usage()
 		return nil
@@ -95,18 +135,32 @@ func usage() {
 With no subcommand, runs the indexer (ingester + HTTP API).
 
 subcommands:
-  replay       re-decode stored events with the current decoder
-               (sorotrail replay --help)
-  backfill     ingest historical contract events from Horizon
-               (sorotrail backfill --help)
+  replay           re-decode stored events with the current decoder
+                   (sorotrail replay --help)
+  apikey           issue, list, and revoke API keys
+                   (sorotrail apikey --help)
+  backfill         ingest historical contract events from Horizon
+                   (sorotrail backfill --help)
   index-addresses  rebuild the address→event inverted index from stored events
-               (sorotrail index-addresses --help)
-  healthcheck  probe /health and exit (used by docker HEALTHCHECK)
-               (sorotrail healthcheck --help)
-  schema-inspect  report migration state, partitions, and table sizes
-               (sorotrail schema-inspect --help)
-  migrate-status report pending migrations without applying them
-               (sorotrail migrate-status --help)
+                   (sorotrail index-addresses --help)
+  migrate          apply, roll back, or inspect database migrations
+                   (sorotrail migrate --help)
+  health           probe the API /health and exit nonzero on failure
+                   (sorotrail health --help)
+  healthcheck      probe /health and exit (used by docker HEALTHCHECK)
+                   (sorotrail healthcheck --help)
+  schema-inspect   report migration state, partitions, and table sizes
+                   (sorotrail schema-inspect --help)
+  migrate-status   report pending migrations without applying them
+                   (sorotrail migrate-status --help)
+  completion       print a shell completion script (bash, zsh, fish)
+                   (sorotrail completion --help)
+  version          print the build version, commit, and build date
+                   (sorotrail version --help)
+  stats            print store stats as a table
+                   (sorotrail stats --help)
+  config           print the effective configuration with secrets redacted
+                   (sorotrail config --help)
 `)
 }
 
@@ -140,6 +194,9 @@ func run() error {
 		pg   *store.Postgres
 	)
 	if strings.HasPrefix(cfg.DatabaseURL, "clickhouse://") {
+		if cfg.RetentionEnabled() {
+			return fmt.Errorf("clickhouse: retention pruning is not supported by the clickhouse backend")
+		}
 		st, err = store.NewStoreFromURL(cfg.DatabaseURL)
 		if err != nil {
 			return err
@@ -220,9 +277,14 @@ func run() error {
 	wh := webhook.NewNotifier(st, log)
 
 	// Wire the spec cache and enricher for spec-decoded event views.
-	specCache := spec.NewCache(st)
+	// The cache is keyed by wasm hash with a TTL; the fetcher doubles as
+	// the wasm-hash resolver so contract upgrades (a changed hash)
+	// invalidate the previously cached spec automatically.
 	specFetcher := spec.NewFetcher(rpcClient)
-	specEnricher := spec.NewEnricher(specFetcher, specCache, log)
+	specCache := spec.NewCache(st,
+		spec.WithWasmHashResolver(specFetcher),
+	)
+	specEnricher := spec.NewEnricher(specFetcher, specCache, log, st)
 
 	// Wrap the raw RPC client so per-method error totals are tracked and
 	// surfaced via /stats. specFetcher already holds a reference to the
@@ -258,8 +320,13 @@ func run() error {
 		}
 	}
 
-	ing := ingester.New(countingClient, st, decode.XDRDecoder{}, log, ingester.Options{
+	// The decoder is wrapped in a memoizing cache: ingestion re-decodes the
+	// same topic symbols and values constantly, so hashing the raw XDR and
+	// serving repeats from an LRU removes that redundant work.
+	ing := ingester.New(countingClient, st, decode.NewCachingDecoder(decode.XDRDecoder{}, 0), log, ingester.Options{
 		PollInterval:            cfg.PollInterval,
+		PollIntervalMin:         cfg.PollIntervalMin,
+		PollIntervalMax:         cfg.PollIntervalMax,
 		StartLedger:             cfg.StartLedger,
 		StartLedgerRaw:          cfg.StartLedgerRaw,
 		RetentionLedgers:        cfg.RetentionLedgers,
@@ -271,8 +338,11 @@ func run() error {
 		BatchSize:               cfg.BatchSize,
 		BatchTargetLatency:      cfg.BatchTargetLatency,
 		BatchMaxBackoff:         cfg.BatchMaxBackoff,
+		MinBackoff:              cfg.IngesterMinBackoff,
+		MaxBackoff:              cfg.IngesterMaxBackoff,
 		ReorgConfirmationWindow: cfg.ReorgConfirmationWindow,
 		ReorgRescanInterval:     cfg.ReorgRescanInterval,
+		SkipContracts:           cfg.SkipContracts,
 		Network:                 cfg.Network,
 	}).WithBroadcaster(bcast)
 	ing.SetNotifier(wh)
@@ -280,6 +350,10 @@ func run() error {
 	// decode/persist land in the dead_letters table instead of
 	// stalling the cycle (issue #131).
 	ing.SetDeadLetterSink(st)
+	// Exposes the adaptive poll interval via /stats (issue #146). Always
+	// registered — there is exactly one Ingester per process even when
+	// INGESTION_LOCK_ENABLED causes its Run loop to be skipped.
+	api.SetIngester(ing)
 
 	// SIGHUP config hot-reload (issue #148): re-reads and validates the
 	// full environment on every SIGHUP, then applies only the safe subset
@@ -332,6 +406,14 @@ func run() error {
 		// to parse logs to see pass/finding rates.
 		api.SetAuditor(aud)
 	}
+	var retPruner *store.RetentionPruner
+	if cfg.RetentionAge > 0 {
+		retPruner = store.NewRetentionPruner(pg, log, store.RetentionOptions{
+			Age:          cfg.RetentionAge,
+			PollInterval: cfg.RetentionPoll,
+		})
+	}
+
 	// The pruner is constructed lazily: when neither RETENTION_MAX_AGE nor
 	// RETENTION_MIN_LEDGER is set, the pruner is a no-op goroutine that
 	// returns immediately. Only when at least one retention policy is
@@ -366,6 +448,9 @@ func run() error {
 		)
 	}
 
+	// Expose spec-cache hit/miss metrics via /stats.
+	api.SetSpecCache(specCache)
+
 	prn := pruner.NewWithArchiver(st, log, pruner.Options{
 		MaxAge:             cfg.RetentionMaxAge,
 		MinLedger:          cfg.RetentionMinLedger,
@@ -377,6 +462,7 @@ func run() error {
 	if cfg.RetentionEnabled() {
 		api.SetPruner(prn)
 	}
+
 	// Per-client HTTP rate limiter. Disabled when RATE_LIMIT_RPS or
 	// RATE_LIMIT_BURST is unset; the limiter is then a pass-through and
 	// its cleanup goroutine is never started.
@@ -406,6 +492,10 @@ func run() error {
 	apiServer := api.New(apiStore, countingClient, log, cfg.APIKey, specEnricher).WithBroadcaster(bcast)
 	apiServer.SetStatsTTL(cfg.StatsCacheTTL)
 	apiServer.SetRateLimiter(limiter)
+	if cfg.APIKeyAuthEnabled {
+		log.Info("api key authentication enabled", "gated", "write/streaming/subscriptions routes")
+	}
+	apiServer.WithAPIKeyAuth(cfg.APIKeyAuthEnabled)
 	apiServer.SetMetricsEnabled(cfg.MetricsEnabled)
 	apiServer.SetCompressMinSize(cfg.CompressMinSize)
 	apiServer.SetHTTPRequestBodyLimit(cfg.HTTPRequestBodyLimit)
@@ -428,7 +518,7 @@ func run() error {
 	apiServer.SetGraphQLHandler(gqlHandler, gqlHandler.PlaygroundHandler())
 
 	if cfg.MultiTenant {
-		// Tenancy lives in tables (tenants, grants, api_keys, usage) that
+		// Tenancy lives in tables (tenants, grants, tenant_api_keys, usage) that
 		// only the Postgres backend has. Refusing at startup is the whole
 		// point: silently running a ClickHouse deployment with MULTI_TENANT
 		// set would mean an operator believing a boundary is enforced when
@@ -471,9 +561,18 @@ func run() error {
 		log.Info("cors enabled", "origins", strings.Join(cfg.CORSAllowedOrigins, ","))
 	}
 
-	errCh := make(chan error, 5)
+	// Six reporters can write here: http, webhook, ingester, auditor,
+	// retention pruner, and pruner. The buffer must hold all of them so
+	// no goroutine parks on a send while shutdown is still draining.
+	errCh := make(chan error, 6)
 	go func() {
-		go wh.Run(ctx)
+		// The webhook pool joins the shutdown accounting: Run returns
+		// as soon as ctx is cancelled, and this report is what the
+		// drain loop below waits for. It used to be launched without
+		// a report, which left the loop waiting for a component that
+		// never spoke — every graceful shutdown hung until SIGKILL.
+		wh.Run(ctx)
+		errCh <- nil
 	}()
 
 	// Start the ingester only when the advisory lock was acquired (or
@@ -483,7 +582,8 @@ func run() error {
 	if ingesterEnabled {
 		remaining++ // + ingester
 		go func() {
-			log.Info("ingester starting", "rpc_urls", rpcURLsForLog(cfg), "poll_interval", cfg.PollInterval)
+			log.Info("ingester starting", requestid.Field, requestid.JobIngester,
+				"rpc_urls", rpcURLsForLog(cfg), "poll_interval", cfg.PollInterval)
 			if err := ing.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 				errCh <- fmt.Errorf("ingester: %w", err)
 			} else {
@@ -505,7 +605,7 @@ func run() error {
 	if aud != nil {
 		remaining++ // + auditor
 		go func() {
-			log.Info("auditor starting",
+			log.Info("auditor starting", requestid.Field, requestid.JobAuditor,
 				"budget_share", cfg.AuditBudgetShare,
 				"batch_ledgers", cfg.AuditBatchLedgers,
 				"lag_threshold", cfg.AuditLagThreshold,
@@ -517,12 +617,24 @@ func run() error {
 			}
 		}()
 	}
+	if retPruner != nil {
+		remaining++ // + age-based retention pruner
+		go func() {
+			log.Info("event retention pruning starting", "age", cfg.RetentionAge, "poll_interval", cfg.RetentionPoll)
+			if err := retPruner.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+				errCh <- fmt.Errorf("retention pruner: %w", err)
+			} else {
+				errCh <- nil
+			}
+		}()
+	}
+
 	// The pruner goroutine always runs; without a retention policy it
 	// returns immediately and reports nil so shutdown accounting holds.
 	remaining++ // + pruner
 	go func() {
 		if cfg.RetentionEnabled() {
-			log.Info("pruner starting",
+			log.Info("pruner starting", requestid.Field, requestid.JobPruner,
 				"max_age", cfg.RetentionMaxAge,
 				"min_ledger", cfg.RetentionMinLedger,
 				"batch_size", cfg.RetentionBatchSize,
@@ -536,13 +648,35 @@ func run() error {
 		}
 	}()
 
+	// A nil report is a component that finished cleanly before any
+	// shutdown was requested — the disabled pruner emits one the moment
+	// it starts. Reading that as "a component died" used to tear the
+	// process down a second after boot. Only the shutdown signal or a
+	// non-nil report ends the loop; every report, nil or not, consumes
+	// exactly one slot of the accounting above, so the drain below waits
+	// for precisely the messages that are still outstanding.
 	var firstErr error
-	select {
-	case <-ctx.Done():
-		log.Info("shutdown signal received")
-	case firstErr = <-errCh:
-		remaining--
-		stop()
+	stopping := false
+	for !stopping {
+		select {
+		case <-ctx.Done():
+			log.Info("shutdown signal received")
+			// Drop the SIGINT/SIGTERM registration right away: from
+			// here on a second signal takes the runtime's default
+			// action and forces immediate exit, instead of being
+			// swallowed while a stuck drain runs out the grace
+			// period. stop() is idempotent with the deferred call
+			// at function exit.
+			stop()
+			stopping = true
+		case err := <-errCh:
+			remaining--
+			if err != nil {
+				firstErr = err
+				stop()
+				stopping = true
+			}
+		}
 	}
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
@@ -583,7 +717,7 @@ func bootstrapAdminKey(ctx context.Context, ts store.TenantStore, key string, lo
 	if err != nil {
 		return fmt.Errorf("loading default tenant: %w", err)
 	}
-	err = ts.CreateAPIKeyIfAbsent(ctx, tenant.ID, "bootstrap", prefix, digest)
+	err = ts.CreateTenantAPIKeyIfAbsent(ctx, tenant.ID, "bootstrap", prefix, digest)
 	if err != nil {
 		return fmt.Errorf("installing bootstrap key: %w", err)
 	}

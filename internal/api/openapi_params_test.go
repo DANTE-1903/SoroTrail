@@ -235,7 +235,7 @@ func TestDeclaredEnumsMatchTheHandlers(t *testing.T) {
 		},
 		{
 			name: "decoded on /events", method: "get", route: "/events", param: "decoded",
-			template: "/events?decoded=%s", accepted: []string{"true"}, flag: true,
+			template: "/events?decoded=%s", accepted: []string{"true", "false"}, flag: true,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

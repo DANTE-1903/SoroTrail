@@ -309,17 +309,17 @@ func TestBackfillFlagValidation(t *testing.T) {
 		{
 			name:    "missing --from-ledger",
 			args:    []string{"--contract", "CABCDEFCABCDEFCABCDEFCABCDEFCABCDEFCABCDEFCABCDEFCABCDEF", "--dry-run", "--rps", "1"},
-			wantErr: "--from-ledger is required",
+			wantErr: "--from is required",
 		},
 		{
 			name:    "zero --from-ledger",
 			args:    []string{"--contract", "CABCDEFCABCDEFCABCDEFCABCDEFCABCDEFCABCDEFCABCDEFCABCDEF", "--from-ledger", "0", "--dry-run", "--rps", "1"},
-			wantErr: "--from-ledger is required and must be positive",
+			wantErr: "--from is required and must be positive",
 		},
 		{
 			name:    "--to-ledger before --from-ledger",
 			args:    []string{"--contract", "CABCDEFCABCDEFCABCDEFCABCDEFCABCDEFCABCDEFCABCDEFCABCDEF", "--from-ledger", "100", "--to-ledger", "50", "--dry-run", "--rps", "1"},
-			wantErr: "--to-ledger 50 is before --from-ledger 100",
+			wantErr: "--to 50 is before --from 100",
 		},
 		{
 			name:    "batch-size too large",

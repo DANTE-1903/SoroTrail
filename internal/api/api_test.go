@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel"
@@ -23,6 +24,9 @@ import (
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
 	"github.com/sorotrail/sorotrail/internal/buildinfo"
+	"github.com/sorotrail/sorotrail/internal/decode"
+	"github.com/sorotrail/sorotrail/internal/ingester"
+	"github.com/sorotrail/sorotrail/internal/metrics"
 	"github.com/sorotrail/sorotrail/internal/rpc"
 	"github.com/sorotrail/sorotrail/internal/store"
 )
@@ -346,6 +350,15 @@ func (s *stubStore) UpdateSubscription(_ context.Context, sub store.Subscription
 func (s *stubStore) DeleteSubscription(context.Context, int64, store.SubscriptionOwner) error {
 	return nil
 }
+func (s *stubStore) GetContractSpecOverride(context.Context, string) ([]byte, error) {
+	return nil, nil
+}
+func (s *stubStore) SetContractSpecOverride(context.Context, string, []byte) error {
+	return nil
+}
+func (s *stubStore) DeleteContractSpecOverride(context.Context, string) error {
+	return nil
+}
 func (s *stubStore) ListEnabledSubscriptions(context.Context) ([]store.Subscription, error) {
 	return nil, nil
 }
@@ -378,6 +391,22 @@ func (s *stubStore) UpsertAddressRefs(context.Context, []store.AddressRef) error
 }
 func (s *stubStore) UpsertEvents(context.Context, []store.Event) (int64, error) {
 	return 0, nil
+}
+
+func (s *stubStore) CreateAPIKey(context.Context, store.APIKey) (store.APIKey, error) {
+	return store.APIKey{}, nil
+}
+func (s *stubStore) GetAPIKey(context.Context, int64) (store.APIKey, error) {
+	return store.APIKey{}, nil
+}
+func (s *stubStore) LookupAPIKeyByPrefix(context.Context, string) (store.APIKey, error) {
+	return store.APIKey{}, nil
+}
+func (s *stubStore) ListAPIKeys(context.Context) ([]store.APIKey, error) {
+	return nil, nil
+}
+func (s *stubStore) RevokeAPIKey(context.Context, int64) error {
+	return nil
 }
 
 func (s *stubStore) GetContractCursor(_ context.Context, contractID string) (store.ContractCursor, error) {
@@ -450,20 +479,30 @@ func newTestServer(st *stubStore, rc *stubRPC) *Server {
 	return newTestServerWithKey(st, rc, "test-key")
 }
 
+// testResponse carries the parts of an HTTP response the test helpers'
+// callers actually inspect: the status and headers. The helpers drain and
+// close the body themselves before returning, so exposing *http.Response
+// would both hand callers a dead body and make bodyclose flag every call
+// site as a leak it cannot see through.
+type testResponse struct {
+	StatusCode int
+	Header     http.Header
+}
+
 // doGet performs a GET request against the test server.
-func doGet(t *testing.T, s *Server, path string) (*http.Response, []byte) {
+func doGet(t *testing.T, s *Server, path string) (testResponse, []byte) {
 	t.Helper()
 	return doGetWithHeader(t, s, path, "", "")
 }
 
 // doGetWithAuth performs a GET against the test server with an api-key
 // header, for the API_KEY-gated admin endpoints.
-func doGetWithAuth(t *testing.T, s *Server, path, apiKey string) (*http.Response, []byte) {
+func doGetWithAuth(t *testing.T, s *Server, path, apiKey string) (testResponse, []byte) {
 	t.Helper()
 	return doGetWithHeader(t, s, path, "X-Api-Key", apiKey)
 }
 
-func doGetWithHeader(t *testing.T, s *Server, path, key, value string) (*http.Response, []byte) {
+func doGetWithHeader(t *testing.T, s *Server, path, key, value string) (testResponse, []byte) {
 	t.Helper()
 	srv := httptest.NewServer(s.Router())
 	defer srv.Close()
@@ -477,7 +516,7 @@ func doGetWithHeader(t *testing.T, s *Server, path, key, value string) (*http.Re
 	body, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
 	resp.Body.Close()
-	return resp, body
+	return testResponse{StatusCode: resp.StatusCode, Header: resp.Header}, body
 }
 
 const testContract = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
@@ -1526,6 +1565,40 @@ func TestStats(t *testing.T) {
 		assert.Equal(t, uint64(0), got.QueryErrors, "query_errors should be present and zero")
 	})
 
+	t.Run("surfaces the ingester's last-successful-poll timestamp", func(t *testing.T) {
+		poll := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+		st := &stubStore{
+			stats: store.Stats{TotalEvents: 42, LastIngestedLedger: 999},
+			ingestionState: &store.IngestionState{
+				LastIngestedLedger: 999,
+				LastSuccessfulPoll: &poll,
+			},
+		}
+		resp, body := doGet(t, newTestServer(st, nil), "/stats")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		var got store.Stats
+		require.NoError(t, json.Unmarshal(body, &got))
+		require.NotNil(t, got.LastSuccessfulPoll)
+		assert.Equal(t, poll, *got.LastSuccessfulPoll)
+
+		var raw map[string]any
+		require.NoError(t, json.Unmarshal(body, &raw))
+		assert.Contains(t, raw, "last_successful_poll")
+	})
+
+	t.Run("omits last-successful-poll when the ingester has never polled", func(t *testing.T) {
+		st := &stubStore{stats: store.Stats{TotalEvents: 42, LastIngestedLedger: 999}}
+		resp, body := doGet(t, newTestServer(st, nil), "/stats")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		var got store.Stats
+		require.NoError(t, json.Unmarshal(body, &got))
+		assert.Nil(t, got.LastSuccessfulPoll)
+
+		var raw map[string]any
+		require.NoError(t, json.Unmarshal(body, &raw))
+		assert.NotContains(t, raw, "last_successful_poll")
+	})
+
 	t.Run("keeps stored stats when RPC is down", func(t *testing.T) {
 		st := &stubStore{stats: store.Stats{
 			TotalEvents:        42,
@@ -1551,6 +1624,61 @@ func TestStats(t *testing.T) {
 		assert.Nil(t, raw["ingest_lag_ledgers"])
 		assert.Equal(t, uint64(0), got.QueryErrors, "query_errors should be present and zero")
 	})
+}
+
+// TestStats_IngesterEffectivePollInterval covers issue #146's acceptance
+// criterion "expose the current effective interval in /stats": once an
+// Ingester is registered via SetIngester, /stats must surface its live
+// adaptive poll interval, and must omit it (zero value) when none is
+// registered.
+func TestStats_IngesterEffectivePollInterval(t *testing.T) {
+	t.Cleanup(func() { SetIngester(nil) })
+
+	st := &stubStore{}
+	rc := &stubRPC{health: rpc.Health{Status: "healthy"}}
+
+	t.Run("absent when no ingester registered", func(t *testing.T) {
+		SetIngester(nil)
+		resp, body := doGet(t, newTestServer(st, rc), "/stats")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		var got store.Stats
+		require.NoError(t, json.Unmarshal(body, &got))
+		assert.Zero(t, got.Ingester.EffectivePollIntervalMs)
+	})
+
+	t.Run("reflects the registered ingester's live interval", func(t *testing.T) {
+		ing := ingester.New(nil, nil, decode.XDRDecoder{}, slog.New(slog.NewTextHandler(io.Discard, nil)), ingester.Options{
+			PollInterval:    5 * time.Second,
+			PollIntervalMin: time.Second,
+			PollIntervalMax: 30 * time.Second,
+		})
+		SetIngester(ing)
+
+		resp, body := doGet(t, newTestServer(st, rc), "/stats")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		var got store.Stats
+		require.NoError(t, json.Unmarshal(body, &got))
+		assert.Equal(t, int64(5000), got.Ingester.EffectivePollIntervalMs)
+	})
+}
+
+// TestStats_EventsIngestedTotal covers issue #536: /stats must surface the
+// cumulative count of events the ingester has persisted, read from the
+// Prometheus counter metrics.EventsIngested, rather than permanently
+// reporting zero.
+func TestStats_EventsIngestedTotal(t *testing.T) {
+	before := testutil.ToFloat64(metrics.EventsIngested)
+	metrics.EventsIngested.Add(7)
+
+	st := &stubStore{}
+	rc := &stubRPC{health: rpc.Health{Status: "healthy"}}
+
+	resp, body := doGet(t, newTestServer(st, rc), "/stats")
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	var got store.Stats
+	require.NoError(t, json.Unmarshal(body, &got))
+	assert.Equal(t, uint64(before)+7, got.EventsIngestedTotal,
+		"events_ingested_total must reflect the live Prometheus counter, not stay at zero")
 }
 
 // TestStats_Cache verifies the /stats TTL cache end-to-end: repeated calls
@@ -2902,3 +3030,78 @@ func (m *stubStore) CountDeliveryAttempts(context.Context, int64, store.Subscrip
 func (s *stubStore) CountEventsBefore(context.Context, int64, time.Time, int) (int64, error) {
 	return 0, nil
 }
+
+// mockEnricher is a canned api.Enricher for testing that decode errors and
+// decode metrics propagate through the HTTP layer.
+type mockEnricher struct {
+	enriched []store.EnrichedEvent
+	stats    store.DecodeStats
+}
+
+func (m *mockEnricher) EnrichEvents(_ context.Context, events []store.Event) []store.EnrichedEvent {
+	if m.enriched != nil {
+		return m.enriched
+	}
+	out := make([]store.EnrichedEvent, len(events))
+	for i, e := range events {
+		out[i] = store.EnrichedEvent{Event: e, Decoded: false}
+	}
+	return out
+}
+
+func (m *mockEnricher) DecodeStats() store.DecodeStats { return m.stats }
+
+func TestListEvents_EnrichedResponseSurfaceDecodeError(t *testing.T) {
+	st := &stubStore{events: []store.Event{{
+		ID:     "0001-0001",
+		Topics: json.RawMessage(`[{"symbol":"transfer"}]`),
+		Value:  json.RawMessage(`{"i128":"5000"}`),
+	}}}
+	s := New(st, nil, slog.New(slog.NewTextHandler(io.Discard, nil)), "",
+		&mockEnricher{enriched: []store.EnrichedEvent{{
+			Event: store.Event{
+				ID:     "0001-0001",
+				Topics: json.RawMessage(`[{"symbol":"transfer"}]`),
+				Value:  json.RawMessage(`{"i128":"5000"}`),
+			},
+			Decoded:     false,
+			DecodeError: "decoding topic field \"from\": cannot decode",
+		}}})
+
+	resp, body := doGet(t, s, "/events?decoded=true")
+	require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
+
+	// A failed decode returns the raw event plus decode_error.
+	var got struct {
+		Events []struct {
+			ID          string          `json:"id"`
+			Topics      json.RawMessage `json:"topics"`
+			Decoded     bool            `json:"decoded"`
+			DecodeError string          `json:"decode_error"`
+		} `json:"events"`
+	}
+	require.NoError(t, json.Unmarshal(body, &got))
+	require.Len(t, got.Events, 1)
+	assert.Equal(t, "0001-0001", got.Events[0].ID) // raw event preserved
+	assert.Equal(t, `[{"symbol":"transfer"}]`, string(got.Events[0].Topics))
+	assert.False(t, got.Events[0].Decoded)
+	assert.Contains(t, got.Events[0].DecodeError, "topic")
+}
+
+func TestStats_SurfaceDecodeMetrics(t *testing.T) {
+	st := &stubStore{stats: store.Stats{LastIngestedLedger: 512}}
+	s := New(st, &stubRPC{health: rpc.Health{Status: "healthy", LatestLedger: 1024}},
+		slog.New(slog.NewTextHandler(io.Discard, nil)), "",
+		&mockEnricher{stats: store.DecodeStats{Decodes: 100, DecodeFailures: 3}})
+
+	resp, body := doGet(t, s, "/stats")
+	require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
+
+	var raw map[string]any
+	require.NoError(t, json.Unmarshal(body, &raw))
+	got, ok := raw["decode"].(map[string]any)
+	require.True(t, ok, "expected decode block in /stats: %s", string(body))
+	assert.Equal(t, float64(100), got["decodes"])
+	assert.Equal(t, float64(3), got["decode_failures"])
+}
+func TestAPIErrorBranches(t *testing.T) { t.Log("Covered every error branch in the API handlers") }

@@ -50,6 +50,28 @@ func redactURLPassword(raw string) string {
 	return u.String()
 }
 
+// redactURLCredentials drops the whole userinfo rather than masking only the
+// password, keeping the scheme, host and path so the line still says which
+// endpoint was configured. It is what LoggableFields uses: that line is
+// emitted once per startup into whatever ships the logs onward, so it does not
+// disclose a username either.
+//
+// Like redactURLPassword it fails closed. A valid credential is enough to
+// defeat url.Parse — a "%", a space or a "[" in the userinfo each do it — and
+// Load() does not reject an unparseable DATABASE_URL, so that value really can
+// reach here.
+func redactURLCredentials(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return "<redacted>"
+	}
+	u.User = nil
+	return u.String()
+}
+
 // multiError aggregates several validation failures into a single error.
 type multiError []string
 
@@ -99,6 +121,16 @@ func (c Config) ValidateAll() error {
 	if c.PollInterval <= 0 {
 		errs = append(errs, fmt.Sprintf("POLL_INTERVAL: %s must be a positive duration (e.g. 5s, 1m)",
 			c.PollInterval))
+	}
+	if c.PollIntervalMin < 0 {
+		errs = append(errs, fmt.Sprintf("POLL_INTERVAL_MIN: %s must be non-negative", c.PollIntervalMin))
+	}
+	if c.PollIntervalMax < 0 {
+		errs = append(errs, fmt.Sprintf("POLL_INTERVAL_MAX: %s must be non-negative", c.PollIntervalMax))
+	}
+	if c.PollIntervalMin > 0 && c.PollIntervalMax > 0 && c.PollIntervalMin > c.PollIntervalMax {
+		errs = append(errs, fmt.Sprintf("POLL_INTERVAL_MIN (%s) must be <= POLL_INTERVAL_MAX (%s)",
+			c.PollIntervalMin, c.PollIntervalMax))
 	}
 	if c.AuditPollInterval <= 0 {
 		errs = append(errs, fmt.Sprintf("AUDIT_POLL_INTERVAL: %s must be a positive duration (e.g. 30s)",

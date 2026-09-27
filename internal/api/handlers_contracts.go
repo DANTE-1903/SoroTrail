@@ -40,7 +40,7 @@ func (s *Server) handleGetContract(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		s.log.Error("loading contract summary", "contract_id", contractID, "error", err)
+		loggerFromContext(r.Context()).Error("loading contract summary", "contract_id", contractID, "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("loading contract summary failed"))
 		return
 	}
@@ -59,7 +59,7 @@ func (s *Server) handleContractStats(w http.ResponseWriter, r *http.Request) {
 	// Verify the contract exists (has at least one event).
 	count, err := s.store.CountContractEvents(r.Context(), contractID)
 	if err != nil {
-		s.log.Error("counting events for contract", "contract_id", contractID, "error", err)
+		loggerFromContext(r.Context()).Error("counting events for contract", "contract_id", contractID, "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("loading contract stats failed"))
 		return
 	}
