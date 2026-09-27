@@ -8,6 +8,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/sorotrail/sorotrail/internal/config"
 )
 
 // scrubEnv empties the process environment for the duration of one
@@ -108,5 +110,30 @@ func TestRunFailsFastOnBadConfiguration(t *testing.T) {
 			assert.Less(t, elapsed, 5*time.Second,
 				"startup must fail before attempting any network I/O")
 		})
+	}
+}
+
+// TestLoggerConstructionAndRedaction asserts that every documented log format
+// (json, text) and log level (debug, info, warn, error) initializes successfully
+// and that sensitive URLs or credentials in log output are properly redacted.
+func TestLoggerConstructionAndRedaction(t *testing.T) {
+	formats := []string{"json", "text"}
+	levels := []string{"debug", "info", "warn", "error"}
+
+	for _, format := range formats {
+		for _, level := range levels {
+			t.Run(format+"_+"+level, func(t *testing.T) {
+				logger := newLogger(format, level)
+				require.NotNil(t, logger)
+
+				// Verify credential redaction helper directly used in logger setup/startup
+				redacted := rpcURLsForLog(config.Config{
+					RPCURL: "https://admin:super-secret-password@rpc.stellar.org",
+				})
+				require.Len(t, redacted, 1)
+				assert.NotContains(t, redacted[0], "super-secret-password")
+				assert.Contains(t, redacted[0], "%2A%2A%2A")
+			})
+		}
 	}
 }

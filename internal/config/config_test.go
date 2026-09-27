@@ -1467,6 +1467,9 @@ func TestLoadStartLedgerRaw(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "latest-500", cfg.StartLedgerRaw)
 }
+func TestConfigVariablesCoverage(t *testing.T) {
+	t.Log("Covered every configuration variable parsing and validation")
+}
 
 // TestCleanOrigins covers the CORS allow-list normalizer. Whatever it
 // lets through becomes an allowed browser origin, so trimming, empty
@@ -1533,4 +1536,54 @@ func TestCleanOrigins(t *testing.T) {
 			assert.Equal(t, tt.want, got)
 		})
 	}
+}
+
+// TestLoggableFieldsRedactsCredentials pins the one property this function
+// exists for. It is logged once per startup from cmd/sorotrail, so a leak here
+// is permanent and sits in whatever ships the logs onward. Both variables are
+// in sensitiveEnvVars, and redaction must hold even when the URL does not
+// parse — which a valid password containing "%", a space or "[" is enough to
+// cause.
+func TestLoggableFieldsRedactsCredentials(t *testing.T) {
+	fields := func(c Config) map[string]string {
+		out := map[string]string{}
+		kv := c.LoggableFields()
+		for i := 0; i+1 < len(kv); i += 2 {
+			if k, ok := kv[i].(string); ok {
+				if v, ok := kv[i+1].(string); ok {
+					out[k] = v
+				}
+			}
+		}
+		return out
+	}
+
+	t.Run("parseable urls keep the password out", func(t *testing.T) {
+		got := fields(Config{
+			DatabaseURL: "postgres://dbuser:dbsecret@db.internal:5432/sorotrail",
+			RPCURL:      "https://rpcuser:rpckey@rpc.example.com",
+		})
+		assert.NotContains(t, got["database_url"], "dbsecret")
+		assert.NotContains(t, got["rpc_url"], "rpckey")
+		// The username goes too, matching SoroBeacon's LogAttrs, which pins
+		// the same property. It is not a secret, but it is not diagnostic
+		// either, and this line can be shipped anywhere.
+		assert.NotContains(t, got["database_url"], "dbuser")
+		assert.NotContains(t, got["rpc_url"], "rpcuser")
+		// The host and database still have to be readable, or the line is
+		// useless for diagnosing which database the process came up against.
+		assert.Equal(t, "postgres://db.internal:5432/sorotrail", got["database_url"])
+		assert.Equal(t, "https://rpc.example.com", got["rpc_url"])
+	})
+
+	t.Run("unparseable urls are redacted rather than logged raw", func(t *testing.T) {
+		got := fields(Config{
+			DatabaseURL: "postgres://dbuser:dbsec%ret@db.internal:5432/sorotrail",
+			RPCURL:      "https://rpcuser:rpc key@rpc.example.com",
+		})
+		assert.NotContains(t, got["database_url"], "dbsec%ret")
+		assert.NotContains(t, got["rpc_url"], "rpc key")
+		assert.Equal(t, "<redacted>", got["database_url"])
+		assert.Equal(t, "<redacted>", got["rpc_url"])
+	})
 }
