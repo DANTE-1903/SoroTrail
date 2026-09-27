@@ -21,6 +21,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -52,6 +53,11 @@ func sorotrailBinary(t *testing.T) string {
 		}
 		lifecycleBinD = dir
 		path := filepath.Join(dir, "sorotrail")
+		if runtime.GOOS == "windows" {
+			// Windows will not execute a file without an executable
+			// extension, and go build writes exactly the -o path given.
+			path += ".exe"
+		}
 		cmd := exec.Command("go", "build", "-o", path, ".")
 		out, err := cmd.CombinedOutput()
 		if err != nil {
