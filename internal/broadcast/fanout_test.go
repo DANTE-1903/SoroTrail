@@ -2,14 +2,14 @@ package broadcast
 
 import (
 	"context"
+	"encoding/json"
+	"sync"
 	"testing"
 	"time"
 
-	"encoding/json"
 	"github.com/sorotrail/sorotrail/internal/store"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"sync"
 )
 
 func TestSubscriberFanOut_Lifecycle(t *testing.T) {
