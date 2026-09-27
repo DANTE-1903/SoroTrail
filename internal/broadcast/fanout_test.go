@@ -14,7 +14,6 @@ import (
 )
 
 func TestSubscriberFanOut_Lifecycle(t *testing.T) {
-	// Use a buffer size that can accommodate the events published during test.
 	b := New(10)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -25,7 +24,6 @@ func TestSubscriberFanOut_Lifecycle(t *testing.T) {
 	defer sub2.Close()
 
 	ev := store.Event{ID: "0000000000000001-0000", Ledger: 1, ContractID: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}
-	// Publish needs a small yield or running in goroutine depending on broadcast implementation, but let's make sure it's published properly.
 	go b.Publish(ctx, []store.Event{ev})
 
 	select {
@@ -57,14 +55,12 @@ func TestSubscriberFanOut_SlowSubscriberNonBlocking(t *testing.T) {
 	ev2 := store.Event{ID: "0000000000000002-0000", Ledger: 2}
 	ev3 := store.Event{ID: "0000000000000003-0000", Ledger: 3}
 
-	// Fill subSlow's buffer asynchronously so publisher never blocks on full subscribers
 	go b.Publish(ctx, []store.Event{ev1})
 	go b.Publish(ctx, []store.Event{ev2})
 	go b.Publish(ctx, []store.Event{ev3})
 
 	select {
 	case <-subFast.Events():
-		// Fast sub receives events correctly
 	case <-time.After(2 * time.Second):
 		require.Fail(t, "timed out on fast sub")
 	}
