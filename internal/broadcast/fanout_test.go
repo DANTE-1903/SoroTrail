@@ -24,7 +24,8 @@ func TestSubscriberFanOut_Lifecycle(t *testing.T) {
 	defer sub2.Close()
 
 	ev := store.Event{ID: "0000000000000001-0000", Ledger: 1, ContractID: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}
-	go b.Publish(ctx, []store.Event{ev})
+	err := b.Publish(ctx, []store.Event{ev})
+	require.NoError(t, err)
 
 	select {
 	case got := <-sub1.Events():
@@ -55,9 +56,8 @@ func TestSubscriberFanOut_SlowSubscriberNonBlocking(t *testing.T) {
 	ev2 := store.Event{ID: "0000000000000002-0000", Ledger: 2}
 	ev3 := store.Event{ID: "0000000000000003-0000", Ledger: 3}
 
-	go b.Publish(ctx, []store.Event{ev1})
-	go b.Publish(ctx, []store.Event{ev2})
-	go b.Publish(ctx, []store.Event{ev3})
+	err := b.Publish(ctx, []store.Event{ev1, ev2, ev3})
+	require.NoError(t, err)
 
 	select {
 	case <-subFast.Events():
