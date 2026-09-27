@@ -19,8 +19,9 @@ const watchedOtherContract = "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB
 
 // watchedRoute hits the watched-contracts surface with the given HTTP method
 // and path (relative to /watched-contracts), optionally adding the API key
-// header and a JSON body.
-func watchedRoute(t *testing.T, s *Server, method, path string, withKey bool, body any) (*http.Response, []byte) {
+// header and a JSON body. Like doGet it returns the drained testResponse
+// rather than a *http.Response with a dead body.
+func watchedRoute(t *testing.T, s *Server, method, path string, withKey bool, body any) (testResponse, []byte) {
 	t.Helper()
 	srv := httptest.NewServer(s.Router())
 	defer srv.Close()
@@ -49,7 +50,7 @@ func watchedRoute(t *testing.T, s *Server, method, path string, withKey bool, bo
 	buf := new(bytes.Buffer)
 	_, err = buf.ReadFrom(resp.Body)
 	require.NoError(t, err)
-	return resp, buf.Bytes()
+	return testResponse{StatusCode: resp.StatusCode, Header: resp.Header}, buf.Bytes()
 }
 
 // All three endpoints demand the X-API-Key header. A request without it is

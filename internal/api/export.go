@@ -32,6 +32,8 @@ const (
 )
 
 // parseExportFormat returns the recognized format or a 400-style error.
+// Both export endpoints call this one parser, so "which formats exist"
+// and "what an invalid value looks like" can never drift between them.
 func parseExportFormat(raw string) (exportFormat, error) {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
 	case "", "csv":
@@ -40,6 +42,117 @@ func parseExportFormat(raw string) (exportFormat, error) {
 		return formatNDJSON, nil
 	default:
 		return "", fmt.Errorf("invalid format %q (want csv or ndjson)", raw)
+	}
+}
+
+// exportCSVHeader is the column order every CSV export writes, in both
+// endpoints. It mirrors the field names of the JSON API's Event
+// representation (see store.Event) so a consumer switching from JSON to
+// CSV, or between the two export endpoints, never has to relearn a shape.
+var exportCSVHeader = []string{"id", "ledger", "type", "tx_hash", "topics", "value"}
+
+// exportCSVRow renders one event as a CSV record in exportCSVHeader order.
+// topics and value are written as JSON strings so spreadsheets and pandas
+// can parse them as a single cell without splitting on commas inside the
+// event payload.
+func exportCSVRow(ev store.Event) []string {
+	return []string{
+		ev.ID,
+		fmt.Sprintf("%d", ev.Ledger),
+		ev.Type,
+		ev.TxHash,
+		string(ev.Topics),
+		string(ev.Value),
+	}
+}
+
+// setExportHeaders commits the Content-Type, Content-Disposition and
+// cache headers shared by every export response. It must run before the
+// first byte of the body so a store failure before streaming starts can
+// still return a JSON error envelope instead of a half-written file.
+func setExportHeaders(w http.ResponseWriter, format exportFormat, filenameStem string) {
+	switch format {
+	case formatCSV:
+		w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+	default:
+		w.Header().Set("Content-Type", "application/x-ndjson")
+	}
+	w.Header().Set("Content-Disposition",
+		fmt.Sprintf(`attachment; filename="%s.%s"`, filenameStem, format))
+	// Streaming responses always flush before reaching the compression
+	// threshold, but we still set it via writeCacheHeaders — a stale
+	// browser cache keeping an old export would be a bug, so we mark
+	// the response no-cache.
+	writeCacheHeaders(w, cacheNoStore, 0, "")
+}
+
+// streamExport pages through filter via QueryEvents and writes each page
+// to w in the requested format, flushing after every page so the client
+// sees data as it's produced rather than after the whole export
+// completes. This is the one streaming path both export endpoints use,
+// so a change to pagination, error handling, or event shape can't drift
+// between them.
+//
+// Once the first byte is written the response is committed: a later
+// store error is logged and the connection is dropped rather than
+// surfaced, since there is no way left to send a JSON error envelope.
+func (s *Server) streamExport(ctx context.Context, w http.ResponseWriter, filter store.EventFilter, format exportFormat) {
+	flusher, flushable := w.(http.Flusher)
+
+	var cw *csv.Writer
+	var enc *json.Encoder
+	if format == formatCSV {
+		cw = csv.NewWriter(w)
+		if err := cw.Write(exportCSVHeader); err != nil {
+			loggerFromContext(ctx).Error("writing csv header", "error", err)
+			return
+		}
+		if flushable {
+			flusher.Flush() // header row lands before any other body
+		}
+	} else {
+		enc = json.NewEncoder(w)
+	}
+
+	for {
+		events, cursor, err := s.store.QueryEvents(ctx, filter)
+		if errors.Is(err, store.ErrInvalidCursor) {
+			loggerFromContext(ctx).Error("export cursor", "error", err)
+			return
+		}
+		if err != nil {
+			loggerFromContext(ctx).Error("export query", "error", err)
+			return
+		}
+		for _, ev := range events {
+			if cw != nil {
+				if err := cw.Write(exportCSVRow(ev)); err != nil {
+					loggerFromContext(ctx).Error("export csv write", "error", err)
+					return
+				}
+			} else {
+				if err := enc.Encode(ev); err != nil {
+					loggerFromContext(ctx).Error("export ndjson write", "error", err)
+					return
+				}
+			}
+		}
+		if cw != nil {
+			cw.Flush()
+		}
+		if flushable {
+			flusher.Flush()
+		}
+		if cursor == "" {
+			return
+		}
+		filter.Cursor = cursor
+		// Client disconnect: bail without an error envelope (already
+		// streaming, so the headers are gone and any error body would
+		// just be noise).
+		if ctx.Err() != nil {
+			return
+		}
 	}
 }
 
@@ -112,118 +225,10 @@ func (s *Server) handleContractExport(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := r.Context()
-	w.Header().Set("Content-Disposition",
-		fmt.Sprintf(`attachment; filename="%s-ledgers-%d-%d.%s"`,
-			contractID, fromLedger, toLedger, format))
-	// Streaming responses always flush before reaching the compression
-	// threshold, but we still set it via writeCacheHeaders — a stale
-	// browser cache keeping an old export would be a bug, so we mark
-	// the response no-cache.
-	writeCacheHeaders(w, cacheNoStore, 0, "")
-
-	switch format {
-	case formatCSV:
-		w.Header().Set("Content-Type", "text/csv; charset=utf-8")
-		s.streamExportCSV(ctx, w, contractID, fromLedger, toLedger)
-	default:
-		w.Header().Set("Content-Type", "application/x-ndjson")
-		s.streamExportNDJSON(ctx, w, contractID, fromLedger, toLedger)
-	}
-}
-
-// streamExportCSV writes one CSV record per event with columns
-// id, ledger, type, tx_hash, topics (JSON string), value (JSON string).
-// topics and value are written as JSON strings so spreadsheets and pandas
-// can parse them as a single cell without splitting on commas inside the
-// event payload.
-func (s *Server) streamExportCSV(ctx context.Context, w http.ResponseWriter, contractID string, fromLedger, toLedger int64) {
-	cw := csv.NewWriter(w)
-	if err := cw.Write([]string{"id", "ledger", "type", "tx_hash", "topics", "value"}); err != nil {
-		loggerFromContext(ctx).Error("writing csv header", "error", err)
-		// Headers were already sent; nothing else we can do but log and
-		// drop the connection.
-		return
-	}
-	flusher, flushable := w.(http.Flusher)
-	if flushable {
-		flusher.Flush() // header row lands before any other body
-	}
+	setExportHeaders(w, format, fmt.Sprintf("%s-ledgers-%d-%d", contractID, fromLedger, toLedger))
 
 	filter := s.exportFilter(ctx, contractID, fromLedger, toLedger)
-	for {
-		events, cursor, err := s.store.QueryEvents(ctx, filter)
-		if errors.Is(err, store.ErrInvalidCursor) {
-			loggerFromContext(ctx).Error("export cursor", "error", err)
-			return
-		}
-		if err != nil {
-			loggerFromContext(ctx).Error("export query", "error", err)
-			return
-		}
-		for _, ev := range events {
-			if err := cw.Write([]string{
-				ev.ID,
-				fmt.Sprintf("%d", ev.Ledger),
-				ev.Type,
-				ev.TxHash,
-				string(ev.Topics),
-				string(ev.Value),
-			}); err != nil {
-				loggerFromContext(ctx).Error("export csv write", "error", err)
-				return
-			}
-		}
-		cw.Flush()
-		if flushable {
-			flusher.Flush()
-		}
-		if cursor == "" {
-			return
-		}
-		filter.Cursor = cursor
-		// Client disconnect: bail without an error envelope (already
-		// streaming, so the headers are gone and any error body would
-		// just be noise).
-		if ctx.Err() != nil {
-			return
-		}
-	}
-}
-
-// streamExportNDJSON writes one JSON object per line, exactly the shape
-// served by GET /events/{id} (no wrap, no cursor key — each line IS an
-// event). jq-friendly and pandas-friendly (lines=True).
-func (s *Server) streamExportNDJSON(ctx context.Context, w http.ResponseWriter, contractID string, fromLedger, toLedger int64) {
-	enc := json.NewEncoder(w)
-	flusher, flushable := w.(http.Flusher)
-	filter := s.exportFilter(ctx, contractID, fromLedger, toLedger)
-	for {
-		events, cursor, err := s.store.QueryEvents(ctx, filter)
-		if errors.Is(err, store.ErrInvalidCursor) {
-			loggerFromContext(ctx).Error("export cursor", "error", err)
-			return
-		}
-		if err != nil {
-			loggerFromContext(ctx).Error("export query", "error", err)
-			return
-		}
-		for _, ev := range events {
-			if err := enc.Encode(ev); err != nil {
-				loggerFromContext(ctx).Error("export ndjson write", "error", err)
-				return
-			}
-		}
-		if flushable {
-			flusher.Flush()
-		}
-		if cursor == "" {
-			return
-		}
-		filter.Cursor = cursor
-		if ctx.Err() != nil {
-			return
-		}
-	}
+	s.streamExport(ctx, w, filter, format)
 }
 
 // exportFilter is the filter every export page request uses; the
@@ -247,10 +252,19 @@ func (s *Server) exportFilter(ctx context.Context, contractID string, fromLedger
 	}
 }
 
-// handleEventsCSV streams all matching events as CSV, using the same
-// filter params as GET /events. It sets Content-Type to text/csv and
-// Content-Disposition so browsers offer a file download.
+// handleEventsCSV streams all matching events, using the same filter
+// params as GET /events, in the format requested by ?format= (csv|ndjson,
+// default csv — see parseExportFormat). Despite the historical ".csv"
+// route name, this endpoint accepts the same format values as
+// /contracts/{id}/export so a client doesn't have to rediscover per-route
+// behavior when it switches which events it's exporting.
 func (s *Server) handleEventsCSV(w http.ResponseWriter, r *http.Request) {
+	format, err := parseExportFormat(r.URL.Query().Get("format"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+
 	filter, err := filterFromQuery(r)
 	if err != nil {
 		writeFilterError(w, err)
@@ -259,62 +273,6 @@ func (s *Server) handleEventsCSV(w http.ResponseWriter, r *http.Request) {
 	filter.Cursor = ""
 	filter.Limit = exportQueryBatchSize
 
-	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
-	w.Header().Set("Content-Disposition", `attachment; filename="events.csv"`)
-	writeCacheHeaders(w, cacheNoStore, 0, "")
-
-	s.streamEventsCSV(r.Context(), w, filter)
-}
-
-// streamEventsCSV writes one CSV record per event with columns
-// id, ledger, type, tx_hash, topics (JSON string), value (JSON string).
-// topics and value are written as JSON strings so spreadsheets and
-// pandas can parse them as a single cell without splitting on commas
-// inside the event payload.
-func (s *Server) streamEventsCSV(ctx context.Context, w http.ResponseWriter, filter store.EventFilter) {
-	cw := csv.NewWriter(w)
-	if err := cw.Write([]string{"id", "ledger", "type", "tx_hash", "topics", "value"}); err != nil {
-		loggerFromContext(ctx).Error("writing csv header", "error", err)
-		return
-	}
-	flusher, flushable := w.(http.Flusher)
-	if flushable {
-		flusher.Flush()
-	}
-
-	for {
-		events, cursor, err := s.store.QueryEvents(ctx, filter)
-		if errors.Is(err, store.ErrInvalidCursor) {
-			loggerFromContext(ctx).Error("export cursor", "error", err)
-			return
-		}
-		if err != nil {
-			loggerFromContext(ctx).Error("export query", "error", err)
-			return
-		}
-		for _, ev := range events {
-			if err := cw.Write([]string{
-				ev.ID,
-				fmt.Sprintf("%d", ev.Ledger),
-				ev.Type,
-				ev.TxHash,
-				string(ev.Topics),
-				string(ev.Value),
-			}); err != nil {
-				loggerFromContext(ctx).Error("csv write", "error", err)
-				return
-			}
-		}
-		cw.Flush()
-		if flushable {
-			flusher.Flush()
-		}
-		if cursor == "" {
-			return
-		}
-		filter.Cursor = cursor
-		if ctx.Err() != nil {
-			return
-		}
-	}
+	setExportHeaders(w, format, "events")
+	s.streamExport(r.Context(), w, filter, format)
 }

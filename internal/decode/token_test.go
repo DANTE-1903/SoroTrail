@@ -3,6 +3,7 @@ package decode
 import (
 	"encoding/json"
 	"math/big"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -140,6 +141,89 @@ func TestParseTokenEvent_LargeI128(t *testing.T) {
 	expected := new(big.Int)
 	expected.SetString("170141183460469231731687303715884105727", 10)
 	assert.Equal(t, expected, te.Amount)
+}
+
+func TestScvSymbol(t *testing.T) {
+	// SCSymbol is string<32> in the Stellar XDR definition, so 32 is the
+	// longest symbol the network can produce.
+	maxSymbol := strings.Repeat("a", 32)
+
+	tests := []struct {
+		name   string
+		input  json.RawMessage
+		want   string
+		wantOK bool
+	}{
+		{
+			name:   "well-formed symbol yields its string",
+			input:  json.RawMessage(`{"symbol":"transfer"}`),
+			want:   "transfer",
+			wantOK: true,
+		},
+		{
+			name:   "non-symbol address is rejected rather than returning empty",
+			input:  json.RawMessage(`{"address":"CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"}`),
+			want:   "",
+			wantOK: false,
+		},
+		{
+			name:   "non-symbol integer is rejected rather than returning empty",
+			input:  json.RawMessage(`{"u64":42}`),
+			want:   "",
+			wantOK: false,
+		},
+		{
+			name:   "non-string symbol value is rejected",
+			input:  json.RawMessage(`{"symbol":42}`),
+			want:   "",
+			wantOK: false,
+		},
+		{
+			name:   "missing symbol key is rejected",
+			input:  json.RawMessage(`{}`),
+			want:   "",
+			wantOK: false,
+		},
+		{
+			name:  "empty symbol reports ok with an empty string",
+			input: json.RawMessage(`{"symbol":""}`),
+			// An empty string is still a well-formed symbol shape, so the
+			// extractor reports success; the token allowlist downstream is
+			// what rejects it as an unknown event name.
+			want:   "",
+			wantOK: true,
+		},
+		{
+			name:   "symbol at maximum permitted length is returned intact",
+			input:  json.RawMessage(`{"symbol":"` + maxSymbol + `"}`),
+			want:   maxSymbol,
+			wantOK: true,
+		},
+		{
+			name:   "nil value does not panic and is rejected",
+			input:  nil,
+			want:   "",
+			wantOK: false,
+		},
+		{
+			name:   "invalid JSON is rejected",
+			input:  json.RawMessage(`not json`),
+			want:   "",
+			wantOK: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var got string
+			var ok bool
+			assert.NotPanics(t, func() {
+				got, ok = scvSymbol(tt.input)
+			})
+			assert.Equal(t, tt.wantOK, ok, "ok flag")
+			assert.Equal(t, tt.want, got, "extracted symbol")
+		})
+	}
 }
 
 func TestParseTokenEvent_ZeroAmount(t *testing.T) {

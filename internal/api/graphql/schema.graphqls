@@ -81,8 +81,12 @@ input TopicPositionFilterInput {
 # EventFilterInput mirrors the filter query parameters the REST API
 # accepts. A nil / zero value on any field means "no constraint".
 input EventFilterInput {
-  "Filter by Stellar contract strkey (e.g. C...)."
+  "Filter by Stellar contract strkey (e.g. C...). Mutually exclusive with contractIds and contractIdPrefix."
   contractId: String
+  "Filter by a list of Stellar contract strkeys; an event matching any of these qualifies. Mutually exclusive with contractId and contractIdPrefix."
+  contractIds: [String!]
+  "Filter by a contract strkey prefix (LIKE match). Mutually exclusive with contractId and contractIds."
+  contractIdPrefix: String
   "Filter by event type: contract | system | diagnostic."
   types: [String!]
   "Match an event whose topics array contains this value at any position."
@@ -93,6 +97,14 @@ input EventFilterInput {
   topicContains: JSON
   "Filter by hex-encoded transaction hash."
   txHash: String
+  "Exact match on the transaction index within a ledger. Must be non-negative."
+  txIndex: Int
+  "Exact match on the operation index within a transaction. Must be non-negative."
+  opIndex: Int
+  "Filter by whether the event came from a successful (true) or failed (false) call. Omit for no constraint."
+  inSuccessfulCall: Boolean
+  "Filter by whether the event carries a value payload: true = has one, false = none. Omit for no constraint."
+  hasValue: Boolean
   "Inclusive lower ledger bound."
   fromLedger: Int
   "Inclusive upper ledger bound."

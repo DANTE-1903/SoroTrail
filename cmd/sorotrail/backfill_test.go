@@ -31,6 +31,11 @@ func TestRunBackfill_Flags(t *testing.T) {
 	}
 }
 
+func TestRunBackfill_SubcommandsAndUsage(t *testing.T) {
+	err := runBackfill([]string{"--help"})
+	assert.NoError(t, err)
+}
+
 func TestJitter(t *testing.T) {
 	tests := []struct {
 		name string

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/sorotrail/sorotrail/internal/archive"
+	"github.com/sorotrail/sorotrail/internal/requestid"
 	"github.com/sorotrail/sorotrail/internal/store"
 )
 
@@ -119,9 +120,12 @@ func NewWithArchiver(st store.Store, log *slog.Logger, opts Options, arch *archi
 	opts.applyDefaults()
 	return &Pruner{
 		store: st,
-		log:   log.With("component", "pruner"),
-		opts:  opts,
-		arch:  arch,
+		// The same correlation field HTTP requests use carries the pruner's
+		// stable job id, so one field always identifies the originating
+		// work.
+		log:  log.With("component", "pruner", requestid.Field, requestid.JobPruner),
+		opts: opts,
+		arch: arch,
 	}
 }
 
@@ -135,6 +139,9 @@ func (p *Pruner) Enabled() bool {
 // batches. If neither retention policy is configured Run returns
 // immediately.
 func (p *Pruner) Run(ctx context.Context) error {
+	// Carry the job id on the context so the store decorator tags this
+	// loop's slow-query logs with "pruner".
+	ctx = requestid.WithJob(ctx, requestid.JobPruner)
 	if !p.Enabled() {
 		p.log.Debug("pruner disabled; nothing to do")
 		return nil
