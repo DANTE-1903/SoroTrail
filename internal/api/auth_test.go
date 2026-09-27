@@ -197,12 +197,21 @@ func TestAuth_EnabledGatesWebSocket(t *testing.T) {
 	srv := httptest.NewServer(s.Router())
 	defer srv.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "/events/ws"
 
+	// Each dial gets its own deadline instead of sharing one context
+	// with the setup: bcrypt hashing in addKey takes over a second
+	// under -race, and a shared 2s budget made the second dial fail
+	// with "context deadline exceeded" instead of exercising the gate.
+	dial := func(opts *websocket.DialOptions) (*http.Response, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, resp, err := websocket.Dial(ctx, wsURL, opts)
+		return resp, err
+	}
+
 	// Without a key the upgrade is rejected with 401.
-	_, resp, err := websocket.Dial(ctx, wsURL, nil)
+	resp, err := dial(nil)
 	drainWSResp(resp)
 	require.Error(t, err)
 	require.NotNil(t, resp)
@@ -212,7 +221,7 @@ func TestAuth_EnabledGatesWebSocket(t *testing.T) {
 	// a 401, proving the key was accepted).
 	key := st.addKey(t, "streamer")
 	hdr := http.Header{"Authorization": {"Bearer " + key}}
-	_, resp, err = websocket.Dial(ctx, wsURL, &websocket.DialOptions{HTTPHeader: hdr})
+	resp, err = dial(&websocket.DialOptions{HTTPHeader: hdr})
 	drainWSResp(resp)
 	require.Error(t, err)
 	require.NotNil(t, resp)

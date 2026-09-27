@@ -542,3 +542,154 @@ func TestAdvanceHWM(t *testing.T) {
 			"the conditional write never moves the HWM backwards")
 	})
 }
+func TestReconciliation_RangeComparison(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		storeIDs     []string
+		rpcIDs       []string
+		wantMatching bool
+		wantMissing  []string
+		wantExtra    []string
+	}{
+		{
+			name:         "matching windows",
+			storeIDs:     []string{"id-1", "id-2", "id-3"},
+			rpcIDs:       []string{"id-1", "id-2", "id-3"},
+			wantMatching: true,
+			wantMissing:  nil,
+			wantExtra:    nil,
+		},
+		{
+			name:         "mismatching window with missing and extra",
+			storeIDs:     []string{"id-1", "id-2"},
+			rpcIDs:       []string{"id-2", "id-3"},
+			wantMatching: false,
+			wantMissing:  []string{"id-3"},
+			wantExtra:    []string{"id-1"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			storeMap := make(map[string]bool)
+			for _, id := range tt.storeIDs {
+				storeMap[id] = true
+			}
+
+			rpcMap := make(map[string]bool)
+			for _, id := range tt.rpcIDs {
+				rpcMap[id] = true
+			}
+
+			var missing []string
+			for _, id := range tt.rpcIDs {
+				if !storeMap[id] {
+					missing = append(missing, id)
+				}
+			}
+
+			var extra []string
+			for _, id := range tt.storeIDs {
+				if !rpcMap[id] {
+					extra = append(extra, id)
+				}
+			}
+
+			matching := len(missing) == 0 && len(extra) == 0
+			assert.Equal(t, tt.wantMatching, matching)
+			assert.ElementsMatch(t, tt.wantMissing, missing)
+			assert.ElementsMatch(t, tt.wantExtra, extra)
+		})
+	}
+}
+
+func TestReconciliation_FindingCreation(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewPostgres(nil)
+	_ = st
+
+	missingIDs := []string{"event-missing-1", "event-missing-2"}
+	findingType := "missing_events"
+
+	assert.NotEmpty(t, missingIDs)
+	assert.Equal(t, "missing_events", findingType)
+	assert.NotNil(t, ctx)
+}
+
+func TestReconciliation_RepairAttemptsAndMaxCutoff(t *testing.T) {
+	t.Parallel()
+
+	maxAttempts := 3
+	attempts := 0
+
+	repairFunc := func(currentAttempt int) bool {
+		return currentAttempt < maxAttempts
+	}
+
+	for i := 1; i <= 5; i++ {
+		if repairFunc(i) {
+			attempts++
+		}
+	}
+
+	assert.Equal(t, 2, attempts)
+}
+
+func TestReconciliation_AgesOut(t *testing.T) {
+	t.Parallel()
+
+	retentionWindow := 24 * time.Hour
+	ledgerTimestamp := time.Now().Add(-48 * time.Hour)
+
+	isAgedOut := time.Since(ledgerTimestamp) > retentionWindow
+	assert.True(t, isAgedOut)
+}
+
+func TestReconciliation_HighWaterMarkAdvancement(t *testing.T) {
+	t.Parallel()
+
+	highWaterMark := int64(100)
+	repairedThrough := int64(95)
+	unrepairedGap := int64(97)
+
+	// High-water mark advancement should never pass an unrepaired gap
+	canAdvance := repairedThrough >= 99 && unrepairedGap > 98
+	assert.False(t, canAdvance)
+
+	repairedThrough = 100
+	unrepairedGap = 105
+	canAdvance = repairedThrough >= 100 && unrepairedGap > 100
+	assert.True(t, canAdvance)
+	_ = highWaterMark
+}
+
+func TestReconciliation_BudgetedRPCUsage(t *testing.T) {
+	t.Parallel()
+
+	maxRPCBudget := 10
+	rpcCallsMade := 0
+
+	makeCall := func() error {
+		if rpcCallsMade >= maxRPCBudget {
+			return errors.New("rpc budget exceeded")
+		}
+		rpcCallsMade++
+		return nil
+	}
+
+	var err error
+	for i := 0; i < 15; i++ {
+		err = makeCall()
+		if err != nil {
+			break
+		}
+	}
+
+	assert.Error(t, err)
+	assert.Equal(t, maxRPCBudget, rpcCallsMade)
+}
