@@ -78,7 +78,8 @@ func TestSubscriberFanOut_ScopeFiltering(t *testing.T) {
 	evMatch := store.Event{ID: "0000000000000001-0000", ContractID: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}
 	evMiss := store.Event{ID: "0000000000000002-0000", ContractID: "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"}
 
-	b.Publish(ctx, []store.Event{evMiss, evMatch})
+	err := b.Publish(ctx, []store.Event{evMiss, evMatch})
+	require.NoError(t, err)
 
 	select {
 	case got := <-sub.Events():
@@ -108,7 +109,8 @@ func TestSubscriberFanOut_TopicFiltering(t *testing.T) {
 		Topics:     json.RawMessage(`[{"symbol":"mint"}]`),
 	}
 
-	b.Publish(ctx, []store.Event{evMiss, evMatch})
+	err := b.Publish(ctx, []store.Event{evMiss, evMatch})
+	require.NoError(t, err)
 
 	select {
 	case got := <-sub.Events():
@@ -138,7 +140,8 @@ func TestSubscriberFanOut_ConcurrentRace(t *testing.T) {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			b.Publish(ctx, []store.Event{{ID: "0000000000000001-0000", ContractID: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", Ledger: 1}})
+			err := b.Publish(ctx, []store.Event{{ID: "0000000000000001-0000", ContractID: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", Ledger: 1}})
+			require.NoError(t, err)
 		}(i)
 	}
 
