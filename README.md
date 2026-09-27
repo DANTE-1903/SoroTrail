@@ -77,6 +77,60 @@ DATABASE_URL=sqlite:./sorotrail.db make run
 
 Migrations run automatically on startup.
 
+Configuration
+All configuration comes from environment variables (see 
+.env.example
+):
+
+Variable	Default	Description
+RPC_URL	https://soroban-testnet.stellar.org	Stellar RPC endpoint (JSON-RPC 2.0). Point at a provider URL for mainnet.
+RPC_RATE_LIMIT	10	Single-provider request rate limit (requests/second). Default matches the public endpoint limit — raising it against the public RPC will get you throttled; set higher only for paid plans or self-hosted RPCs. On 429 the client honors Retry-After (seconds or HTTP-date, capped at 60s).
+DATABASE_URL	— (required)	Postgres connection string.
+POLL_INTERVAL	5s	Sleep between polls once caught up.
+HTTP_ADDR	:8080	API listen address.
+WATCHED_CONTRACTS	empty	Comma-separated contract IDs (C...). Empty = ingest all contract events.
+START_LEDGER	unset	Force cold-start ingestion from this ledger.
+RETENTION_LEDGERS	17280	Cold-start reach-back in ledgers (~24h at 5s/ledger). See [Ingestion behavior](#ingestion-behavior).
+LOG_LEVEL	info	debug | info | warn | error.
+AUDIT_ENABLED	false	Enable the background auditor. When unset/false the binary behaves exactly like the pre-audit build.
+AUDIT_POLL_INTERVAL	30s	Sleep between audit passes.
+AUDIT_BATCH_LEDGERS	100	Ledger range covered by one audit pass.
+AUDIT_LAG_THRESHOLD	200	Auditor sleeps until ingest is at least this many ledgers past the verified mark.
+AUDIT_BUDGET_SHARE	0.10	Fraction of the request budget the audit pool gets (rest goes to ingest).
+AUDIT_MAX_RPS	10	Total request budget (split between ingest and audit).
+AUDIT_MAX_REPAIR_ATTEMPTS	3	Repair iterations before a finding is kept open as unrecoverable.
+AUDIT_FINDING_MAX_LEDGERS	100	Largest range a single finding is allowed to span.
+RATE_LIMIT_RPS	unset	Per-client HTTP request rate limit (requests/second). Both RATE_LIMIT_RPS and RATE_LIMIT_BURST must be set together; otherwise no rate limiting is applied.
+RATE_LIMIT_BURST	unset	Maximum instantaneous burst size for the rate limiter. Pairs with RATE_LIMIT_RPS.
+RATE_LIMIT_TRUSTED_PROXY	false	Honor X-Forwarded-For for client IP detection. Must only be enabled behind a proxy you trust to strip/rewrite the header — clients control X-Forwarded-For themselves, so enabling it on an Internet-facing surface lets any caller pick their own rate-limit key.
+CACHE_PRIVATE	false	Flip cacheable responses from Cache-Control: public to private. Set this when the deployment serves per-user data behind an auth layer (see Caching).
+Ingestion behavior
+Cold start (empty database): begins at latest ledger − RETENTION_LEDGERS
+(clamped to what the RPC still retains) so it captures as much recent history
+as possible, then follows the chain head. START_LEDGER overrides this.
+Warm start: resumes from the persisted cursor / last ingested ledger.
+Events are upserted idempotently by ID, so re-scans and restarts never
+duplicate rows.
+If the indexer is down long enough that its resume point falls out of the
+RPC's retention window, it logs a warning and skips ahead to the oldest
+retained ledger (the gap is unrecoverable from RPC — that's the problem this
+project exists to prevent).
+Requests are rate-limited (10/s by default, matching public endpoint limits —
+raise it via `RPC_RATE_LIMIT` only for paid plans or self-hosted RPCs) and
+errors are retried with jittered exponential backoff; when the provider
+responds 429 with a `Retry-After` header, that hint (seconds or HTTP-date,
+capped at 60s) is honored before falling back to computed backoff.
+Topics/values are stored as JSON. When the RPC supports xdrFormat: "json"
+its decoding is used verbatim; otherwise the base64 XDR is decoded locally
+into shapes like {"symbol":"transfer"}, {"u64":42}, {"i128":"-1000"},
+{"address":"C..."}.
+The raw base64 XDR is stored alongside the decoded JSON, so an improved
+decoder can be applied to already-indexed events — see
+decoder replay. This intentionally duplicates payload
+data in events.topics_xdr and events.value_xdr; budget extra event-table
+storage for deployments that retain large event histories.
+Decoder replay
+Decoders improve over time. sorotrail replay re-runs the current decoder
 ## Supported versions
 
 SoroTrail is tested in CI against the following Postgres major versions:
@@ -106,7 +160,7 @@ SoroTrail is tested in CI against the following Postgres major versions:
 | `WATCHED_CONTRACTS` | empty | Comma-separated contract IDs (`C...`). Empty = ingest **all** contract events. Each watched contract tracks its own resume cursor; adding a contract automatically triggers a backfill from `latest − RETENTION_LEDGERS` (clamped to RPC retention), independent of other contracts. |
 | `SKIP_CONTRACTS` | empty | Comma-separated contract IDs (`C...`) to never index events from. |
 | `START_LEDGER` | unset | Force cold-start ingestion from this ledger. |
-| `RETENTION_LEDGERS` | `17280` | Cold-start reach-back in ledgers (~24h at 5s/ledger). |
+| `RETENTION_LEDGERS` | `17280` | Cold-start reach-back in ledgers (~24h at 5s/ledger). See [Ingestion behavior](#ingestion-behavior). |
 | `RETENTION_AGE` | `0` (disabled) | Delete events older than this duration. `0` disables age-based pruning. |
 | `RETENTION_POLL_INTERVAL` | `1h` | How often the age-based pruner re-examines events older than `RETENTION_AGE`. |
 | `PARTITION_LEDGER_SPAN` | `120960` | Ledger range per events-table partition (~7 days at 5s/ledger). Partitions are created automatically on migration and at ingest time. |
@@ -197,7 +251,7 @@ the struct tags in `internal/config/config.go` to prevent drift.
 | `SKIP_CONTRACTS` | CSV | empty | Comma-separated contract IDs (`C...`) to never index events from. |
 | `START_LEDGER` | string | unset | Force cold-start ingestion from this ledger. Accepts an absolute number (≥ 2) or a relative offset like `latest-1000`. |
 | `START_LEDGER_RAW` | string | unset | Raw form of `START_LEDGER` before parsing. Used internally; operators should set `START_LEDGER` instead. |
-| `RETENTION_LEDGERS` | uint32 | `17280` | Cold-start reach-back in ledgers (~24h at 5s/ledger). Clamped to the RPC's oldest retained ledger. |
+| `RETENTION_LEDGERS` | uint32 | `17280` | Cold-start reach-back in ledgers (~24h at 5s/ledger). See [Ingestion behavior](#ingestion-behavior). Clamped to the RPC's oldest retained ledger. |
 | `INGEST_PAGE_SIZE` | uint | `1000` | Maximum number of events per `getEvents` RPC page. |
 | `INGEST_BATCH_SIZE` | uint | `1000` | Number of events per upsert batch during ingestion. |
 | `INGESTER_MIN_BACKOFF` | duration | `1s` | Initial error backoff for the ingester's retry loop. |
@@ -520,6 +574,62 @@ are lagging.
 ## Decoder replay
 
 Decoders improve over time. `sorotrail replay` re-runs the current decoder
+Migrations run automatically on startup.
+
+Configuration
+All configuration comes from environment variables (see 
+.env.example
+):
+
+Variable	Default	Description
+RPC_URL	https://soroban-testnet.stellar.org	Stellar RPC endpoint (JSON-RPC 2.0). Point at a provider URL for mainnet.
+RPC_RATE_LIMIT	10	Single-provider request rate limit (requests/second). Default matches the public endpoint limit — raising it against the public RPC will get you throttled; set higher only for paid plans or self-hosted RPCs. On 429 the client honors Retry-After (seconds or HTTP-date, capped at 60s).
+DATABASE_URL	— (required)	Postgres connection string.
+POLL_INTERVAL	5s	Sleep between polls once caught up.
+HTTP_ADDR	:8080	API listen address.
+WATCHED_CONTRACTS	empty	Comma-separated contract IDs (C...). Empty = ingest all contract events.
+START_LEDGER	unset	Force cold-start ingestion from this ledger.
+RETENTION_LEDGERS	17280	Cold-start reach-back in ledgers (~24h at 5s/ledger). See [Ingestion behavior](#ingestion-behavior).
+LOG_LEVEL	info	debug | info | warn | error.
+AUDIT_ENABLED	false	Enable the background auditor. When unset/false the binary behaves exactly like the pre-audit build.
+AUDIT_POLL_INTERVAL	30s	Sleep between audit passes.
+AUDIT_BATCH_LEDGERS	100	Ledger range covered by one audit pass.
+AUDIT_LAG_THRESHOLD	200	Auditor sleeps until ingest is at least this many ledgers past the verified mark.
+AUDIT_BUDGET_SHARE	0.10	Fraction of the request budget the audit pool gets (rest goes to ingest).
+AUDIT_MAX_RPS	10	Total request budget (split between ingest and audit).
+AUDIT_MAX_REPAIR_ATTEMPTS	3	Repair iterations before a finding is kept open as unrecoverable.
+AUDIT_FINDING_MAX_LEDGERS	100	Largest range a single finding is allowed to span.
+RATE_LIMIT_RPS	unset	Per-client HTTP request rate limit (requests/second). Both RATE_LIMIT_RPS and RATE_LIMIT_BURST must be set together; otherwise no rate limiting is applied.
+RATE_LIMIT_BURST	unset	Maximum instantaneous burst size for the rate limiter. Pairs with RATE_LIMIT_RPS.
+RATE_LIMIT_TRUSTED_PROXY	false	Honor X-Forwarded-For for client IP detection. Must only be enabled behind a proxy you trust to strip/rewrite the header — clients control X-Forwarded-For themselves, so enabling it on an Internet-facing surface lets any caller pick their own rate-limit key.
+CACHE_PRIVATE	false	Flip cacheable responses from Cache-Control: public to private. Set this when the deployment serves per-user data behind an auth layer (see Caching).
+Ingestion behavior
+Cold start (empty database): begins at latest ledger − RETENTION_LEDGERS
+(clamped to what the RPC still retains) so it captures as much recent history
+as possible, then follows the chain head. START_LEDGER overrides this.
+Warm start: resumes from the persisted cursor / last ingested ledger.
+Events are upserted idempotently by ID, so re-scans and restarts never
+duplicate rows.
+If the indexer is down long enough that its resume point falls out of the
+RPC's retention window, it logs a warning and skips ahead to the oldest
+retained ledger (the gap is unrecoverable from RPC — that's the problem this
+project exists to prevent).
+Requests are rate-limited (10/s by default, matching public endpoint limits —
+raise it via `RPC_RATE_LIMIT` only for paid plans or self-hosted RPCs) and
+errors are retried with jittered exponential backoff; when the provider
+responds 429 with a `Retry-After` header, that hint (seconds or HTTP-date,
+capped at 60s) is honored before falling back to computed backoff.
+Topics/values are stored as JSON. When the RPC supports xdrFormat: "json"
+its decoding is used verbatim; otherwise the base64 XDR is decoded locally
+into shapes like {"symbol":"transfer"}, {"u64":42}, {"i128":"-1000"},
+{"address":"C..."}.
+The raw base64 XDR is stored alongside the decoded JSON, so an improved
+decoder can be applied to already-indexed events — see
+decoder replay. This intentionally duplicates payload
+data in events.topics_xdr and events.value_xdr; budget extra event-table
+storage for deployments that retain large event histories.
+Decoder replay
+Decoders improve over time. sorotrail replay re-runs the current decoder
 over stored raw XDR and rewrites the decoded columns, so improvements apply
 to everything already indexed instead of only to future events.
 The raw base64 XDR is stored alongside the decoded JSON specifically so an
