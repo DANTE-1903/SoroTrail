@@ -98,10 +98,20 @@ func TestRenderGolden_RepresentativeOverrides(t *testing.T) {
 	assertGolden(t, golden, got)
 }
 
+func normalizeManifest(s string) string {
+	// Helm v4 emits an extra newline before document separators ("\n\n---\n")
+	// whereas Helm v3 emits "\n---\n". Normalize them so golden tests pass
+	// regardless of whether Helm v3 or Helm v4 is installed.
+	for strings.Contains(s, "\n\n---\n") {
+		s = strings.ReplaceAll(s, "\n\n---\n", "\n---\n")
+	}
+	return strings.TrimSpace(s) + "\n"
+}
+
 func assertGolden(t *testing.T, golden, got string) {
 	t.Helper()
 	if *update {
-		require.NoError(t, os.WriteFile(golden, []byte(got), 0o644))
+		require.NoError(t, os.WriteFile(golden, []byte(normalizeManifest(got)), 0o644))
 		t.Logf("updated golden file %s", golden)
 		return
 	}
@@ -109,7 +119,7 @@ func assertGolden(t *testing.T, golden, got string) {
 	if err != nil {
 		t.Fatalf("reading golden file %s: %v (run with -update to create it)", golden, err)
 	}
-	assert.Equal(t, string(want), got,
+	assert.Equal(t, normalizeManifest(string(want)), normalizeManifest(got),
 		"rendered manifests drifted from %s; if the change is intentional, regenerate with:\n\tgo test ./deploy/helm/sorotrail -run TestRenderGolden -update", golden)
 }
 

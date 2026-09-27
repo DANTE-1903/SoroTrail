@@ -29,6 +29,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/sorotrail/sorotrail/internal/store"
@@ -153,7 +154,7 @@ func TestEventsGolden(t *testing.T) {
 			require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
 			require.Equal(t, "application/json", rec.Header().Get("Content-Type"))
 
-			compareGolden(t, tt.name, rec.Body.Bytes())
+			compareGolden(t, "events_"+tt.name, rec.Body.Bytes())
 		})
 	}
 }
@@ -206,8 +207,10 @@ func TestContractsEventsGolden(t *testing.T) {
 	compareGolden(t, "contracts_events", rec.Body.Bytes())
 }
 
-// TestEventsGoldenFilesAreValidJSON validates every golden file in
-// the testdata/golden directory is valid JSON.
+// TestEventsGoldenCoverage verifies that every route enumerated by
+// pkg/docs/drift_test.go has a corresponding golden file for the
+// 200 response shape. This ensures no endpoint is silently omitted
+// from golden-file coverage.
 func TestEventsGoldenFilesAreValidJSON(t *testing.T) {
 	entries, err := os.ReadDir(filepath.Join("testdata", "golden"))
 	require.NoError(t, err)
@@ -215,32 +218,31 @@ func TestEventsGoldenFilesAreValidJSON(t *testing.T) {
 		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
 			continue
 		}
-		body, err := os.ReadFile(filepath.Join("testdata", "golden", entry.Name()))
-		require.NoError(t, err, entry.Name())
-		require.True(t, json.Valid(body), "golden file %s must contain valid JSON", entry.Name())
+		t.Run(entry.Name(), func(t *testing.T) {
+			data, err := os.ReadFile(filepath.Join("testdata", "golden", entry.Name()))
+			require.NoError(t, err)
+			var v interface{}
+			assert.NoError(t, json.Unmarshal(data, &v))
+		})
 	}
 }
 
-// TestEventsGoldenCoverage verifies that every route enumerated by
-// pkg/docs/drift_test.go has a corresponding golden file for the
-// 200 response shape. This ensures no endpoint is silently omitted
-// from golden-file coverage.
 func TestEventsGoldenCoverage(t *testing.T) {
 	// The golden files must exist for each documented endpoint
 	// that produces a 200 response. This test asserts that the
 	// golden file names match the expected set, so no endpoint
 	// is accidentally left without coverage.
 	goldenNames := map[string]struct{}{
-		"events_default_page":   {},
-		"events_envelope":       {},
-		"events_include_xdr":    {},
+		"events_default_page":      {},
+		"events_envelope":          {},
+		"events_include_xdr":       {},
 		"events_fields_projection": {},
-		"events_pretty":         {},
-		"events_empty_result":   {},
-		"events_decoded":        {},
-		"events_single":         {},
-		"events_count":          {},
-		"contracts_events":      {},
+		"events_pretty":            {},
+		"events_empty_result":      {},
+		"events_decoded":           {},
+		"events_single":            {},
+		"events_count":             {},
+		"contracts_events":         {},
 	}
 	entries, err := os.ReadDir(filepath.Join("testdata", "golden"))
 	require.NoError(t, err)
@@ -257,19 +259,6 @@ func TestEventsGoldenCoverage(t *testing.T) {
 	}
 }
 
-func TestEventsGoldenFilesAreValidJSON(t *testing.T) {
-	entries, err := os.ReadDir(filepath.Join("testdata", "golden"))
-	require.NoError(t, err)
-	for _, entry := range entries {
-		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
-			continue
-		}
-		body, err := os.ReadFile(filepath.Join("testdata", "golden", entry.Name()))
-		require.NoError(t, err, entry.Name())
-		require.True(t, json.Valid(body), "golden file %s must contain valid JSON", entry.Name())
-	}
-}
-
 // compareGolden diffs body against testdata/golden/events_<name>.json, or
 // rewrites the file when -update-golden is passed. On mismatch it prints
 // both sides indented so the drifted key is findable despite the compact
@@ -277,7 +266,7 @@ func TestEventsGoldenFilesAreValidJSON(t *testing.T) {
 func compareGolden(t *testing.T, name string, body []byte) {
 	t.Helper()
 
-	path := filepath.Join("testdata", "golden", "events_"+name+".json")
+	path := filepath.Join("testdata", "golden", name+".json")
 
 	if *updateGolden {
 		require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
