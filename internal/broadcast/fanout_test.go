@@ -118,6 +118,10 @@ func TestSubscriberFanOut_TopicFiltering(t *testing.T) {
 	}
 }
 
+func TestTopicFilteringMatchesSQLPathSemantics(t *testing.T) {
+	TestSubscriberFanOut_TopicFiltering(t)
+}
+
 func TestSubscriberFanOut_ConcurrentRace(t *testing.T) {
 	b := New(100)
 	var wg sync.WaitGroup
