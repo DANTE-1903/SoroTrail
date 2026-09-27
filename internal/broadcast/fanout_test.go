@@ -1,18 +1,15 @@
-//go:build integration
-
 package broadcast
 
 import (
 	"context"
-	"encoding/json"
-	"sync"
 	"testing"
 	"time"
 
+	"encoding/json"
+	"github.com/sorotrail/sorotrail/internal/store"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-
-	"github.com/sorotrail/sorotrail/internal/store"
+	"sync"
 )
 
 func TestSubscriberFanOut_Lifecycle(t *testing.T) {
@@ -20,12 +17,14 @@ func TestSubscriberFanOut_Lifecycle(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	sub1 := b.Subscribe(store.EventFilter{Scope: store.NewScope(nil)})
-	sub2 := b.Subscribe(store.EventFilter{Scope: store.NewScope(nil)})
+	sub1 := b.Subscribe(store.EventFilter{Scope: store.WildcardScope()})
+	sub2 := b.Subscribe(store.EventFilter{Scope: store.WildcardScope()})
 	defer sub1.Close()
 	defer sub2.Close()
 
 	ev := store.Event{ID: "0000000000000001-0000", Ledger: 1, ContractID: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}
+	// Give goroutines a moment to start/register subscriptions
+	time.Sleep(50 * time.Millisecond)
 	b.Publish(ctx, []store.Event{ev})
 
 	select {
@@ -48,16 +47,23 @@ func TestSubscriberFanOut_SlowSubscriberNonBlocking(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	subSlow := b.Subscribe(store.EventFilter{Scope: store.NewScope(nil)})
-	subFast := b.Subscribe(store.EventFilter{Scope: store.NewScope(nil)})
+	subSlow := b.Subscribe(store.EventFilter{Scope: store.WildcardScope()})
+	subFast := b.Subscribe(store.EventFilter{Scope: store.WildcardScope()})
 	defer subSlow.Close()
 	defer subFast.Close()
 
-	ev1 := store.Event{ID: "0000000000000001-0000", Ledger: 1}
-	ev2 := store.Event{ID: "0000000000000002-0000", Ledger: 2}
-	ev3 := store.Event{ID: "0000000000000003-0000", Ledger: 3}
+	time.Sleep(50 * time.Millisecond)
 
-	b.Publish(ctx, []store.Event{ev1, ev2, ev3})
+	ev1 := store.Event{ID: "0000000000000001-0000", Ledger: 1, ContractID: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}
+	ev2 := store.Event{ID: "0000000000000002-0000", Ledger: 2, ContractID: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}
+	ev3 := store.Event{ID: "0000000000000003-0000", Ledger: 3, ContractID: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}
+
+	// Fill the buffer of subSlow without reading so it becomes slow
+	b.Publish(ctx, []store.Event{ev1})
+	time.Sleep(10 * time.Millisecond)
+
+	// Publish more events; fast sub should still receive them successfully without blocking publisher
+	b.Publish(ctx, []store.Event{ev2, ev3})
 
 	select {
 	case <-subFast.Events():
@@ -74,6 +80,8 @@ func TestSubscriberFanOut_ScopeFiltering(t *testing.T) {
 	scope := store.NewScope([]string{"CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"})
 	sub := b.Subscribe(store.EventFilter{Scope: scope})
 	defer sub.Close()
+
+	time.Sleep(10 * time.Millisecond)
 
 	evMatch := store.Event{ID: "0000000000000001-0000", ContractID: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}
 	evMiss := store.Event{ID: "0000000000000002-0000", ContractID: "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"}
@@ -96,6 +104,8 @@ func TestSubscriberFanOut_TopicFiltering(t *testing.T) {
 	needleTopic := json.RawMessage(`{"symbol":"transfer"}`)
 	sub := b.Subscribe(store.EventFilter{Topic: needleTopic, Scope: store.WildcardScope()})
 	defer sub.Close()
+
+	time.Sleep(10 * time.Millisecond)
 
 	evMatch := store.Event{
 		ID:         "0000000000000001-0000",
