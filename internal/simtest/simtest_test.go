@@ -569,6 +569,230 @@ func TestVirtualChain_GetEvents_OutOfRange(t *testing.T) {
 	assert.Contains(t, rpcErr.Message, "ledger range")
 }
 
+// ---------- Filter Matching & Virtual Clock Machineries tests ----------
+
+func TestVirtualChain_FilterMatchingSemantics(t *testing.T) {
+	now := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	clock := NewVirtualClock(now)
+	chain := NewVirtualChain(clock, now, 100)
+	chain.AdvanceTo(30)
+
+	ev1 := BuildEvent("0000000010-000000000", 10, "CAAAA")
+	ev2 := BuildEvent("0000000020-000000000", 20, "CBBBB")
+	chain.AddEvents(10, ev1)
+	chain.AddEvents(20, ev2)
+
+	tests := []struct {
+		name          string
+		req           rpc.GetEventsRequest
+		wantCount     int
+		wantMinLedger uint32
+	}{
+		{
+			name:      "no filters returns all events in range",
+			req:       rpc.GetEventsRequest{StartLedger: 2},
+			wantCount: 2,
+		},
+		{
+			name: "contract ID filter matches specific contract",
+			req: rpc.GetEventsRequest{
+				StartLedger: 2,
+				Filters:     []rpc.EventFilter{{ContractIDs: []string{"CAAAA"}}},
+			},
+			wantCount:     1,
+			wantMinLedger: 10,
+		},
+		{
+			name: "ledger range filter restricts bounds",
+			req: rpc.GetEventsRequest{
+				StartLedger: 15,
+				EndLedger:   25,
+			},
+			wantCount:     1,
+			wantMinLedger: 20,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resp, err := chain.GetEvents(context.Background(), tt.req)
+			require.NoError(t, err)
+			assert.Len(t, resp.Events, tt.wantCount)
+			if tt.wantMinLedger > 0 && len(resp.Events) > 0 {
+				assert.Equal(t, tt.wantMinLedger, resp.Events[0].Ledger)
+			}
+		})
+	}
+}
+
+func TestVirtualClock_DeterministicAdvance(t *testing.T) {
+	now := time.Date(2025, 1, 1, 12, 0, 0, 0, time.UTC)
+	clock := NewVirtualClock(now)
+
+	assert.Equal(t, now, clock.Now())
+
+	steps := []time.Duration{
+		100 * time.Millisecond,
+		2 * time.Second,
+		1 * time.Hour,
+	}
+
+	expected := now
+	for _, d := range steps {
+		clock.Advance(d)
+		expected = expected.Add(d)
+		assert.Equal(t, expected, clock.Now())
+	}
+}
+
+// ---------- Fault Scheduling, Seeded Generation, and Oracle Validation Tests ----------
+
+func TestFaultScheduling_FiresOnNominatedCall(t *testing.T) {
+	// Verify that a fault configured for a specific call index fires exactly on that call
+	// and passes transparently on other calls.
+	now := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	clock := NewVirtualClock(now)
+	chain := NewVirtualChain(clock, now, 100)
+	chain.AdvanceTo(50)
+
+	scenario := Scenario{
+		Name:             "fault_scheduling_test",
+		RetentionLedgers: 100,
+		ChainLedgers:     50,
+		PageLimit:        100,
+		Faults: []FaultDescriptor{
+			{
+				Kind:      FaultRateLimit,
+				CallIndex: 2,
+			},
+		},
+	}
+
+	client := NewFaultClient(chain, scenario)
+	req := rpc.GetEventsRequest{StartLedger: 2}
+
+	// Call 1: should succeed without fault.
+	_, err1 := client.GetEvents(context.Background(), req)
+	assert.NoError(t, err1, "call 1 should not trigger fault")
+
+	// Call 2: should trigger the rate limit fault.
+	_, err2 := client.GetEvents(context.Background(), req)
+	require.Error(t, err2, "call 2 should trigger fault")
+
+	// Call 3: should succeed again after fault triggers.
+	_, err3 := client.GetEvents(context.Background(), req)
+	assert.NoError(t, err3, "call 3 should not trigger fault")
+}
+
+func TestSeededGeneration_ReproducesIdenticalScenarios(t *testing.T) {
+	// Verify that two scenarios generated with the exact same seed produce identical
+	// event lists, fault schedules, and parameters.
+	seed := uint64(12345)
+	s1 := RandomScenario(seed)
+	s2 := RandomScenario(seed)
+
+	assert.Equal(t, s1.Name, s2.Name)
+	assert.Equal(t, s1.RetentionLedgers, s2.RetentionLedgers)
+	assert.Equal(t, s1.ChainLedgers, s2.ChainLedgers)
+	assert.Equal(t, s1.PageLimit, s2.PageLimit)
+
+	require.Len(t, s1.Events, len(s2.Events))
+	for i := range s1.Events {
+		assert.Equal(t, s1.Events[i].Ledger, s2.Events[i].Ledger)
+		assert.Equal(t, s1.Events[i].ContractID, s2.Events[i].ContractID)
+	}
+
+	require.Len(t, s1.Faults, len(s2.Faults))
+	for i := range s1.Faults {
+		assert.Equal(t, s1.Faults[i].Kind, s2.Faults[i].Kind)
+		assert.Equal(t, s1.Faults[i].CallIndex, s2.Faults[i].CallIndex)
+	}
+}
+
+func TestOracle_DetectsDeliberateGapOrDuplicate(t *testing.T) {
+	now := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	_ = NewVirtualClock(now)
+
+	tests := []struct {
+		name        string
+		mutateStore func(st *mockStore, scenario Scenario)
+		wantError   bool
+	}{
+		{
+			name: "deliberately omit an event (gap)",
+			mutateStore: func(st *mockStore, scenario Scenario) {
+				st.mu.Lock()
+				defer st.mu.Unlock()
+				for id := range st.events {
+					delete(st.events, id)
+					break
+				}
+			},
+			wantError: true,
+		},
+		{
+			name: "deliberately duplicate an event",
+			mutateStore: func(st *mockStore, scenario Scenario) {
+				st.mu.Lock()
+				defer st.mu.Unlock()
+				for _, ev := range st.events {
+					dup := ev
+					dup.ID = "9999999999-999999999"
+					st.events[dup.ID] = dup
+					break
+				}
+			},
+			wantError: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			scenario := findScenario("cold_start_all_in_retention")
+			require.NotNil(t, scenario)
+
+			st := newMockStore()
+			h := NewHarness(*scenario, st)
+			// Pre-run to ingest normally or mutate directly
+			err := h.Run(context.Background())
+			require.NoError(t, err)
+
+			// Now inject the violation
+			tt.mutateStore(st, *scenario)
+
+			// Re-running or validating oracle against mutated store should catch it
+			h2 := NewHarness(*scenario, st)
+			err2 := h2.Run(context.Background())
+			if tt.wantError {
+				assert.Error(t, err2, "oracle should detect store deviation")
+			} else {
+				assert.NoError(t, err2)
+			}
+		})
+	}
+}
+
+func NewFaultClient(chain rpc.Client, scenario Scenario) rpc.Client {
+	return &faultClient{inner: chain, faults: scenario.Faults}
+}
+
+type faultClient struct {
+	rpc.Client
+	inner  rpc.Client
+	faults []FaultDescriptor
+	call   int
+}
+
+func (f *faultClient) GetEvents(ctx context.Context, req rpc.GetEventsRequest) (rpc.GetEventsResponse, error) {
+	f.call++
+	for _, fault := range f.faults {
+		if fault.CallIndex == f.call {
+			return rpc.GetEventsResponse{}, &rpc.Error{Code: -32000, Message: fmt.Sprintf("fault injected: %s", fault.Kind)}
+		}
+	}
+	return f.inner.GetEvents(ctx, req)
+}
+
 func (m *mockStore) CountEventsBefore(context.Context, int64, time.Time, int) (int64, error) {
 	return 0, nil
 }

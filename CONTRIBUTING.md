@@ -147,6 +147,7 @@ testable and replaceable.
 
 ## Conventions
 
+- When a pull request introduces user-visible or behavioral changes, contributors must append a concise line-item summary to the root [CHANGELOG.md](CHANGELOG.md) under the `[Unreleased]` section.
 - Plain SQL via pgx; no ORM. Schema changes are new numbered migration pairs
   in `internal/store/migrations/` — never edit an applied migration.
 - `log/slog` for logging; pass loggers explicitly, no globals.
