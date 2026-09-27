@@ -49,6 +49,12 @@ jobs:
         run: go build ./...
       - name: Vet
         run: go vet ./...
+      # Fails in seconds with an actionable message when a contributor edited
+      # api/openapi.yaml without running `make spec`. pkg/docs' drift test
+      # catches the same staleness later in the suite; this step exists so the
+      # signal arrives before the ten-minute test run, not buried in its output.
+      - name: Verify generated OpenAPI JSON is current
+        run: make spec-check
       - name: Wait for Postgres
         run: |
           for i in $(seq 1 30); do
@@ -106,8 +112,9 @@ jobs:
   # the `integration` build tag. Same Postgres service as the `test-matrix` job;
   # `-p 1` is required because internal/store and internal/replay
   # integration tests share the database and truncate the same tables.
+  # integration test workflow
   integration:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     services:
       postgres:
