@@ -2,13 +2,18 @@ package store
 
 import (
 	"context"
+	"errors"
+	"io"
 	"log/slog"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/sorotrail/sorotrail/internal/metrics"
 )
 
 type testGuardedStore struct {
@@ -142,3 +147,42 @@ func (m *errorStore) GetDeadLetter(context.Context, int64) (DeadLetter, error) {
 	return DeadLetter{}, ErrNotFound
 }
 func (m *errorStore) DeleteDeadLetter(context.Context, int64) error { return nil }
+
+// metricsOKStore and metricsFailStore give the metrics test one operation
+// that succeeds and one that fails without needing to implement all 60-odd
+// Store methods by hand.
+type metricsOKStore struct{ Store }
+
+func (metricsOKStore) Ping(context.Context) error { return nil }
+
+type metricsFailStore struct{ Store }
+
+func (metricsFailStore) Ping(context.Context) error { return errors.New("boom") }
+
+// TestGuardedStore_RecordsOperationOutcomes asserts that a wrapped operation
+// records a duration and an outcome, and that failures are counted separately
+// from successes. The operation label is the Store method name, so cardinality
+// stays bounded to the interface's method set rather than growing with data.
+func TestGuardedStore_RecordsOperationOutcomes(t *testing.T) {
+	opts := GuardedStoreOptions{
+		Timeout:            time.Second,
+		SlowQueryThreshold: time.Hour,
+		Logger:             slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+
+	successBefore := testutil.ToFloat64(metrics.DBOperationsTotal.WithLabelValues("store.Ping", "success"))
+	errorBefore := testutil.ToFloat64(metrics.DBOperationsTotal.WithLabelValues("store.Ping", "error"))
+
+	ok := NewGuardedStore(metricsOKStore{}, opts)
+	require.NoError(t, ok.Ping(context.Background()))
+
+	bad := NewGuardedStore(metricsFailStore{}, opts)
+	require.Error(t, bad.Ping(context.Background()))
+
+	assert.Equal(t, successBefore+1,
+		testutil.ToFloat64(metrics.DBOperationsTotal.WithLabelValues("store.Ping", "success")),
+		"a successful operation must increment the success outcome")
+	assert.Equal(t, errorBefore+1,
+		testutil.ToFloat64(metrics.DBOperationsTotal.WithLabelValues("store.Ping", "error")),
+		"a failing operation must increment the error outcome, separately from success")
+}

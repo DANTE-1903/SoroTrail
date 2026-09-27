@@ -18,8 +18,9 @@ import (
 )
 
 // bodyOf runs h behind the compression middleware and returns the response
-// plus the body as the client would see it after decoding.
-func bodyOf(t *testing.T, h http.Handler, acceptEncoding string, minSize int) (*http.Response, string) {
+// plus the body as the client would see it after decoding. It returns the
+// drained testResponse rather than a *http.Response with a dead body.
+func bodyOf(t *testing.T, h http.Handler, acceptEncoding string, minSize int) (testResponse, string) {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	if acceptEncoding != "" {
@@ -38,15 +39,16 @@ func bodyOf(t *testing.T, h http.Handler, acceptEncoding string, minSize int) (*
 		zr, err := gzip.NewReader(bytes.NewReader(raw))
 		require.NoError(t, err, "response claimed gzip but isn't decodable")
 		defer zr.Close()
+
 		out, err := io.ReadAll(zr)
 		require.NoError(t, err)
-		return resp, string(out)
+		return testResponse{StatusCode: resp.StatusCode, Header: resp.Header}, string(out)
 	case "deflate":
 		out, err := io.ReadAll(flate.NewReader(bytes.NewReader(raw)))
 		require.NoError(t, err)
-		return resp, string(out)
+		return testResponse{StatusCode: resp.StatusCode, Header: resp.Header}, string(out)
 	default:
-		return resp, string(raw)
+		return testResponse{StatusCode: resp.StatusCode, Header: resp.Header}, string(raw)
 	}
 }
 
@@ -314,8 +316,10 @@ func TestNegotiateEncoding(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // doGetWithAE sends a GET through s.Router() with an optional
-// Accept-Encoding header and returns the response plus body (raw, no decode).
-func doGetWithAE(t *testing.T, s *Server, path, acceptEncoding string) (*http.Response, []byte) {
+// Accept-Encoding header and returns the drained testResponse plus body
+// (raw, no decode). Like doGet it returns testResponse rather than a
+// *http.Response with a dead body.
+func doGetWithAE(t *testing.T, s *Server, path, acceptEncoding string) (testResponse, []byte) {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodGet, path, nil)
 	if acceptEncoding != "" {
@@ -327,7 +331,7 @@ func doGetWithAE(t *testing.T, s *Server, path, acceptEncoding string) (*http.Re
 	t.Cleanup(func() { _ = resp.Body.Close() })
 	body, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
-	return resp, body
+	return testResponse{StatusCode: resp.StatusCode, Header: resp.Header}, body
 }
 
 // decodeGzip decodes a gzip body and returns the uncompressed bytes.
