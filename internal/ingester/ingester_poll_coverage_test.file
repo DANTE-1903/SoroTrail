@@ -1,0 +1,134 @@
+package ingester
+
+import (
+	"context"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/sorotrail/sorotrail/internal/store"
+)
+
+func TestIngester_PollCycleBranchesCoverage(t *testing.T) {
+	contractA := "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+
+	t.Run("cold start with explicit start ledger", func(t *testing.T) {
+		client := &mockRPC{eventsResps: []rpc.GetEventsResponse{{LatestLedger: 500}}}
+		ing := newTestIngester(client, newMockStore(), Options{StartLedger: 200})
+		_, err := ing.runOnce(context.Background())
+		require.NoError(t, err)
+		assert.Equal(t, uint32(200), client.eventsRequests[0].StartLedger)
+	})
+
+	t.Run("cold start without explicit start ledger uses retention", func(t *testing.T) {
+		client := &mockRPC{
+			health:      rpc.Health{Status: "healthy", LatestLedger: 10_000, OldestLedger: 100},
+			eventsResps: []rpc.GetEventsResponse{{LatestLedger: 10_000}},
+		}
+		ing := newTestIngester(client, newMockStore(), Options{RetentionLedgers: 1_000})
+		_, err := ing.runOnce(context.Background())
+		require.NoError(t, err)
+		assert.Equal(t, uint32(9_000), client.eventsRequests[0].StartLedger)
+	})
+
+	t.Run("resume from persisted cursor", func(t *testing.T) {
+		client := &mockRPC{eventsResps: []rpc.GetEventsResponse{{LatestLedger: 1_000}}}
+		st := newMockStore()
+		require.NoError(t, st.SaveIngestionState(context.Background(),
+			store.IngestionState{LastIngestedLedger: 500, LastCursor: "my-cursor"}))
+		ing := newTestIngester(client, st, Options{})
+		_, err := ing.runOnce(context.Background())
+		require.NoError(t, err)
+		require.NotNil(t, client.eventsRequests[0].Pagination)
+		assert.Equal(t, "my-cursor", client.eventsRequests[0].Pagination.Cursor)
+	})
+
+	t.Run("resume from ledger with no cursor", func(t *testing.T) {
+		client := &mockRPC{eventsResps: []rpc.GetEventsResponse{{LatestLedger: 1_000}}}
+		st := newMockStore()
+		require.NoError(t, st.SaveIngestionState(context.Background(),
+			store.IngestionState{LastIngestedLedger: 500}))
+		ing := newTestIngester(client, st, Options{})
+		_, err := ing.runOnce(context.Background())
+		require.NoError(t, err)
+		assert.Equal(t, uint32(501), client.eventsRequests[0].StartLedger)
+	})
+
+	t.Run("retention clamp when requested ledger below rpc oldest", func(t *testing.T) {
+		client := &mockRPC{
+			health:      rpc.Health{Status: "healthy", LatestLedger: 10_000, OldestLedger: 5_000},
+			eventsResps: []rpc.GetEventsResponse{{LatestLedger: 10_000}},
+		}
+		ing := newTestIngester(client, newMockStore(), Options{StartLedger: 1_000})
+		_, err := ing.runOnce(context.Background())
+		require.NoError(t, err)
+		assert.Equal(t, uint32(5_000), client.eventsRequests[0].StartLedger)
+	})
+
+	t.Run("failover re-anchor discards cursor and rescans", func(t *testing.T) {
+		client := &mockRPC{
+			health: rpc.Health{Status: "healthy", LatestLedger: 10_000, OldestLedger: 4_000},
+			eventsErrs: []error{
+				fmt.Errorf("getEvents: %w", &rpc.Error{Code: -32600, Message: "startLedger must be within the ledger range: 40000 - 10000"}),
+			},
+		}
+		st := newMockStore()
+		require.NoError(t, st.SaveIngestionState(context.Background(),
+			store.IngestionState{LastIngestedLedger: 100, LastCursor: "stale-cursor"}))
+		ing := newTestIngester(client, st, Options{})
+		_, err := ing.runOnce(context.Background())
+		require.NoError(t, err)
+		state, _ := st.GetIngestionState(context.Background())
+		assert.Empty(t, state.LastCursor)
+		assert.Equal(t, int64(3_999), state.LastIngestedLedger)
+	})
+
+	t.Run("empty page at frontier leaves cursor untouched", func(t *testing.T) {
+		client := &mockRPC{
+			health:      rpc.Health{Status: "healthy", LatestLedger: 500, OldestLedger: 10},
+			eventsResps: []rpc.GetEventsResponse{{LatestLedger: 500, Cursor: "some-cursor"}},
+		}
+		st := newMockStore()
+		ing := newTestIngester(client, st, Options{StartLedger: 100})
+		caughtUp, err := ing.runOnce(context.Background())
+		require.NoError(t, err)
+		assert.True(t, caughtUp)
+		state, _ := st.GetIngestionState(context.Background())
+		assert.Empty(t, state.LastCursor)
+	})
+
+	t.Run("page at exactly page limit is not mistaken for caught up", func(t *testing.T) {
+		client := &mockRPC{
+			health: rpc.Health{Status: "healthy", LatestLedger: 500, OldestLedger: 10},
+			eventsResps: []rpc.GetEventsResponse{{
+				Events:       []rpc.Event{rpcEvent("e1", 100), rpcEvent("e2", 101)},
+				LatestLedger: 500,
+				Cursor:       "lim-cursor",
+			}},
+		}
+		st := newMockStore()
+		ing := newTestIngester(client, st, Options{StartLedger: 100, PageLimit: 2})
+		caughtUp, err := ing.runOnce(context.Background())
+		require.NoError(t, err)
+		assert.False(t, caughtUp, "full page limit must not be marked caught up")
+	})
+
+	t.Run("lag alarm hysteresis fires once and recovers once", func(t *testing.T) {
+		ing, _, metricsRecorder := makeIngester(t, Options{
+			LagThreshold: 5,
+		})
+		// Drive cycles: 0 lag (below threshold), then cross threshold (lag 10),
+		// stay at lag 10, then return to caught up (lag 0).
+		driveLagCycles(t, ing, []mockCycle{
+			{latest: 100, ingested: 100},
+			{latest: 100, ingested: 90},
+			{latest: 100, ingested: 90},
+			{latest: 100, ingested: 100},
+		})
+		history := metricsRecorder.history()
+		require.Len(t, history, 2)
+		assert.True(t, history[0], "should fire lag alarm on crossing threshold")
+		assert.False(t, history[1], "should recover lag alarm on returning to caught up")
+	})
+}

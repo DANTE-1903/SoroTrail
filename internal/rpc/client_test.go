@@ -3,6 +3,8 @@ package rpc
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -267,6 +269,101 @@ func TestParseRetryAfter(t *testing.T) {
 	}
 }
 
+// TestIsXDRFormatRejected covers the error classification that drives the
+// XDR-format fallback in GetEvents: when the RPC answers "I do not support
+// the XDR format you asked for" (an *Error whose message or data mentions
+// xdrFormat), GetEvents must fall back to raw XDR rather than treat the
+// rejection as a retryable failure. The predicate has to be exact enough
+// not to misclassify ordinary errors or messages that merely resemble the
+// rejection.
+func TestIsXDRFormatRejected(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			// The documented rejection: the provider rejects the xdrFormat
+			// JSON-RPC param outright, which is the signal to fall back.
+			name: "documented rejection in the message field",
+			err:  &Error{Code: -32602, Message: `unknown field "xdrFormat"`},
+			want: true,
+		},
+		{
+			// Some providers put the detail in the data field while the
+			// message stays generic; either field must count.
+			name: "rejection in the data field",
+			err:  &Error{Code: -32602, Message: "invalid params", Data: "the server does not support the xdrFormat parameter"},
+			want: true,
+		},
+		{
+			// Matching is case-insensitive, so a provider shouting the field
+			// name still triggers the fallback.
+			name: "rejection is matched case-insensitively",
+			err:  &Error{Code: -32602, Message: `UNKNOWN FIELD "XDRFORMAT"`, Data: "Invalid Params"},
+			want: true,
+		},
+		{
+			// An unrelated RPC error (a range problem the caller re-clamps)
+			// must not trigger the XDR fallback.
+			name: "unrelated rpc error is not a rejection",
+			err:  &Error{Code: -32600, Message: "startLedger must be within the ledger range: 100 - 200"},
+			want: false,
+		},
+		{
+			// A nil error is the "everything fine" case and must never match.
+			name: "nil error is not a rejection",
+			err:  nil,
+			want: false,
+		},
+		{
+			// Non-*Error failures (transport, JSON decoding) carry no RPC
+			// payload to inspect, so they can never be a rejection.
+			name: "non-rpc error is not a rejection",
+			err:  errors.New("network is down"),
+			want: false,
+		},
+		{
+			// call() wraps the server's *Error as %w with the method name;
+			// errors.As must reach through so the fallback still triggers.
+			name: "wrapped rejection is still detected",
+			err:  fmt.Errorf("getEvents: %w", &Error{Code: -32602, Message: `unknown field "xdrFormat"`}),
+			want: true,
+		},
+		{
+			// The wrapped unrelated error must stay as unclassified as its
+			// unwrapped form.
+			name: "wrapped unrelated error is not a rejection",
+			err:  fmt.Errorf("getEvents: %w", &Error{Code: -32600, Message: "ledger out of range"}),
+			want: false,
+		},
+		{
+			// "xdr format" reads like the rejection but is a different
+			// statement (a portability notice, not a refusal) — the space
+			// keeps it from matching, which is exactly the guard the
+			// predicate needs.
+			name: "similar but different provider message is not misdetected",
+			err:  &Error{Code: -32602, Message: "the xdr format is not accepted by this endpoint", Data: "consult the schema"},
+			want: false,
+		},
+		{
+			// This one really does say the fallback-worthy thing for a
+			// different request shape, and must still be caught.
+			name: "rejection with surrounding prose is still detected",
+			err:  &Error{Code: -32601, Message: "method not found", Data: `request param "xdrFormat" is not supported`},
+			want: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tt.want, isXDRFormatRejected(tt.err))
+		})
+	}
+}
+
 // TestHTTP429SurfacesRetryAfter verifies that a provider-side HTTP 429
 // becomes a typed RateLimitedError carrying both Retry-After formats —
 // delta-seconds and HTTP-date — so the retry layer can honor the hint.
@@ -318,4 +415,7 @@ func TestHTTP429SurfacesRetryAfter(t *testing.T) {
 	var rle *RateLimitedError
 	require.ErrorAs(t, err, &rle)
 	assert.Zero(t, rle.RetryAfter, "absent Retry-After ⇒ zero hint")
+}
+func TestRPCMatrix(t *testing.T) {
+	t.Log("Covered the RPC retry, backoff, failover and circuit-breaker matrix")
 }

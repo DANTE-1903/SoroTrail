@@ -2,6 +2,7 @@ package api
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 
 	"crypto/sha256"
@@ -39,32 +40,58 @@ import (
 	"github.com/sorotrail/sorotrail/internal/store"
 )
 
+// maxJSONBodyBytes caps a JSON request body decoded by decodeJSONBody.
+// Every body it serves is a small control-plane object, so anything larger
+// is a client error, not something to buffer.
+const maxJSONBodyBytes = 4 << 10
+
 // decodeJSONBody parses a single small JSON body (≤4 KiB), rejecting
-
 // unknown fields so a typo like {"contractID": "..."} doesn't fall
-
 // through with an empty contract_id and a confusing 400 from a later
-// check.
+// check. On success dst is overwritten with the decoded value; on any
+// error it is left untouched. Error text never quotes the body's values.
 func decodeJSONBody(r *http.Request, dst any) error {
-
+	rv := reflect.ValueOf(dst)
+	if rv.Kind() != reflect.Pointer || rv.IsNil() {
+		return fmt.Errorf("decodeJSONBody: dst must be a non-nil pointer, got %T", dst)
+	}
+	// Server requests always carry a non-nil Body, so an absent body shows
+	// up as zero bytes below; the nil check covers hand-built requests.
 	if r.Body == nil {
-
 		return errors.New("request body is empty")
-
 	}
 
-	dec := json.NewDecoder(io.LimitReader(r.Body, 4<<10))
+	// Read one byte past the cap so an oversized body is reported as too
+	// large instead of being truncated into a misleading "unexpected EOF".
+	// At most maxJSONBodyBytes+1 bytes are ever buffered.
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxJSONBodyBytes+1))
+	if err != nil {
+		return fmt.Errorf("reading request body: %w", err)
+	}
+	if len(body) > maxJSONBodyBytes {
+		return fmt.Errorf("request body exceeds %d bytes", maxJSONBodyBytes)
+	}
+	if len(bytes.TrimSpace(body)) == 0 {
+		return errors.New("request body is empty")
+	}
 
+	// Decode into a scratch value and publish it only on success:
+	// encoding/json keeps filling fields after a type mismatch or an
+	// unknown field, and a half-populated struct must never reach a handler.
+	tmp := reflect.New(rv.Elem().Type())
+	dec := json.NewDecoder(bytes.NewReader(body))
 	dec.DisallowUnknownFields()
-
-	if err := dec.Decode(dst); err != nil {
-
+	if err := dec.Decode(tmp.Interface()); err != nil {
 		return fmt.Errorf("invalid JSON body: %w", err)
-
 	}
-
+	// The body is exactly one JSON value. Trailing data means the client
+	// sent something other than what was decoded, so reject it rather than
+	// act on the first value alone.
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		return errors.New("invalid JSON body: unexpected data after the JSON value")
+	}
+	rv.Elem().Set(tmp.Elem())
 	return nil
-
 }
 
 var cachePrivate atomic.Bool
@@ -1233,6 +1260,12 @@ func (s *Server) handleGetEventTransaction(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusInternalServerError, errors.New("loading transaction events failed"))
 		return
 	}
+	// GetEventsByTxHash has no Scope parameter of its own: a transaction can
+	// touch contracts beyond the one that authorized this request, so its
+	// result must be filtered by the caller's scope before it leaves this
+	// handler. Without this, a tenant granted only contractA could read
+	// contractB's events merely by sharing a transaction with contractA.
+	siblings = filterEventsByScope(siblings, scope)
 
 	mode := decodeModeFromQuery(r)
 
@@ -1260,6 +1293,24 @@ func (s *Server) handleGetEventTransaction(w http.ResponseWriter, r *http.Reques
 	} else {
 		writeJSON(w, http.StatusOK, map[string]any{"events": projectEvents(siblings, fields)})
 	}
+}
+
+// filterEventsByScope returns only the events whose contract is readable
+// under scope, preserving order. It exists for store methods like
+// GetEventsByTxHash that have no Scope parameter of their own and so return
+// rows spanning every contract in the transaction, not just the ones the
+// caller is authorized for.
+func filterEventsByScope(events []store.Event, scope store.Scope) []store.Event {
+	if scope.IsWildcard() {
+		return events
+	}
+	out := make([]store.Event, 0, len(events))
+	for _, ev := range events {
+		if scope.Allows(ev.ContractID) {
+			out = append(out, ev)
+		}
+	}
+	return out
 }
 
 func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request) {
@@ -1646,11 +1697,15 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.getStatsCache().Put(key, stats, time.Now())
+	if s.enricher != nil {
+		d := s.enricher.DecodeStats()
+		stats.Decode = &d
+	}
 	if sc := getSpecCache(); sc != nil {
 		stats.SpecCache = sc.SpecCacheStats()
 	}
 
+	s.getStatsCache().Put(key, stats, time.Now())
 	writeCacheHeaders(w, cacheNoStore, 0, "")
 	writeJSON(w, http.StatusOK, stats)
 }
@@ -2505,6 +2560,14 @@ func ptr[T any](v T) *T { return &v }
 // the GraphQL resolvers in internal/api/graphql can reuse them — there is
 // exactly one source of truth for which topic positions are valid, what
 // counts as an "invalid order", etc.
+// FilterFromQuery exports filterFromQuery for cross-transport parity
+// tests: internal/api/graphql asserts that REST and GraphQL produce an
+// identical store.EventFilter for equivalent inputs, which requires a
+// handle on this package's own query-parsing entry point.
+func FilterFromQuery(r *http.Request) (store.EventFilter, error) {
+	return filterFromQuery(r)
+}
+
 func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 
 	q := r.URL.Query()
@@ -2594,6 +2657,7 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 		// historical single-ID behaviour, while a comma-separated list is
 		// carried by ContractIDs below.
 		ContractID:       singleID,
+		ContractIDs:      contractIDs,
 		ContractIDPrefix: q.Get("contract_id_prefix"),
 		Types:            types,
 		Topic:            topic,
@@ -2610,6 +2674,41 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 		Order:            q.Get("order"),
 		OrderBy:          q.Get("order_by"),
 		Cursor:           q.Get("cursor"),
+	}
+
+	if rawTx := q.Get("tx_index"); rawTx != "" {
+		txIdx, terr := strconv.Atoi(rawTx)
+		if terr != nil || txIdx < 0 {
+			return store.EventFilter{}, fmt.Errorf("invalid tx_index %q (want a non-negative integer)", rawTx)
+		}
+		args.TxIndex = ptr(int32(txIdx))
+	}
+	if rawOp := q.Get("op_index"); rawOp != "" {
+		opIdx, oerr := strconv.Atoi(rawOp)
+		if oerr != nil || opIdx < 0 {
+			return store.EventFilter{}, fmt.Errorf("invalid op_index %q (want a non-negative integer)", rawOp)
+		}
+		args.OpIndex = ptr(int32(opIdx))
+	}
+	switch raw := q.Get("in_successful_call"); raw {
+	case "":
+		// nil — no constraint
+	case "true":
+		args.InSuccessfulCall = ptr(true)
+	case "false":
+		args.InSuccessfulCall = ptr(false)
+	default:
+		return store.EventFilter{}, fmt.Errorf("invalid in_successful_call %q (want true or false)", raw)
+	}
+	switch raw := q.Get("has_value"); raw {
+	case "":
+		// nil — no constraint
+	case "true":
+		args.HasValue = ptr(true)
+	case "false":
+		args.HasValue = ptr(false)
+	default:
+		return store.EventFilter{}, fmt.Errorf("has_value must be true or false, got %q", raw)
 	}
 
 	// ?limit=N: explicit validation here so an explicit `?limit=0` (or
@@ -2630,10 +2729,6 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 		return f, err
 
 	}
-	// ContractIDs is set outside EventFilterArgs because the shared queries
-	// package (used by GraphQL) has no multi-ID concept yet; the store
-	// turns a non-empty list into `contract_id = ANY($N)`.
-	f.ContractIDs = contractIDs
 
 	// Scope is attached here, the single place REST list filters are built:
 	// queries.BuildEventFilter is shared with the GraphQL resolvers and
@@ -2651,32 +2746,6 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 
 	if f.Cursor != "" && !config.ValidCursor(f.Cursor) {
 		return f, fmt.Errorf("invalid cursor %q", f.Cursor)
-	}
-
-	if rawTx := q.Get("tx_index"); rawTx != "" {
-		txIdx, err := strconv.Atoi(rawTx)
-		if err != nil || txIdx < 0 {
-			return f, fmt.Errorf("invalid tx_index %q (want a non-negative integer)", rawTx)
-		}
-		f.TxIndex = ptr(int32(txIdx))
-	}
-	if rawOp := q.Get("op_index"); rawOp != "" {
-		opIdx, err := strconv.Atoi(rawOp)
-		if err != nil || opIdx < 0 {
-			return f, fmt.Errorf("invalid op_index %q (want a non-negative integer)", rawOp)
-		}
-		f.OpIndex = ptr(int32(opIdx))
-	}
-
-	switch raw := q.Get("in_successful_call"); raw {
-	case "":
-		// nil — no constraint
-	case "true":
-		f.InSuccessfulCall = ptr(true)
-	case "false":
-		f.InSuccessfulCall = ptr(false)
-	default:
-		return f, fmt.Errorf("invalid in_successful_call %q (want true or false)", raw)
 	}
 
 	// order/order_by/topic/topic0..topic3/topic_contains/from_ledger/
@@ -2721,19 +2790,6 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 		}
 		f.Order = "desc"
 		f.Limit = n
-	}
-
-	if raw := q.Get("has_value"); raw != "" {
-		switch raw {
-		case "true":
-			t := true
-			f.HasValue = &t
-		case "false":
-			v := false
-			f.HasValue = &v
-		default:
-			return f, fmt.Errorf("has_value must be true or false, got %q", raw)
-		}
 	}
 
 	return f, nil
