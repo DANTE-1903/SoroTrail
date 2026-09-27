@@ -21,9 +21,9 @@ func TestClientErrors(t *testing.T) {
 		}))
 		defer server.Close()
 
-		client := NewHorizonClient(server.URL)
+		client := NewClient(server.URL)
 		ctx := context.Background()
-		err := client.Health(ctx)
+		err := client.CheckHealth(ctx)
 		assert.Error(t, err)
 	})
 }
