@@ -462,6 +462,18 @@ func (l *RateLimiter) clientKey(r *http.Request) string {
 	return "unknown"
 }
 
+// unbracket strips the square brackets from a bare IPv6 literal such
+// as "[2001:db8::1]" and reports whether the result parses as an IP.
+// SplitHostPort rejects bracketed literals without a port and
+// net.ParseIP rejects the brackets themselves, so without this helper
+// those entries would look malformed and be skipped.
+func unbracket(s string) (string, bool) {
+	if len(s) > 2 && s[0] == '[' && s[len(s)-1] == ']' && net.ParseIP(s[1:len(s)-1]) != nil {
+		return s[1 : len(s)-1], true
+	}
+	return "", false
+}
+
 // clientIP returns the parsed source IP, optionally honoring XFF.
 func clientIP(r *http.Request, trustXFF bool) string {
 	if trustXFF {
@@ -480,19 +492,31 @@ func clientIP(r *http.Request, trustXFF bool) string {
 				if net.ParseIP(part) != nil {
 					return part
 				}
+				// "[2001:db8::1]" without a port is a legitimate
+				// forwarded hop; treat it as that address instead of
+				// skipping to the proxy that appended its own entry.
+				if host, ok := unbracket(part); ok {
+					return host
+				}
 			}
 		}
 	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		// RemoteAddr may already be just an IP for some transports; treat
-		// anything net.ParseIP accepts as the host.
-		if net.ParseIP(r.RemoteAddr) != nil {
-			return r.RemoteAddr
-		}
-		return ""
+	if err == nil && net.ParseIP(host) != nil {
+		return host
 	}
-	return host
+	// RemoteAddr may already be just an IP for some transports; treat
+	// anything net.ParseIP accepts — bracketed IPv6 included — as the
+	// host. Anything else is malformed, and returning "" lets clientKey
+	// fall back to its stable "unknown" key rather than minting a bucket
+	// per junk string.
+	if net.ParseIP(r.RemoteAddr) != nil {
+		return r.RemoteAddr
+	}
+	if bare, ok := unbracket(r.RemoteAddr); ok {
+		return bare
+	}
+	return ""
 }
 
 // ceilSeconds rounds d up to the next whole second. RFC 7231 specifies

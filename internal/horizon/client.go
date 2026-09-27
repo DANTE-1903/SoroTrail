@@ -1,10 +1,3 @@
-// Horizon REST client. Mirrors the small "minimal HTTP wrapper for one
-// Stellar API" pattern in internal/rpc/client.go: explicit rate limiter,
-// simple JSON decoding, no SDK.
-//
-// Producing and consuming both happen here; the XDR meta extraction
-// (the part that turns a Tx result_meta_xdr into store.Event rows) lives
-// in extract.go so this file stays a thin HTTP boundary.
 package horizon
 
 import (
@@ -19,18 +12,7 @@ import (
 	"time"
 )
 
-// Client is the Horizon boundary. Tests can substitute a fake by
-// implementing the same interface.
 type Client interface {
-	// ListContractTransactions walks every transaction that touches
-	// contractID, in ascending ledger/transaction order, with Horizon
-	// cursor pagination. The cursor argument is opaque — pass "" for the
-	// first page, then the value returned in TransactionsResponse.
-	//
-	// Callers should pass limit in 1..200; 200 matches Horizon's cap.
-	// includeFailed=true matches the live ingester's behavior: a
-	// transaction whose contract call succeeded but that other ops
-	// failed still carries events from the call we care about.
 	ListContractTransactions(ctx context.Context, contractID, cursor string, limit int, includeFailed bool) (TransactionsResponse, error)
 }
 

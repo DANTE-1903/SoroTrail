@@ -35,8 +35,12 @@ const (
 func SanitizeURL(rawURL string) string {
 	parsed, err := url.Parse(rawURL)
 	if err != nil {
-		// If it's not a valid URL, perform a basic string fallback redaction
-		return rawURL
+		// Nothing here can tell a password from the rest of an unparseable
+		// string, and returning it unchanged is exactly how a credential
+		// reaches the log line this function exists to keep it out of. Note
+		// that a valid password is enough to fail url.Parse: a "%", a space or
+		// a "[" in the userinfo all do it.
+		return "<redacted>"
 	}
 	if parsed.User != nil {
 		if _, passwordSet := parsed.User.Password(); passwordSet {
