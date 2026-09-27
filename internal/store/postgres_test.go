@@ -254,9 +254,13 @@ func TestEnsureEventPartitions(t *testing.T) {
 					require.NoError(t, err)
 				}
 			} else {
-				require.NoError(t, st.ensureEventPartitions(ctx, []Event{{Ledger: tt.ledgers[0]}}))
-				if len(tt.ledgers) > 1 {
-					require.NoError(t, st.ensureEventPartitions(ctx, []Event{{Ledger: tt.ledgers[1]}}))
+				// Every ledger in the case, not just the first two. The
+				// boundary case supplies three (10, 19, 20) and it is the
+				// third that crosses into the next span, so stopping at
+				// index 1 asserted two partitions while only ever writing
+				// into the first.
+				for _, ledger := range tt.ledgers {
+					require.NoError(t, st.ensureEventPartitions(ctx, []Event{{Ledger: ledger}}))
 				}
 			}
 
