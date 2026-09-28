@@ -1,3 +1,5 @@
+//go:build integration
+
 package store
 
 import (
@@ -27,10 +29,10 @@ func testTenantStore(t *testing.T) *Postgres {
 	t.Helper()
 	p := testStore(t)
 	_, err := p.pool.Exec(context.Background(),
-		`TRUNCATE tenant_usage, api_keys, tenant_watched_contracts,
+		`TRUNCATE tenant_usage, tenant_api_keys, tenant_watched_contracts,
 		          tenant_contract_grants, tenants RESTART IDENTITY CASCADE`)
 	require.NoError(t, err)
-	// Re-seed what migration 0008 inserts, since the truncate above removed it.
+	// Re-seed what migration 0016 inserts, since the truncate above removed it.
 	_, err = p.pool.Exec(context.Background(),
 		`INSERT INTO tenants (name, wildcard, is_admin, enabled)
 		 VALUES ('default', true, true, true)`)
@@ -366,19 +368,19 @@ func TestWatchingDoesNotGrantAccess(t *testing.T) {
 	assert.Empty(t, got)
 }
 
-func TestAPIKeys(t *testing.T) {
+func TestTenantAPIKeys(t *testing.T) {
 	p := testTenantStore(t)
 	ctx := context.Background()
 	tenant := mustTenant(t, p, "keyed")
 
 	digest := []byte("0123456789abcdef0123456789abcdef")
-	key, err := p.CreateAPIKey(ctx, tenant.ID, "primary", "PREFIX0000000001", digest)
+	key, err := p.CreateTenantAPIKey(ctx, tenant.ID, "primary", "PREFIX0000000001", digest)
 	require.NoError(t, err)
 	assert.Equal(t, tenant.ID, key.TenantID)
 	assert.Nil(t, key.RevokedAt)
 
 	t.Run("lookup returns the digest and tenant", func(t *testing.T) {
-		got, gotDigest, gotTenant, err := p.LookupAPIKey(ctx, "PREFIX0000000001")
+		got, gotDigest, gotTenant, err := p.LookupTenantAPIKey(ctx, "PREFIX0000000001")
 		require.NoError(t, err)
 		assert.Equal(t, key.ID, got.ID)
 		assert.Equal(t, digest, gotDigest)
@@ -387,57 +389,57 @@ func TestAPIKeys(t *testing.T) {
 	})
 
 	t.Run("an unknown prefix is not found", func(t *testing.T) {
-		_, _, _, err := p.LookupAPIKey(ctx, "NOSUCHPREFIX0000")
+		_, _, _, err := p.LookupTenantAPIKey(ctx, "NOSUCHPREFIX0000")
 		assert.ErrorIs(t, err, ErrNotFound)
 	})
 
 	t.Run("a revoked key stops resolving", func(t *testing.T) {
-		require.NoError(t, p.RevokeAPIKey(ctx, key.ID))
-		_, _, _, err := p.LookupAPIKey(ctx, "PREFIX0000000001")
+		require.NoError(t, p.RevokeTenantAPIKey(ctx, key.ID))
+		_, _, _, err := p.LookupTenantAPIKey(ctx, "PREFIX0000000001")
 		assert.ErrorIs(t, err, ErrNotFound,
 			"revocation must be enforced by the lookup, not by the caller remembering to check")
 
 		// The row survives for audit.
-		keys, err := p.ListAPIKeys(ctx, tenant.ID)
+		keys, err := p.ListTenantAPIKeys(ctx, tenant.ID)
 		require.NoError(t, err)
 		require.Len(t, keys, 1)
 		assert.NotNil(t, keys[0].RevokedAt)
 	})
 
 	t.Run("revoking twice reports not found", func(t *testing.T) {
-		assert.ErrorIs(t, p.RevokeAPIKey(ctx, key.ID), ErrNotFound)
+		assert.ErrorIs(t, p.RevokeTenantAPIKey(ctx, key.ID), ErrNotFound)
 	})
 
 	t.Run("deleting a tenant cascades its keys", func(t *testing.T) {
 		victim := mustTenant(t, p, "doomed")
-		_, err := p.CreateAPIKey(ctx, victim.ID, "k", "PREFIX0000000002", digest)
+		_, err := p.CreateTenantAPIKey(ctx, victim.ID, "k", "PREFIX0000000002", digest)
 		require.NoError(t, err)
 
 		require.NoError(t, p.DeleteTenant(ctx, victim.ID))
-		_, _, _, err = p.LookupAPIKey(ctx, "PREFIX0000000002")
+		_, _, _, err = p.LookupTenantAPIKey(ctx, "PREFIX0000000002")
 		assert.ErrorIs(t, err, ErrNotFound)
 	})
 }
 
 // The bootstrap path runs on every startup, so it must be idempotent.
-func TestCreateAPIKeyIfAbsent_IsIdempotent(t *testing.T) {
+func TestCreateTenantAPIKeyIfAbsent_IsIdempotent(t *testing.T) {
 	p := testTenantStore(t)
 	ctx := context.Background()
 	tenant := mustTenant(t, p, "bootstrapped")
 
 	first := []byte("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
-	require.NoError(t, p.CreateAPIKeyIfAbsent(ctx, tenant.ID, "bootstrap", "BOOTPREFIX000001", first))
-	require.NoError(t, p.CreateAPIKeyIfAbsent(ctx, tenant.ID, "bootstrap", "BOOTPREFIX000001", first))
+	require.NoError(t, p.CreateTenantAPIKeyIfAbsent(ctx, tenant.ID, "bootstrap", "BOOTPREFIX000001", first))
+	require.NoError(t, p.CreateTenantAPIKeyIfAbsent(ctx, tenant.ID, "bootstrap", "BOOTPREFIX000001", first))
 
-	keys, err := p.ListAPIKeys(ctx, tenant.ID)
+	keys, err := p.ListTenantAPIKeys(ctx, tenant.ID)
 	require.NoError(t, err)
 	assert.Len(t, keys, 1, "a restart must not accumulate duplicate bootstrap keys")
 
 	t.Run("rotating the configured value takes effect", func(t *testing.T) {
 		second := []byte("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
-		require.NoError(t, p.CreateAPIKeyIfAbsent(ctx, tenant.ID, "bootstrap", "BOOTPREFIX000001", second))
+		require.NoError(t, p.CreateTenantAPIKeyIfAbsent(ctx, tenant.ID, "bootstrap", "BOOTPREFIX000001", second))
 
-		_, digest, _, err := p.LookupAPIKey(ctx, "BOOTPREFIX000001")
+		_, digest, _, err := p.LookupTenantAPIKey(ctx, "BOOTPREFIX000001")
 		require.NoError(t, err)
 		assert.Equal(t, second, digest)
 	})

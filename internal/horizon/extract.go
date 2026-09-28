@@ -27,7 +27,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/stellar/go/xdr"
+	"github.com/stellar/go-stellar-sdk/xdr"
 
 	"github.com/sorotrail/sorotrail/internal/decode"
 	"github.com/sorotrail/sorotrail/internal/store"
@@ -207,6 +207,14 @@ func eventKind(t xdr.ContractEventType) string {
 // all leading elements as topics (decoded individually) and the last
 // element as the value.
 func eventPayloads(dx decode.Decoder, ev xdr.ContractEvent) (json.RawMessage, json.RawMessage, []string, string, bool) {
+	// Check the pointer before asking the union. A zero-valued
+	// ContractEventBody has V == 0, which ArmForSwitch maps to "V0", so GetV0
+	// takes the success path and dereferences a nil V0 — it panics rather than
+	// returning ok == false. Horizon handing back an event with no body would
+	// otherwise bring the indexer down instead of skipping one row.
+	if ev.Body.V0 == nil {
+		return nil, nil, nil, "", false
+	}
 	body, ok := ev.Body.GetV0()
 	if !ok {
 		return nil, nil, nil, "", false

@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/stellar/go/xdr"
+	"github.com/stellar/go-stellar-sdk/xdr"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -25,6 +25,32 @@ func scSymbol(s string) xdr.ScVal {
 func scU64(n uint64) xdr.ScVal {
 	u := xdr.Uint64(n)
 	return xdr.ScVal{Type: xdr.ScValTypeScvU64, U64: &u}
+}
+
+// testWasmHash is a fixed 32-byte wasm hash reused by struct ScVal tests.
+var testWasmHash = xdr.Hash{
+	0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+	0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
+	0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
+	0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20,
+}
+
+func wasmExecutable() xdr.ContractExecutable {
+	h := testWasmHash
+	return xdr.ContractExecutable{
+		Type:     xdr.ContractExecutableTypeContractExecutableWasm,
+		WasmHash: &h,
+	}
+}
+
+func scContractInstance(executable xdr.ContractExecutable, storage *xdr.ScMap) xdr.ScVal {
+	return xdr.ScVal{
+		Type: xdr.ScValTypeScvContractInstance,
+		Instance: &xdr.ScContractInstance{
+			Executable: executable,
+			Storage:    storage,
+		},
+	}
 }
 
 func TestXDRDecoder_DecodeScVal(t *testing.T) {
@@ -132,6 +158,61 @@ func TestXDRDecoder_ContractAddress(t *testing.T) {
 	assert.True(t, strings.HasPrefix(addr, "C"), "contract addresses use the C... strkey prefix, got %q", addr)
 }
 
+func TestXDRDecoder_StructScVals(t *testing.T) {
+	// Literal base64 XDR samples pin the wire format for the struct-carrying
+	// ScVal variants (SCV_CONTRACT_INSTANCE, SCV_LEDGER_KEY_NONCE,
+	// SCV_EXECUTABLE_TAG). Each sample is a real base64-encoded ScVal.
+	tests := []struct {
+		name string
+		b64  string
+		want string
+	}{
+		{
+			"contract instance: wasm executable + storage",
+			"AAAAEwAAAAABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4fIAAAAAEAAAABAAAADwAAAAdiYWxhbmNlAAAAAAUAAAAAAAAD6A==",
+			`{"contract_instance":{"executable":{"wasm_hash":"0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20"},"storage":[{"key":{"symbol":"balance"},"val":{"u64":1000}}]}}`,
+		},
+		{
+			"contract instance: wasm executable, no storage",
+			"AAAAEwAAAAABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4fIAAAAAA=",
+			`{"contract_instance":{"executable":{"wasm_hash":"0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20"},"storage":[]}}`,
+		},
+		{
+			"contract instance: stellar asset executable",
+			"AAAAEwAAAAEAAAAA",
+			`{"contract_instance":{"executable":{"stellar_asset":null},"storage":[]}}`,
+		},
+		{
+			"contract instance: external ref executable",
+			"AAAAEwAAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAnYxAAAAAAAA",
+			`{"contract_instance":{"executable":{"external_ref":{"executable_owner":"GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF","tag":"v1"}},"storage":[]}}`,
+		},
+		{
+			"ledger key nonce",
+			"AAAAFQAAAAAAAAAq",
+			`{"ledger_key_nonce":{"nonce":42}}`,
+		},
+		{
+			"ledger key nonce: negative",
+			"AAAAFf/////////5",
+			`{"ledger_key_nonce":{"nonce":-7}}`,
+		},
+		{
+			"executable tag",
+			"AAAAFgAAAAtzb3JvYmFuLXRhZwA=",
+			`{"executable_tag":"soroban-tag"}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := XDRDecoder{}.DecodeScVal(tt.b64)
+			require.NoError(t, err)
+			assert.JSONEq(t, tt.want, string(got))
+		})
+	}
+}
+
 func TestXDRDecoder_UnknownTypeFallback(t *testing.T) {
 	val := xdr.ScVal{Type: xdr.ScValTypeScvLedgerKeyContractInstance}
 	raw := mustBase64(t, val)
@@ -227,6 +308,31 @@ func TestXDRDecoder_NestedCollections(t *testing.T) {
 			}(),
 			`{"map":[]}`,
 		},
+		{
+			"vec containing contract instance",
+			func() xdr.ScVal {
+				inst := scContractInstance(wasmExecutable(), nil)
+				vec := xdr.ScVec{scSymbol("v1"), inst}
+				vecPtr := &vec
+				return xdr.ScVal{Type: xdr.ScValTypeScvVec, Vec: &vecPtr}
+			}(),
+			`{"vec":[{"symbol":"v1"},{"contract_instance":{"executable":{"wasm_hash":"0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20"},"storage":[]}}]}`,
+		},
+		{
+			"map containing contract instance",
+			func() xdr.ScVal {
+				entry := xdr.ScMapEntry{
+					Key: scSymbol("instance"),
+					Val: scContractInstance(wasmExecutable(), &xdr.ScMap{
+						{Key: scSymbol("balance"), Val: scU64(1000)},
+					}),
+				}
+				scMap := xdr.ScMap{entry}
+				mapPtr := &scMap
+				return xdr.ScVal{Type: xdr.ScValTypeScvMap, Map: &mapPtr}
+			}(),
+			`{"map":[{"key":{"symbol":"instance"},"val":{"contract_instance":{"executable":{"wasm_hash":"0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20"},"storage":[{"key":{"symbol":"balance"},"val":{"u64":1000}}]}}}]}`,
+		},
 	}
 
 	for _, tt := range tests {
@@ -239,6 +345,91 @@ func TestXDRDecoder_NestedCollections(t *testing.T) {
 }
 
 func TestXDRDecoder_InvalidBase64(t *testing.T) {
-	_, err := XDRDecoder{}.DecodeScVal("not base64!!!")
-	assert.Error(t, err)
+	// DecodeScVal should NOT return an error for invalid base64 — it returns
+	// a fallback with the raw value preserved and counts the failure.
+	t.Run("fallback, not error", func(t *testing.T) {
+		old := decodeErrors.Load()
+		got, err := XDRDecoder{}.DecodeScVal("not base64!!!")
+		assert.NoError(t, err, "DecodeScVal must return a fallback, not propagate the error")
+		assert.Equal(t, old+1, decodeErrors.Load(), "decode error counter must be incremented")
+
+		var decoded map[string]map[string]any
+		require.NoError(t, json.Unmarshal(got, &decoded))
+		unknown := decoded["unknown"]
+		require.NotNil(t, unknown, "invalid input must decode to an {\"unknown\": ...} wrapper")
+		assert.Equal(t, "decode_error", unknown["type"])
+		assert.Equal(t, "not base64!!!", unknown["base64"])
+		assert.NotEmpty(t, unknown["error"])
+	})
+
+	t.Run("counter increments on multiple failures", func(t *testing.T) {
+		old := decodeErrors.Load()
+		XDRDecoder{}.DecodeScVal("bad1")
+		XDRDecoder{}.DecodeScVal("bad2")
+		assert.Equal(t, old+2, decodeErrors.Load(), "each decode failure must increment the counter")
+	})
+}
+
+func TestDecodeErrorCount(t *testing.T) {
+	// DecodeErrorCount returns the current counter value.
+	before := DecodeErrorCount()
+	XDRDecoder{}.DecodeScVal("invalid!!!")
+	assert.Equal(t, before+1, DecodeErrorCount())
+}
+
+func TestXDRDecoder_InvalidScValConversion(t *testing.T) {
+	// Use a ScVal with a corrupted or boundary XDR that unmarshals
+	// but fails during conversion. ScMap with a nil ScVal entry is
+	// a valid XDR construct that requires special handling.
+	t.Run("map with nil entries preserves raw XDR", func(t *testing.T) {
+		// A map entry with void key and void value should decode fine.
+		// This verifies that the fallback path for conversion errors
+		// in scValToGo (which already handles all known types) continues
+		// to work correctly. The actual error path is exercised by the
+		// invalid base64 test above.
+		old := decodeErrors.Load()
+
+		// An ScMap with one entry of void key/val
+		entry := xdr.ScMapEntry{
+			Key: xdr.ScVal{Type: xdr.ScValTypeScvVoid},
+			Val: xdr.ScVal{Type: xdr.ScValTypeScvVoid},
+		}
+		scMap := xdr.ScMap{entry}
+		mapPtr := &scMap
+		val := xdr.ScVal{Type: xdr.ScValTypeScvMap, Map: &mapPtr}
+		raw := mustBase64(t, val)
+
+		got, err := XDRDecoder{}.DecodeScVal(raw)
+		require.NoError(t, err)
+		assert.JSONEq(t, `{"map":[{"key":{"void":null},"val":{"void":null}}]}`, string(got))
+		// Counter must not have been incremented for a successful decode.
+		assert.Equal(t, old, decodeErrors.Load())
+	})
+}
+
+func TestUint128String(t *testing.T) {
+	// uint128String renders the full 128-bit range as a decimal string
+	// because JSON numbers lose precision past 2^53.
+	tests := []struct {
+		name string
+		hi   uint64
+		lo   uint64
+		want string
+	}{
+		{"zero renders as 0", 0, 0, "0"},
+		{"one", 0, 1, "1"},
+		{"value above 2^53 stays exact", 0, 9007199254740993, "9007199254740993"},
+		{"low word only", 0, 18446744073709551615, "18446744073709551615"},
+		{"high word only", 1, 0, "18446744073709551616"},
+		{"high bit set stays positive", 0x8000000000000000, 0, "170141183460469231731687303715884105728"},
+		{"maximum u128 renders without truncation", 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, "340282366920938463463374607431768211455"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := uint128String(xdr.UInt128Parts{Hi: xdr.Uint64(tt.hi), Lo: xdr.Uint64(tt.lo)})
+			assert.Equal(t, tt.want, got, "decimal rendering")
+			assert.NotContains(t, got, "-", "unsigned rendering must never carry a minus sign")
+		})
+	}
 }

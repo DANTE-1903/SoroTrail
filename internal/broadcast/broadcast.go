@@ -1,6 +1,5 @@
 // Package broadcast provides a pub-sub mechanism for distributing ingested
-// events to connected clients (SSE, WebSocket, etc.). It is the streaming
-// counterpart of the store package's query interface.
+// events to connected clients (SSE, WebSocket, etc.).
 package broadcast
 
 import (
@@ -14,8 +13,7 @@ import (
 	"github.com/sorotrail/sorotrail/internal/store"
 )
 
-// DefaultBufferSize is the per-subscriber channel buffer. When a subscriber's
-// channel is full the subscriber is evicted (slow-consumer policy).
+// DefaultBufferSize is the per-subscriber channel buffer.
 const DefaultBufferSize = 64
 
 // Broadcaster distributes events to subscribers whose filters match.
@@ -27,7 +25,6 @@ type Broadcaster struct {
 }
 
 // Subscription represents a single subscriber's connection to the event stream.
-// The caller receives events on Events() and must call Close() when done.
 type Subscription struct {
 	id     string
 	ch     chan store.Event
@@ -40,10 +37,20 @@ type Subscription struct {
 	// grants and revocations that happen after it was opened; see SetScope.
 	scopeMu sync.RWMutex
 	scope   store.Scope
+
+	// chMu serializes every send on ch against closeChannel. Publish reads
+	// its subscriber list under Broadcaster.mu but sends outside that lock,
+	// so without chMu a client disconnecting (Subscription.Close, called
+	// from a request's own goroutine) could close ch while a concurrent
+	// Publish is mid-send on it, panicking with "send on closed channel" —
+	// the ingestion goroutine crashing because of an unrelated client
+	// hanging up. chMu makes "is ch closed" and "send on ch" one atomic
+	// step from the broadcaster's point of view, at either end.
+	chMu   sync.Mutex
+	closed bool
 }
 
-// New creates a Broadcaster. bufferSize is the per-subscriber channel
-// capacity; a subscriber that falls behind gets evicted.
+// New creates a Broadcaster.
 func New(bufferSize int) *Broadcaster {
 	if bufferSize <= 0 {
 		bufferSize = DefaultBufferSize
@@ -100,26 +107,45 @@ func (s *Subscription) currentScope() store.Scope {
 
 func (b *Broadcaster) unsubscribe(id string) {
 	b.mu.Lock()
-	defer b.mu.Unlock()
-	if s, ok := b.subs[id]; ok {
-		close(s.ch)
+	s, ok := b.subs[id]
+	if ok {
 		delete(b.subs, id)
+	}
+	b.mu.Unlock()
+	// Closed outside b.mu, under s.chMu instead, so it can never block
+	// waiting for a concurrent Publish's send on this same subscriber to
+	// finish — and so that send and close stay mutually exclusive; see
+	// closeChannel.
+	if ok {
+		s.closeChannel()
 	}
 }
 
+// closeChannel closes s.ch exactly once, synchronized against Publish's
+// send on the same channel via chMu, so a disconnect that lands while a
+// publish is in flight for this subscriber can never race a send against
+// the close (see chMu's doc comment). Both Close (via unsubscribe) and
+// Publish's slow-consumer eviction call this, and both may race to do so
+// for the same subscriber, so the guard has to live here rather than at
+// either call site.
+func (s *Subscription) closeChannel() {
+	s.chMu.Lock()
+	defer s.chMu.Unlock()
+	if s.closed {
+		return
+	}
+	s.closed = true
+	close(s.ch)
+}
+
 // SubscriberCount returns the number of subscribers currently registered.
-// Exposed primarily for tests that need to verify the subscription
-// lifecycle (e.g. confirming that a handler's deferred sub.Close()
-// actually ran on connection teardown), but also useful for operators
-// who want to see how many live consumers the broadcaster is feeding.
 func (b *Broadcaster) SubscriberCount() int {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	return len(b.subs)
 }
 
-// Publish sends events to all subscribers whose filter matches. Slow
-// consumers (full channel) are silently evicted.
+// Publish sends events to all subscribers whose filter matches.
 func (b *Broadcaster) Publish(ctx context.Context, events []store.Event) {
 	b.mu.RLock()
 	subs := make([]*Subscription, 0, len(b.subs))
@@ -128,52 +154,63 @@ func (b *Broadcaster) Publish(ctx context.Context, events []store.Event) {
 	}
 	b.mu.RUnlock()
 
-	var evict []string
+	var evict []*Subscription
 	for _, s := range subs {
-		// Read the scope once per subscriber per publish rather than once
-		// per event: it cannot change mid-batch in a way that matters, and
-		// taking the lock per event would put it on the hot path.
-		scope := s.currentScope()
-		for _, ev := range events {
-			// Authorization first, and independently of the user's filter,
-			// so no filter expression can be crafted to bypass it.
-			if !scope.Allows(ev.ContractID) {
-				continue
-			}
-			if !eventMatches(ev, s.filter) {
-				continue
-			}
-			select {
-			case s.ch <- ev:
-			default:
-				evict = append(evict, s.id)
-				goto nextSub
-			}
+		if s.publishTo(events) {
+			evict = append(evict, s)
 		}
-	nextSub:
 	}
 	if len(evict) > 0 {
 		b.mu.Lock()
-		for _, id := range evict {
-			if s, ok := b.subs[id]; ok {
-				close(s.ch)
-				delete(b.subs, id)
-			}
+		for _, s := range evict {
+			delete(b.subs, s.id)
 		}
 		b.mu.Unlock()
+		for _, s := range evict {
+			s.closeChannel()
+		}
 	}
 }
 
-// Events returns a receive-only channel of events matching the subscriber's
-// filter. The channel is closed when the subscription is terminated (either
-// by the caller calling Close() or by the broadcaster evicting a slow
-// consumer).
+// publishTo sends every event in events that s's scope and filter allow,
+// returning true if s must be evicted for being too slow to keep up (its
+// buffer was full). The whole attempt runs under s.chMu, so a concurrent
+// Close cannot close s.ch out from under an in-flight send — see chMu's
+// doc comment on Subscription.
+func (s *Subscription) publishTo(events []store.Event) bool {
+	s.chMu.Lock()
+	defer s.chMu.Unlock()
+	if s.closed {
+		return false
+	}
+	// Read the scope once per subscriber per publish rather than once per
+	// event: it cannot change mid-batch in a way that matters, and taking
+	// the lock per event would put it on the hot path.
+	scope := s.currentScope()
+	for _, ev := range events {
+		// Authorization first, and independently of the user's filter, so
+		// no filter expression can be crafted to bypass it.
+		if !scope.Allows(ev.ContractID) {
+			continue
+		}
+		if !eventMatches(ev, s.filter) {
+			continue
+		}
+		select {
+		case s.ch <- ev:
+		default:
+			return true
+		}
+	}
+	return false
+}
+
+// Events returns a receive-only channel of events matching the subscriber's filter.
 func (s *Subscription) Events() <-chan store.Event {
 	return s.ch
 }
 
-// Close terminates the subscription. The subscriber will receive no more
-// events.
+// Close terminates the subscription.
 func (s *Subscription) Close() {
 	s.once.Do(func() {
 		s.b.unsubscribe(s.id)
@@ -181,10 +218,25 @@ func (s *Subscription) Close() {
 }
 
 // eventMatches reports whether an event satisfies the given filter.
-// Zero-valued filter fields are treated as "no constraint".
 func eventMatches(ev store.Event, f store.EventFilter) bool {
-	if f.ContractID != "" && ev.ContractID != f.ContractID {
-		return false
+	// If both ContractID and ContractIDs are set, match if the event's
+	// contract matches either one.
+	if f.ContractID != "" || len(f.ContractIDs) > 0 {
+		matched := false
+		if f.ContractID != "" && ev.ContractID == f.ContractID {
+			matched = true
+		}
+		if !matched {
+			for _, id := range f.ContractIDs {
+				if ev.ContractID == id {
+					matched = true
+					break
+				}
+			}
+		}
+		if !matched {
+			return false
+		}
 	}
 	if len(f.Types) > 0 {
 		ok := false
@@ -215,11 +267,19 @@ func eventMatches(ev store.Event, f store.EventFilter) bool {
 	if !f.ToTime.IsZero() && ev.CreatedAt.After(f.ToTime) {
 		return false
 	}
+	if f.HasValue != nil {
+		hasPayload := len(ev.Value) > 0 && string(ev.Value) != "null"
+		if *f.HasValue && !hasPayload {
+			return false
+		}
+		if !*f.HasValue && hasPayload {
+			return false
+		}
+	}
 	return true
 }
 
-// topicContains reports whether the topics JSON array contains the needle
-// JSON value at any position (equivalent to Postgres's @> containment).
+// topicContains reports whether the topics JSON array contains the needle.
 func topicContains(topics json.RawMessage, needle json.RawMessage) bool {
 	var arr []json.RawMessage
 	if err := json.Unmarshal(topics, &arr); err != nil {

@@ -7,6 +7,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
 )
 
 func TestHealthcheckReturnsZeroOn2xx(t *testing.T) {
@@ -156,6 +158,48 @@ func TestHealthcheckDoesNotFollowRedirects(t *testing.T) {
 		"--addr", addr, "--endpoint", "/health",
 	}); got != 1 {
 		t.Fatalf("expected exit code 1 for 3xx response, got %d", got)
+	}
+}
+
+func TestResolveHealthcheckAddr(t *testing.T) {
+	cases := []struct {
+		name     string
+		flagAddr string
+		httpAddr string
+		want     string
+	}{
+		{
+			name:     "explicit flag wins over environment",
+			flagAddr: "10.0.0.5:9090",
+			httpAddr: "192.168.1.1:8080",
+			want:     "10.0.0.5:9090",
+		},
+		{
+			name:     "empty flag falls back to HTTP_ADDR",
+			flagAddr: "",
+			httpAddr: "192.168.1.1:8080",
+			want:     "192.168.1.1:8080",
+		},
+		{
+			name:     "empty flag and unset HTTP_ADDR fall back to default",
+			flagAddr: "",
+			httpAddr: "",
+			want:     healthcheckAddrDefault,
+		},
+		{
+			name:     "bare :PORT form is normalised to loopback",
+			flagAddr: "",
+			httpAddr: ":9090",
+			want:     "127.0.0.1:9090",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("HTTP_ADDR", tc.httpAddr)
+			got := resolveHealthcheckAddr(tc.flagAddr)
+			assert.Equal(t, tc.want, got)
+		})
 	}
 }
 

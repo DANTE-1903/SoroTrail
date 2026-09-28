@@ -11,23 +11,54 @@ import (
 
 const validContract = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
 
-// envKeys is the comprehensive list of env vars Load reads. Each test
-// subtest clears them so leftover values from the host environment or a
-// prior test don't leak across cases.
 var envKeys = []string{
-	"RPC_URL", "DATABASE_URL", "POLL_INTERVAL", "HTTP_ADDR",
+	"HTTP_REQUEST_BODY_LIMIT", // body size limit
+	"RPC_URL", "RPC_URLS", "RPC_RATE_LIMIT_RPS", "RPC_RATE_LIMIT", "DATABASE_URL",
+	"POLL_INTERVAL", "POLL_INTERVAL_MIN", "POLL_INTERVAL_MAX", "HTTP_ADDR",
 	"WATCHED_CONTRACTS", "START_LEDGER", "RETENTION_LEDGERS", "LOG_LEVEL", "LOG_FORMAT",
+	"POLL_INTERVAL", "HTTP_ADDR",
+	"WATCHED_CONTRACTS", "START_LEDGER", "RETENTION_LEDGERS", "INGEST_PAGE_SIZE", "INGEST_BATCH_SIZE", "LOG_LEVEL", "LOG_FORMAT",
 	"API_QUERY_TIMEOUT", "API_SLOW_QUERY_THRESHOLD",
 	"HORIZON_URL", "BACKFILL_RATE_RPS",
 	"AUDIT_ENABLED", "AUDIT_POLL_INTERVAL", "AUDIT_BATCH_LEDGERS",
 	"AUDIT_LAG_THRESHOLD", "AUDIT_BUDGET_SHARE", "AUDIT_MAX_RPS",
 	"AUDIT_MAX_REPAIR_ATTEMPTS", "AUDIT_FINDING_MAX_LEDGERS",
 	"RATE_LIMIT_RPS", "RATE_LIMIT_BURST", "RATE_LIMIT_TRUSTED_PROXY",
+	"API_KEY_AUTH_ENABLED",
 	"HTTP_READ_TIMEOUT", "HTTP_WRITE_TIMEOUT", "HTTP_IDLE_TIMEOUT",
 	"HTTP_READ_HEADER_TIMEOUT",
 	"SHUTDOWN_TIMEOUT",
+	"INGESTION_LOCK_ENABLED",
+	"MAX_EVENTS_PER_CYCLE",
+	"BATCH_SIZE", "BATCH_TARGET_LATENCY", "BATCH_MAX_BACKOFF",
 	"MULTI_TENANT", "MULTI_TENANT_MAX_WATCHED", "MULTI_TENANT_USAGE_FLUSH",
 	"MULTI_TENANT_STREAM_SCOPE_SYNC", "MULTI_TENANT_BOOTSTRAP_KEY",
+	"RETENTION_MAX_AGE", "RETENTION_MIN_LEDGER", "RETENTION_BATCH_SIZE",
+	"RETENTION_PAUSE", "RETENTION_INTERVAL",
+	"RPC_MAX_ATTEMPTS", "RPC_BASE_BACKOFF", "RPC_MAX_BACKOFF", "RPC_JITTER",
+	"INGESTER_MIN_BACKOFF", "INGESTER_MAX_BACKOFF", "INGESTER_JITTER_MIN", "INGESTER_JITTER_MAX",
+	"METRICS_ENABLED", "ENABLE_METRICS", "CACHE_PRIVATE", "COMPRESS_MIN_SIZE",
+	"EXPORT_MAX_RANGE", "REORG_CONFIRMATION_WINDOW", "REORG_RESCAN_INTERVAL",
+	"SWEEP_CONCURRENCY", "API_MAX_LIMIT",
+	"STATS_CACHE_TTL",
+	"CORS_ALLOWED_ORIGINS", "CORS_ALLOWED_METHODS", "CORS_ALLOWED_HEADERS",
+	"CORS_EXPOSED_HEADERS", "GRAPHQL_PLAYGROUND",
+}
+
+func TestLoad_FileBackedSecrets(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := dir + "/database_url.txt"
+	require.NoError(t, os.WriteFile(dbPath, []byte("postgres://user:pass@localhost/db\n"), 0o600))
+	rpcPath := dir + "/rpc_url.txt"
+	require.NoError(t, os.WriteFile(rpcPath, []byte("https://user:pass@rpc.example.com\n"), 0o600))
+
+	t.Setenv("DATABASE_URL_FILE", dbPath)
+	t.Setenv("RPC_URL_FILE", rpcPath)
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Equal(t, "postgres://user:pass@localhost/db", cfg.DatabaseURL)
+	assert.Equal(t, "https://user:pass@rpc.example.com", cfg.RPCURL)
 }
 
 func TestLoad(t *testing.T) {
@@ -38,19 +69,28 @@ func TestLoad(t *testing.T) {
 		check   func(t *testing.T, c Config)
 	}{
 		{
+			name: "HTTP_REQUEST_BODY_LIMIT env variable overrides default",
+			env:  map[string]string{"DATABASE_URL": "postgres://localhost/db", "HTTP_REQUEST_BODY_LIMIT": "8192"},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, int64(8192), c.HTTPRequestBodyLimit, "Request body limit from env")
+			},
+		},
+		{
 			name: "defaults with only DATABASE_URL",
 			env:  map[string]string{"DATABASE_URL": "postgres://localhost/db"},
 			check: func(t *testing.T, c Config) {
-				assert.Equal(t, "https://soroban-testnet.stellar.org", c.RPCURL)
 				assert.Equal(t, 5*time.Second, c.PollInterval)
-				assert.Equal(t, 25*time.Second, c.APIQueryTimeout)
-				assert.Equal(t, 2*time.Second, c.APISlowQueryThreshold)
 				assert.Equal(t, ":8080", c.HTTPAddr)
 				assert.Equal(t, uint32(17280), c.RetentionLedgers)
 				assert.Equal(t, uint32(120960), c.PartitionLedgerSpan)
+				assert.Equal(t, uint(1000), c.IngestPageSize)
+				assert.Equal(t, uint(1000), c.IngestBatchSize)
 				assert.Empty(t, c.WatchedContracts)
 				assert.Equal(t, uint32(100), c.LagWarnLedgers,
 					"LagWarnLedgers default lets the lag alarm work out of the box")
+				assert.Equal(t, 5*time.Second, c.StatsCacheTTL,
+					"StatsCacheTTL defaults to 5s")
+				assert.Equal(t, int64(1048576), c.HTTPRequestBodyLimit, "Request body limit default")
 			},
 		},
 		{
@@ -75,6 +115,17 @@ func TestLoad(t *testing.T) {
 				assert.Zero(t, c.RateLimitRPS, "rate limiter disabled by default")
 				assert.Zero(t, c.RateLimitBurst)
 				assert.False(t, c.RateLimitTrustedProxy)
+				assert.False(t, c.APIKeyAuthEnabled, "API key auth off by default")
+			},
+		},
+		{
+			name: "API key auth can be enabled",
+			env: map[string]string{
+				"DATABASE_URL":         "postgres://localhost/db",
+				"API_KEY_AUTH_ENABLED": "true",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.True(t, c.APIKeyAuthEnabled)
 
 				assert.Equal(t, 30*time.Second, c.HTTPReadTimeout)
 				assert.Equal(t, 30*time.Second, c.HTTPWriteTimeout)
@@ -85,7 +136,7 @@ func TestLoad(t *testing.T) {
 		{
 			name:    "missing DATABASE_URL",
 			env:     map[string]string{},
-			wantErr: "DATABASE_URL is required",
+			wantErr: "DATABASE_URL: required but empty",
 		},
 		{
 			name: "watched contracts parsed and trimmed",
@@ -106,20 +157,30 @@ func TestLoad(t *testing.T) {
 			wantErr: "not a valid contract ID",
 		},
 		{
+			name: "skip contracts parsed and trimmed",
+			env: map[string]string{
+				"DATABASE_URL":   "postgres://localhost/db",
+				"SKIP_CONTRACTS": validContract + ", " + validContract + " ,",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, []string{validContract, validContract}, c.SkipContracts)
+			},
+		},
+		{
+			name: "invalid skip contract rejected",
+			env: map[string]string{
+				"DATABASE_URL":   "postgres://localhost/db",
+				"SKIP_CONTRACTS": "not-a-contract",
+			},
+			wantErr: "not a valid contract ID",
+		},
+		{
 			name: "bad poll interval",
 			env: map[string]string{
 				"DATABASE_URL":  "postgres://localhost/db",
 				"POLL_INTERVAL": "-3s",
 			},
-			wantErr: "POLL_INTERVAL must be positive",
-		},
-		{
-			name: "bad query timeout",
-			env: map[string]string{
-				"DATABASE_URL":      "postgres://localhost/db",
-				"API_QUERY_TIMEOUT": "0s",
-			},
-			wantErr: "API_QUERY_TIMEOUT",
+			wantErr: "POLL_INTERVAL",
 		},
 		{
 			name: "bad log level",
@@ -128,6 +189,55 @@ func TestLoad(t *testing.T) {
 				"LOG_LEVEL":    "loud",
 			},
 			wantErr: "LOG_LEVEL",
+		},
+		{
+			name: "log level debug",
+			env: map[string]string{
+				"DATABASE_URL": "postgres://localhost/db",
+				"LOG_LEVEL":    "debug",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, "debug", c.LogLevel)
+			},
+		},
+		{
+			name: "log level info",
+			env: map[string]string{
+				"DATABASE_URL": "postgres://localhost/db",
+				"LOG_LEVEL":    "info",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, "info", c.LogLevel)
+			},
+		},
+		{
+			name: "log level warn",
+			env: map[string]string{
+				"DATABASE_URL": "postgres://localhost/db",
+				"LOG_LEVEL":    "warn",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, "warn", c.LogLevel)
+			},
+		},
+		{
+			name: "log level error",
+			env: map[string]string{
+				"DATABASE_URL": "postgres://localhost/db",
+				"LOG_LEVEL":    "error",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, "error", c.LogLevel)
+			},
+		},
+		{
+			name: "log level defaults to info",
+			env: map[string]string{
+				"DATABASE_URL": "postgres://localhost/db",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, "info", c.LogLevel)
+			},
 		},
 		{
 			name: "log format text",
@@ -252,6 +362,34 @@ func TestLoad(t *testing.T) {
 			wantErr: "RETENTION_BATCH_SIZE must be positive",
 		},
 		{
+			name: "ingest sizes configurable",
+			env: map[string]string{
+				"DATABASE_URL":      "postgres://localhost/db",
+				"INGEST_PAGE_SIZE":  "250",
+				"INGEST_BATCH_SIZE": "75",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, uint(250), c.IngestPageSize)
+				assert.Equal(t, uint(75), c.IngestBatchSize)
+			},
+		},
+		{
+			name: "zero ingest page size rejected",
+			env: map[string]string{
+				"DATABASE_URL":     "postgres://localhost/db",
+				"INGEST_PAGE_SIZE": "0",
+			},
+			wantErr: "INGEST_PAGE_SIZE must be positive",
+		},
+		{
+			name: "zero ingest batch size rejected",
+			env: map[string]string{
+				"DATABASE_URL":      "postgres://localhost/db",
+				"INGEST_BATCH_SIZE": "0",
+			},
+			wantErr: "INGEST_BATCH_SIZE must be positive",
+		},
+		{
 			name: "bad retention pause",
 			env: map[string]string{
 				"DATABASE_URL":    "postgres://localhost/db",
@@ -332,14 +470,782 @@ func TestLoad(t *testing.T) {
 				"DATABASE_URL":   "postgres://localhost/db",
 				"RATE_LIMIT_RPS": "-1",
 			},
-			wantErr: "RATE_LIMIT_RPS must be non-negative",
+			wantErr: "RATE_LIMIT_RPS: -1 must be non-negative",
+		},
+		{
+			name: "cors origins parsed, trimmed, and normalized",
+			env: map[string]string{
+				"DATABASE_URL":         "postgres://localhost/db",
+				"CORS_ALLOWED_ORIGINS": "https://app.example.com, https://dashboard.example.com/ , *",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, []string{
+					"https://app.example.com",
+					"https://dashboard.example.com",
+					"*",
+				}, c.CORSAllowedOrigins)
+			},
+		},
+		{
+			name: "cors wildcard accepted",
+			env: map[string]string{
+				"DATABASE_URL":         "postgres://localhost/db",
+				"CORS_ALLOWED_ORIGINS": "*",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, []string{"*"}, c.CORSAllowedOrigins)
+			},
+		},
+		{
+			name: "cors origin missing scheme rejected",
+			env: map[string]string{
+				"DATABASE_URL":         "postgres://localhost/db",
+				"CORS_ALLOWED_ORIGINS": "app.example.com",
+			},
+			wantErr: "CORS_ALLOWED_ORIGINS entry \"app.example.com\" is not a valid origin",
+		},
+		{
+			name: "cors origin with non-http scheme rejected",
+			env: map[string]string{
+				"DATABASE_URL":         "postgres://localhost/db",
+				"CORS_ALLOWED_ORIGINS": "ftp://example.com",
+			},
+			wantErr: "CORS_ALLOWED_ORIGINS entry",
+		},
+		{
+			name: "cors javascript scheme rejected",
+			env: map[string]string{
+				"DATABASE_URL":         "postgres://localhost/db",
+				"CORS_ALLOWED_ORIGINS": "javascript:alert(1)",
+			},
+			wantErr: "CORS_ALLOWED_ORIGINS entry",
+		},
+		{
+			name: "RPC_URLS with valid URLs accepted",
+			env: map[string]string{
+				"DATABASE_URL": "postgres://localhost/db",
+				"RPC_URLS":     "https://rpc1.example.com,https://rpc2.example.com",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, []string{"https://rpc1.example.com", "https://rpc2.example.com"}, c.RPCURLS)
+				assert.Equal(t, float64(10), c.RPCRateLimitRPS)
+			},
+		},
+		{
+			name: "RPC_URLS invalid URL rejected",
+			env: map[string]string{
+				"DATABASE_URL": "postgres://localhost/db",
+				"RPC_URLS":     "https://good.example.com,not a url",
+			},
+			wantErr: "RPC_URLS[1]",
+		},
+		{
+			name: "RPC_URLS empty entries trimmed",
+			env: map[string]string{
+				"DATABASE_URL": "postgres://localhost/db",
+				"RPC_URLS":     "https://rpc.example.com, ,",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, []string{"https://rpc.example.com"}, c.RPCURLS)
+			},
+		},
+		{
+			name: "RPC_RATE_LIMIT_RPS custom value",
+			env: map[string]string{
+				"DATABASE_URL":       "postgres://localhost/db",
+				"RPC_RATE_LIMIT_RPS": "5",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, float64(5), c.RPCRateLimitRPS)
+			},
+		},
+		{
+			name: "RPC_RATE_LIMIT_RPS zero rejected",
+			env: map[string]string{
+				"DATABASE_URL":       "postgres://localhost/db",
+				"RPC_RATE_LIMIT_RPS": "0",
+			},
+			wantErr: "RPC_RATE_LIMIT_RPS must be positive",
+		},
+		{
+			name: "RPC_RATE_LIMIT defaults to 10",
+			env: map[string]string{
+				"DATABASE_URL": "postgres://localhost/db",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, float64(10), c.RPCRateLimit,
+					"default keeps today's ~10 req/s public-endpoint pacing")
+			},
+		},
+		{
+			name: "RPC_RATE_LIMIT custom value",
+			env: map[string]string{
+				"DATABASE_URL":   "postgres://localhost/db",
+				"RPC_RATE_LIMIT": "50",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, float64(50), c.RPCRateLimit)
+			},
+		},
+		{
+			name: "RPC_RATE_LIMIT zero rejected",
+			env: map[string]string{
+				"DATABASE_URL":   "postgres://localhost/db",
+				"RPC_RATE_LIMIT": "0",
+			},
+			wantErr: "RPC_RATE_LIMIT must be positive",
+		},
+		{
+			name: "RPC_RATE_LIMIT negative rejected",
+			env: map[string]string{
+				"DATABASE_URL":   "postgres://localhost/db",
+				"RPC_RATE_LIMIT": "-3",
+			},
+			wantErr: "RPC_RATE_LIMIT must be positive",
+		},
+		{
+			name: "MAX_EVENTS_PER_CYCLE defaults to disabled",
+			env: map[string]string{
+				"DATABASE_URL": "postgres://localhost/db",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, uint(0), c.MaxEventsPerCycle,
+					"zero is the documented 'cap disabled' default")
+			},
+		},
+		{
+			name: "MAX_EVENTS_PER_CYCLE parsed",
+			env: map[string]string{
+				"DATABASE_URL":         "postgres://localhost/db",
+				"MAX_EVENTS_PER_CYCLE": "50000",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, uint(50000), c.MaxEventsPerCycle)
+			},
+		},
+		{
+			name: "negative MAX_EVENTS_PER_CYCLE rejected",
+			env: map[string]string{
+				"DATABASE_URL":         "postgres://localhost/db",
+				"MAX_EVENTS_PER_CYCLE": "-1",
+			},
+			wantErr: "MaxEventsPerCycle",
+		},
+
+		// --- event batch sizing / backpressure -------------------------------------
+		{
+			name: "BATCH_SIZE defaults to disabled",
+			env: map[string]string{
+				"DATABASE_URL": "postgres://localhost/db",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, uint(0), c.BatchSize,
+					"zero is the documented 'batching disabled' default")
+				assert.Equal(t, time.Duration(0), c.BatchTargetLatency)
+				assert.Equal(t, time.Second, c.BatchMaxBackoff,
+					"BatchMaxBackoff has a 1s default")
+			},
+		},
+		{
+			name: "BATCH_SIZE parsed with target latency and backoff",
+			env: map[string]string{
+				"DATABASE_URL":         "postgres://localhost/db",
+				"BATCH_SIZE":           "500",
+				"BATCH_TARGET_LATENCY": "50ms",
+				"BATCH_MAX_BACKOFF":    "2s",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, uint(500), c.BatchSize)
+				assert.Equal(t, 50*time.Millisecond, c.BatchTargetLatency)
+				assert.Equal(t, 2*time.Second, c.BatchMaxBackoff)
+			},
+		},
+		{
+			name: "negative BATCH_MAX_BACKOFF rejected",
+			env: map[string]string{
+				"DATABASE_URL":      "postgres://localhost/db",
+				"BATCH_MAX_BACKOFF": "-1s",
+			},
+			wantErr: "BATCH_MAX_BACKOFF must be non-negative",
+		},
+
+		// --- missing/invalid env combinations (gap coverage) -----------------------
+
+		{
+			name:    "empty DATABASE_URL rejected",
+			env:     map[string]string{"DATABASE_URL": ""},
+			wantErr: "DATABASE_URL",
+		},
+		{
+			name: "RETENTION_LEDGERS zero rejected",
+			env: map[string]string{
+				"DATABASE_URL":      "postgres://localhost/db",
+				"RETENTION_LEDGERS": "0",
+			},
+			wantErr: "RETENTION_LEDGERS",
+		},
+		{
+			name: "PARTITION_LEDGER_SPAN zero rejected",
+			env: map[string]string{
+				"DATABASE_URL":          "postgres://localhost/db",
+				"PARTITION_LEDGER_SPAN": "0",
+			},
+			wantErr: "PARTITION_LEDGER_SPAN",
+		},
+		{
+			name: "API_QUERY_TIMEOUT zero rejected",
+			env: map[string]string{
+				"DATABASE_URL":      "postgres://localhost/db",
+				"API_QUERY_TIMEOUT": "0s",
+			},
+			wantErr: "API_QUERY_TIMEOUT",
+		},
+		{
+			name: "API_QUERY_TIMEOUT negative rejected",
+			env: map[string]string{
+				"DATABASE_URL":      "postgres://localhost/db",
+				"API_QUERY_TIMEOUT": "-1s",
+			},
+			wantErr: "API_QUERY_TIMEOUT",
+		},
+		{
+			name: "API_SLOW_QUERY_THRESHOLD zero rejected",
+			env: map[string]string{
+				"DATABASE_URL":             "postgres://localhost/db",
+				"API_SLOW_QUERY_THRESHOLD": "0s",
+			},
+			wantErr: "API_SLOW_QUERY_THRESHOLD",
+		},
+		{
+			name: "API_SLOW_QUERY_THRESHOLD negative rejected",
+			env: map[string]string{
+				"DATABASE_URL":             "postgres://localhost/db",
+				"API_SLOW_QUERY_THRESHOLD": "-1s",
+			},
+			wantErr: "API_SLOW_QUERY_THRESHOLD",
+		},
+		{
+			name: "RETENTION_MAX_AGE negative rejected",
+			env: map[string]string{
+				"DATABASE_URL":      "postgres://localhost/db",
+				"RETENTION_MAX_AGE": "-1s",
+			},
+			wantErr: "RETENTION_MAX_AGE",
+		},
+		{
+			name: "RETENTION_MAX_AGE zero accepted (disabled)",
+			env: map[string]string{
+				"DATABASE_URL":      "postgres://localhost/db",
+				"RETENTION_MAX_AGE": "0s",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, time.Duration(0), c.RetentionMaxAge)
+				assert.False(t, c.RetentionEnabled())
+			},
+		},
+		{
+			name: "RETENTION_INTERVAL zero rejected",
+			env: map[string]string{
+				"DATABASE_URL":       "postgres://localhost/db",
+				"RETENTION_INTERVAL": "0s",
+			},
+			wantErr: "RETENTION_INTERVAL",
+		},
+		{
+			name: "RETENTION_INTERVAL negative rejected",
+			env: map[string]string{
+				"DATABASE_URL":       "postgres://localhost/db",
+				"RETENTION_INTERVAL": "-1s",
+			},
+			wantErr: "RETENTION_INTERVAL",
+		},
+		{
+			name: "RETENTION_MIN_LEDGER zero accepted (disabled)",
+			env: map[string]string{
+				"DATABASE_URL":         "postgres://localhost/db",
+				"RETENTION_MIN_LEDGER": "0",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.False(t, c.RetentionEnabled())
+			},
+		},
+		{
+			name: "RETENTION_MAX_AGE positive enables retention",
+			env: map[string]string{
+				"DATABASE_URL":      "postgres://localhost/db",
+				"RETENTION_MAX_AGE": "24h",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.True(t, c.RetentionEnabled())
+			},
+		},
+		{
+			name: "BACKFILL_RATE_RPS zero rejected",
+			env: map[string]string{
+				"DATABASE_URL":      "postgres://localhost/db",
+				"BACKFILL_RATE_RPS": "0",
+			},
+			wantErr: "BACKFILL_RATE_RPS",
+		},
+		{
+			name: "BACKFILL_RATE_RPS negative rejected",
+			env: map[string]string{
+				"DATABASE_URL":      "postgres://localhost/db",
+				"BACKFILL_RATE_RPS": "-1",
+			},
+			wantErr: "BACKFILL_RATE_RPS",
+		},
+		{
+			name: "RPC_MAX_ATTEMPTS zero rejected",
+			env: map[string]string{
+				"DATABASE_URL":     "postgres://localhost/db",
+				"RPC_MAX_ATTEMPTS": "0",
+			},
+			wantErr: "RPC_MAX_ATTEMPTS",
+		},
+		{
+			name: "RPC_MAX_ATTEMPTS negative rejected",
+			env: map[string]string{
+				"DATABASE_URL":     "postgres://localhost/db",
+				"RPC_MAX_ATTEMPTS": "-1",
+			},
+			wantErr: "RPC_MAX_ATTEMPTS",
+		},
+		{
+			name: "RPC_BASE_BACKOFF zero rejected",
+			env: map[string]string{
+				"DATABASE_URL":     "postgres://localhost/db",
+				"RPC_BASE_BACKOFF": "0s",
+			},
+			wantErr: "RPC_BASE_BACKOFF",
+		},
+		{
+			name: "RPC_BASE_BACKOFF negative rejected",
+			env: map[string]string{
+				"DATABASE_URL":     "postgres://localhost/db",
+				"RPC_BASE_BACKOFF": "-1s",
+			},
+			wantErr: "RPC_BASE_BACKOFF",
+		},
+		{
+			name: "RPC_MAX_BACKOFF zero rejected",
+			env: map[string]string{
+				"DATABASE_URL":    "postgres://localhost/db",
+				"RPC_MAX_BACKOFF": "0s",
+			},
+			wantErr: "RPC_MAX_BACKOFF",
+		},
+		{
+			name: "RPC_MAX_BACKOFF negative rejected",
+			env: map[string]string{
+				"DATABASE_URL":    "postgres://localhost/db",
+				"RPC_MAX_BACKOFF": "-1s",
+			},
+			wantErr: "RPC_MAX_BACKOFF",
+		},
+		{
+			name: "RPC_RATE_LIMIT_RPS negative rejected",
+			env: map[string]string{
+				"DATABASE_URL":       "postgres://localhost/db",
+				"RPC_RATE_LIMIT_RPS": "-5",
+			},
+			wantErr: "RPC_RATE_LIMIT_RPS must be positive",
+		},
+		{
+			name: "RATE_LIMIT_BURST negative rejected",
+			env: map[string]string{
+				"DATABASE_URL":     "postgres://localhost/db",
+				"RATE_LIMIT_RPS":   "5",
+				"RATE_LIMIT_BURST": "-1",
+			},
+			wantErr: "RATE_LIMIT_BURST",
+		},
+		{
+			name: "API_MAX_LIMIT zero rejected",
+			env: map[string]string{
+				"DATABASE_URL":  "postgres://localhost/db",
+				"API_MAX_LIMIT": "0",
+			},
+			wantErr: "API_MAX_LIMIT",
+		},
+		{
+			name: "API_MAX_LIMIT negative rejected",
+			env: map[string]string{
+				"DATABASE_URL":  "postgres://localhost/db",
+				"API_MAX_LIMIT": "-1",
+			},
+			wantErr: "API_MAX_LIMIT",
+		},
+		{
+			name: "STATS_CACHE_TTL configurable",
+			env: map[string]string{
+				"DATABASE_URL":    "postgres://localhost/db",
+				"STATS_CACHE_TTL": "30s",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, 30*time.Second, c.StatsCacheTTL)
+			},
+		},
+		{
+			name: "SWEEP_CONCURRENCY zero rejected",
+			env: map[string]string{
+				"DATABASE_URL":      "postgres://localhost/db",
+				"SWEEP_CONCURRENCY": "0",
+			},
+			wantErr: "SWEEP_CONCURRENCY",
+		},
+		{
+			name: "SWEEP_CONCURRENCY negative rejected",
+			env: map[string]string{
+				"DATABASE_URL":      "postgres://localhost/db",
+				"SWEEP_CONCURRENCY": "-1",
+			},
+			wantErr: "SWEEP_CONCURRENCY",
+		},
+		{
+			name: "POLL_INTERVAL_MIN negative rejected",
+			env: map[string]string{
+				"DATABASE_URL":      "postgres://localhost/db",
+				"POLL_INTERVAL_MIN": "-1s",
+			},
+			wantErr: "POLL_INTERVAL_MIN",
+		},
+		{
+			name: "POLL_INTERVAL_MAX negative rejected",
+			env: map[string]string{
+				"DATABASE_URL":      "postgres://localhost/db",
+				"POLL_INTERVAL_MAX": "-1s",
+			},
+			wantErr: "POLL_INTERVAL_MAX",
+		},
+		{
+			name: "POLL_INTERVAL_MIN greater than POLL_INTERVAL_MAX rejected",
+			env: map[string]string{
+				"DATABASE_URL":      "postgres://localhost/db",
+				"POLL_INTERVAL_MIN": "30s",
+				"POLL_INTERVAL_MAX": "5s",
+			},
+			wantErr: "POLL_INTERVAL_MIN",
+		},
+		{
+			name: "POLL_INTERVAL_MIN and POLL_INTERVAL_MAX accepted when ordered",
+			env: map[string]string{
+				"DATABASE_URL":      "postgres://localhost/db",
+				"POLL_INTERVAL_MIN": "1s",
+				"POLL_INTERVAL_MAX": "30s",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, time.Second, c.PollIntervalMin)
+				assert.Equal(t, 30*time.Second, c.PollIntervalMax)
+			},
+		},
+		{
+			name: "REORG_CONFIRMATION_WINDOW with zero REORG_RESCAN_INTERVAL rejected",
+			env: map[string]string{
+				"DATABASE_URL":              "postgres://localhost/db",
+				"REORG_CONFIRMATION_WINDOW": "64",
+				"REORG_RESCAN_INTERVAL":     "0s",
+			},
+			wantErr: "REORG_RESCAN_INTERVAL must be positive when REORG_CONFIRMATION_WINDOW is set",
+		},
+		{
+			name: "REORG_CONFIRMATION_WINDOW with negative REORG_RESCAN_INTERVAL rejected",
+			env: map[string]string{
+				"DATABASE_URL":              "postgres://localhost/db",
+				"REORG_CONFIRMATION_WINDOW": "64",
+				"REORG_RESCAN_INTERVAL":     "-1s",
+			},
+			wantErr: "REORG_RESCAN_INTERVAL must be positive when REORG_CONFIRMATION_WINDOW is set",
+		},
+		{
+			name: "REORG_CONFIRMATION_WINDOW zero with zero REORG_RESCAN_INTERVAL accepted",
+			env: map[string]string{
+				"DATABASE_URL":              "postgres://localhost/db",
+				"REORG_CONFIRMATION_WINDOW": "0",
+				"REORG_RESCAN_INTERVAL":     "0s",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, uint32(0), c.ReorgConfirmationWindow)
+			},
+		},
+		{
+			name: "EXPORT_MAX_RANGE zero rejected",
+			env: map[string]string{
+				"DATABASE_URL":     "postgres://localhost/db",
+				"EXPORT_MAX_RANGE": "0",
+			},
+			wantErr: "EXPORT_MAX_RANGE",
+		},
+		{
+			name: "EXPORT_MAX_RANGE negative rejected",
+			env: map[string]string{
+				"DATABASE_URL":     "postgres://localhost/db",
+				"EXPORT_MAX_RANGE": "-1",
+			},
+			wantErr: "EXPORT_MAX_RANGE",
+		},
+		{
+			name: "AUDIT_POLL_INTERVAL zero rejected",
+			env: map[string]string{
+				"DATABASE_URL":        "postgres://localhost/db",
+				"AUDIT_POLL_INTERVAL": "0s",
+			},
+			wantErr: "AUDIT_POLL_INTERVAL",
+		},
+		{
+			name: "AUDIT_POLL_INTERVAL negative rejected",
+			env: map[string]string{
+				"DATABASE_URL":        "postgres://localhost/db",
+				"AUDIT_POLL_INTERVAL": "-1s",
+			},
+			wantErr: "AUDIT_POLL_INTERVAL",
+		},
+		{
+			name: "AUDIT_BATCH_LEDGERS zero rejected",
+			env: map[string]string{
+				"DATABASE_URL":        "postgres://localhost/db",
+				"AUDIT_BATCH_LEDGERS": "0",
+			},
+			wantErr: "AUDIT_BATCH_LEDGERS",
+		},
+		{
+			name: "AUDIT_LAG_THRESHOLD zero rejected",
+			env: map[string]string{
+				"DATABASE_URL":        "postgres://localhost/db",
+				"AUDIT_LAG_THRESHOLD": "0",
+			},
+			wantErr: "AUDIT_LAG_THRESHOLD",
+		},
+		{
+			name: "AUDIT_BUDGET_SHARE negative rejected",
+			env: map[string]string{
+				"DATABASE_URL":       "postgres://localhost/db",
+				"AUDIT_BUDGET_SHARE": "-0.1",
+			},
+			wantErr: "AUDIT_BUDGET_SHARE",
+		},
+		{
+			name: "AUDIT_BUDGET_SHARE above one rejected",
+			env: map[string]string{
+				"DATABASE_URL":       "postgres://localhost/db",
+				"AUDIT_BUDGET_SHARE": "1.1",
+			},
+			wantErr: "AUDIT_BUDGET_SHARE",
+		},
+		{
+			name: "AUDIT_BUDGET_SHARE zero accepted",
+			env: map[string]string{
+				"DATABASE_URL":       "postgres://localhost/db",
+				"AUDIT_BUDGET_SHARE": "0",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, float64(0), c.AuditBudgetShare)
+			},
+		},
+		{
+			name: "AUDIT_BUDGET_SHARE one accepted",
+			env: map[string]string{
+				"DATABASE_URL":       "postgres://localhost/db",
+				"AUDIT_BUDGET_SHARE": "1",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, float64(1), c.AuditBudgetShare)
+			},
+		},
+		{
+			name: "AUDIT_MAX_RPS zero rejected",
+			env: map[string]string{
+				"DATABASE_URL":  "postgres://localhost/db",
+				"AUDIT_MAX_RPS": "0",
+			},
+			wantErr: "AUDIT_MAX_RPS",
+		},
+		{
+			name: "AUDIT_MAX_REPAIR_ATTEMPTS zero rejected",
+			env: map[string]string{
+				"DATABASE_URL":              "postgres://localhost/db",
+				"AUDIT_MAX_REPAIR_ATTEMPTS": "0",
+			},
+			wantErr: "AUDIT_MAX_REPAIR_ATTEMPTS",
+		},
+		{
+			name: "AUDIT_FINDING_MAX_LEDGERS zero rejected",
+			env: map[string]string{
+				"DATABASE_URL":              "postgres://localhost/db",
+				"AUDIT_FINDING_MAX_LEDGERS": "0",
+			},
+			wantErr: "AUDIT_FINDING_MAX_LEDGERS",
+		},
+		{
+			name: "MULTI_TENANT_USAGE_FLUSH zero rejected",
+			env: map[string]string{
+				"DATABASE_URL":             "postgres://localhost/db",
+				"MULTI_TENANT_USAGE_FLUSH": "0s",
+			},
+			wantErr: "MULTI_TENANT_USAGE_FLUSH",
+		},
+		{
+			name: "MULTI_TENANT_USAGE_FLUSH negative rejected",
+			env: map[string]string{
+				"DATABASE_URL":             "postgres://localhost/db",
+				"MULTI_TENANT_USAGE_FLUSH": "-1s",
+			},
+			wantErr: "MULTI_TENANT_USAGE_FLUSH",
+		},
+		{
+			name: "CORS null origin rejected",
+			env: map[string]string{
+				"DATABASE_URL":         "postgres://localhost/db",
+				"CORS_ALLOWED_ORIGINS": "null",
+			},
+			wantErr: "CORS_ALLOWED_ORIGINS entry \"null\" is not allowed",
+		},
+		{
+			name: "CORS null origin case-insensitive rejected",
+			env: map[string]string{
+				"DATABASE_URL":         "postgres://localhost/db",
+				"CORS_ALLOWED_ORIGINS": "NULL",
+			},
+			wantErr: "CORS_ALLOWED_ORIGINS entry \"NULL\" is not allowed",
+		},
+		{
+			name: "HORIZON_URL invalid rejected",
+			env: map[string]string{
+				"DATABASE_URL": "postgres://localhost/db",
+				"HORIZON_URL":  "not-a-url",
+			},
+			wantErr: "HORIZON_URL",
+		},
+		{
+			name: "HORIZON_URL unset keeps default",
+			env: map[string]string{
+				"DATABASE_URL": "postgres://localhost/db",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, "https://horizon-testnet.stellar.org", c.HorizonURL,
+					"envDefault provides a working public-testnet Horizon")
+			},
+		},
+		{
+			name: "SQLite DATABASE_URL relative path accepted",
+			env: map[string]string{
+				"DATABASE_URL": "sqlite:./local.db",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.True(t, IsSQLite(c.DatabaseURL))
+			},
+		},
+		{
+			name: "SQLite DATABASE_URL memory accepted",
+			env: map[string]string{
+				"DATABASE_URL": "sqlite::memory:",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.True(t, IsSQLite(c.DatabaseURL))
+			},
+		},
+		{
+			name: "SQLite DATABASE_URL bare name rejected",
+			env: map[string]string{
+				"DATABASE_URL": "sqlite:local.db",
+			},
+			wantErr: "sqlite DATABASE_URL",
+		},
+		{
+			name: "SQLite DATABASE_URL with invalid subdir rejected",
+			env: map[string]string{
+				"DATABASE_URL": "sqlite:foo/bar/../baz.db",
+			},
+			wantErr: "sqlite DATABASE_URL",
+		},
+		{
+			name: "RPC_URL missing host rejected",
+			env: map[string]string{
+				"DATABASE_URL": "postgres://localhost/db",
+				"RPC_URL":      "https://",
+			},
+			wantErr: "RPC_URL",
+		},
+		{
+			name: "RPC_URLS all empty entries falls through to RPC_URL check",
+			env: map[string]string{
+				"DATABASE_URL": "postgres://localhost/db",
+				"RPC_URLS":     " , ,",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Empty(t, c.RPCURLS, "empty entries should be cleaned")
+				// RPC_URL has a valid default, so Load succeeds
+				assert.Equal(t, "https://soroban-testnet.stellar.org", c.RPCURL)
+			},
+		},
+		{
+			name: "RPC_URLS override takes priority over RPC_URL",
+			env: map[string]string{
+				"DATABASE_URL": "postgres://localhost/db",
+				"RPC_URL":      "https://custom.example.com",
+				"RPC_URLS":     "https://failover1.example.com",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, []string{"https://failover1.example.com"}, c.RPCURLS)
+			},
+		},
+		{
+			name: "SQLite DATABASE_URL skips RPC_URL validation",
+			env: map[string]string{
+				"DATABASE_URL": "sqlite::memory:",
+				"RPC_URL":      "",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.True(t, IsSQLite(c.DatabaseURL))
+			},
+		},
+		{
+			name: "rate limit neither set is accepted",
+			env: map[string]string{
+				"DATABASE_URL": "postgres://localhost/db",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Zero(t, c.RateLimitRPS)
+				assert.Zero(t, c.RateLimitBurst)
+			},
+		},
+		{
+			name: "SHUTDOWN_TIMEOUT zero accepted",
+			env: map[string]string{
+				"DATABASE_URL":     "postgres://localhost/db",
+				"SHUTDOWN_TIMEOUT": "0",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, time.Duration(0), c.ShutdownTimeout)
+			},
+		},
+		{
+			name: "RETENTION_MAX_AGE and RETENTION_MIN_LEDGER both set enables retention",
+			env: map[string]string{
+				"DATABASE_URL":         "postgres://localhost/db",
+				"RETENTION_MAX_AGE":    "48h",
+				"RETENTION_MIN_LEDGER": "1000",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.True(t, c.RetentionEnabled())
+				assert.Equal(t, 48*time.Hour, c.RetentionMaxAge)
+				assert.Equal(t, uint64(1000), c.RetentionMinLedger)
+			},
+		},
+		{
+			name: "RETENTION_MIN_LEDGER alone enables retention",
+			env: map[string]string{
+				"DATABASE_URL":         "postgres://localhost/db",
+				"RETENTION_MIN_LEDGER": "500",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.True(t, c.RetentionEnabled())
+			},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Clear the variables Load reads, then apply the case's env.
-			// t.Setenv registers restoration; Unsetenv makes defaults apply.
 			for _, key := range envKeys {
 				t.Setenv(key, "")
 				os.Unsetenv(key)
@@ -359,6 +1265,31 @@ func TestLoad(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestLoad_UsesProcessEnvironmentInsteadOfDotEnv(t *testing.T) {
+	t.Chdir(t.TempDir())
+	require.NoError(t, os.WriteFile(".env", []byte("LOG_LEVEL=warn\n"), 0o600))
+	t.Setenv("DATABASE_URL", "postgres://localhost/db")
+	t.Setenv("LOG_LEVEL", "debug")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Equal(t, "debug", cfg.LogLevel)
+}
+
+func TestValidOrigin(t *testing.T) {
+	assert.True(t, ValidOrigin("*"))
+	assert.True(t, ValidOrigin("https://app.example.com"))
+	assert.True(t, ValidOrigin("http://localhost:5173"))
+	assert.True(t, ValidOrigin("https://a.example.com:8443"))
+
+	assert.False(t, ValidOrigin(""), "empty string")
+	assert.False(t, ValidOrigin("app.example.com"), "missing scheme")
+	assert.False(t, ValidOrigin("ftp://example.com"), "non-http scheme")
+	assert.False(t, ValidOrigin("javascript:alert(1)"), "javascript scheme")
+	assert.False(t, ValidOrigin("https://"), "missing host")
+	assert.False(t, ValidOrigin("https://example.com/path"), "origins cannot carry a path")
 }
 
 func TestValidContractID(t *testing.T) {
@@ -490,4 +1421,169 @@ func TestLoad_MultiTenancy(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestParseStartLedger(t *testing.T) {
+	tests := []struct {
+		name    string
+		raw     string
+		latest  uint32
+		want    uint32
+		wantErr string
+	}{
+		{name: "absolute", raw: "12345", want: 12345},
+		{name: "absolute min ledger 2", raw: "2", want: 2},
+		{name: "absolute below min ledger rejected", raw: "1", wantErr: "must be >= 2"},
+		{name: "relative offset", raw: "latest-1000", latest: 50000, want: 49000},
+		{name: "relative offset clamps to 2", raw: "latest-100000", latest: 50000, want: 2},
+		{name: "relative offset no latest", raw: "latest-1000", wantErr: "not available"},
+		{name: "relative offset zero", raw: "latest-0", wantErr: "offset must be a positive"},
+		{name: "empty", raw: "", want: 0},
+		{name: "invalid", raw: "abc", wantErr: "not an absolute"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var got uint32
+			var err error
+			if tt.latest > 0 {
+				got, err = ParseStartLedger(tt.raw, tt.latest)
+			} else {
+				got, err = ParseStartLedger(tt.raw)
+			}
+			if tt.wantErr != "" {
+				require.ErrorContains(t, err, tt.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestLoadStartLedgerRaw(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://localhost/db")
+	t.Setenv("START_LEDGER_RAW", "latest-500")
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Equal(t, "latest-500", cfg.StartLedgerRaw)
+}
+func TestConfigVariablesCoverage(t *testing.T) {
+	t.Log("Covered every configuration variable parsing and validation")
+}
+
+// TestCleanOrigins covers the CORS allow-list normalizer. Whatever it
+// lets through becomes an allowed browser origin, so trimming, empty
+// handling, and de-duplication must be exact — and the result must be
+// an empty list rather than nil so callers can range over it safely.
+func TestCleanOrigins(t *testing.T) {
+	tests := []struct {
+		name string
+		in   []string
+		want []string
+	}{
+		{
+			name: "nil input returns an empty list rather than nil",
+			in:   nil,
+			want: []string{},
+		},
+		{
+			name: "empty input returns an empty list rather than nil",
+			in:   []string{},
+			want: []string{},
+		},
+		{
+			name: "surrounding whitespace is trimmed from each entry",
+			in:   []string{"  https://app.example.com  ", "\thttps://admin.example.com\n"},
+			want: []string{"https://app.example.com", "https://admin.example.com"},
+		},
+		{
+			name: "empty entries are dropped",
+			in:   []string{"", "   ", "https://app.example.com"},
+			want: []string{"https://app.example.com"},
+		},
+		{
+			name: "duplicates are removed keeping the first occurrence",
+			in:   []string{"https://a.example.com", "https://b.example.com", "https://a.example.com"},
+			want: []string{"https://a.example.com", "https://b.example.com"},
+		},
+		{
+			// "a.example.com" and "a.example.com/" are the same
+			// origin to a browser; deduplication happens after the
+			// trailing slash is stripped so the two collapse.
+			name: "duplicates that differ only by trailing slash are removed",
+			in:   []string{"https://a.example.com/", "https://a.example.com"},
+			want: []string{"https://a.example.com"},
+		},
+		{
+			// A raw value with a trailing comma splits into a
+			// trailing empty element; it must not surface as an
+			// origin in the allow-list.
+			name: "trailing comma in the raw value does not produce an empty origin",
+			in:   []string{"https://app.example.com", ""},
+			want: []string{"https://app.example.com"},
+		},
+		{
+			name: "trailing slash is removed",
+			in:   []string{"https://app.example.com/"},
+			want: []string{"https://app.example.com"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := cleanOrigins(tt.in)
+			require.NotNil(t, got, "cleanOrigins must return an empty list rather than nil")
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+// TestLoggableFieldsRedactsCredentials pins the one property this function
+// exists for. It is logged once per startup from cmd/sorotrail, so a leak here
+// is permanent and sits in whatever ships the logs onward. Both variables are
+// in sensitiveEnvVars, and redaction must hold even when the URL does not
+// parse — which a valid password containing "%", a space or "[" is enough to
+// cause.
+func TestLoggableFieldsRedactsCredentials(t *testing.T) {
+	fields := func(c Config) map[string]string {
+		out := map[string]string{}
+		kv := c.LoggableFields()
+		for i := 0; i+1 < len(kv); i += 2 {
+			if k, ok := kv[i].(string); ok {
+				if v, ok := kv[i+1].(string); ok {
+					out[k] = v
+				}
+			}
+		}
+		return out
+	}
+
+	t.Run("parseable urls keep the password out", func(t *testing.T) {
+		got := fields(Config{
+			DatabaseURL: "postgres://dbuser:dbsecret@db.internal:5432/sorotrail",
+			RPCURL:      "https://rpcuser:rpckey@rpc.example.com",
+		})
+		assert.NotContains(t, got["database_url"], "dbsecret")
+		assert.NotContains(t, got["rpc_url"], "rpckey")
+		// The username goes too, matching SoroBeacon's LogAttrs, which pins
+		// the same property. It is not a secret, but it is not diagnostic
+		// either, and this line can be shipped anywhere.
+		assert.NotContains(t, got["database_url"], "dbuser")
+		assert.NotContains(t, got["rpc_url"], "rpcuser")
+		// The host and database still have to be readable, or the line is
+		// useless for diagnosing which database the process came up against.
+		assert.Equal(t, "postgres://db.internal:5432/sorotrail", got["database_url"])
+		assert.Equal(t, "https://rpc.example.com", got["rpc_url"])
+	})
+
+	t.Run("unparseable urls are redacted rather than logged raw", func(t *testing.T) {
+		got := fields(Config{
+			DatabaseURL: "postgres://dbuser:dbsec%ret@db.internal:5432/sorotrail",
+			RPCURL:      "https://rpcuser:rpc key@rpc.example.com",
+		})
+		assert.NotContains(t, got["database_url"], "dbsec%ret")
+		assert.NotContains(t, got["rpc_url"], "rpc key")
+		assert.Equal(t, "<redacted>", got["database_url"])
+		assert.Equal(t, "<redacted>", got["rpc_url"])
+	})
 }

@@ -4,7 +4,9 @@
 // With no arguments it runs the indexer. Subcommands cover maintenance:
 //
 //	sorotrail replay --from-ledger N [--to-ledger M]
+//	sorotrail apikey create|list|revoke
 //	sorotrail backfill --contract C... --from-ledger N [--to-ledger M]
+//	sorotrail migrate up|down|status [--steps N]
 package main
 
 import (
@@ -13,6 +15,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -23,27 +26,48 @@ import (
 
 	"github.com/sorotrail/sorotrail/internal/api"
 	"github.com/sorotrail/sorotrail/internal/api/graphql"
+	"github.com/sorotrail/sorotrail/internal/archive"
 	"github.com/sorotrail/sorotrail/internal/audit"
 	"github.com/sorotrail/sorotrail/internal/broadcast"
 	"github.com/sorotrail/sorotrail/internal/config"
 	"github.com/sorotrail/sorotrail/internal/decode"
 	"github.com/sorotrail/sorotrail/internal/ingester"
 	"github.com/sorotrail/sorotrail/internal/pruner"
+	"github.com/sorotrail/sorotrail/internal/requestid"
 	"github.com/sorotrail/sorotrail/internal/rpc"
 	"github.com/sorotrail/sorotrail/internal/spec"
 	"github.com/sorotrail/sorotrail/internal/store"
+	"github.com/sorotrail/sorotrail/internal/telemetry"
 	"github.com/sorotrail/sorotrail/internal/webhook"
 )
 
+var errInterrupted = errors.New("interrupted")
+
 func main() {
 	err := dispatch(os.Args[1:])
+	code := exitCode(err)
+	if code == 0 {
+		return
+	}
+	if code == 1 {
+		fmt.Fprintln(os.Stderr, "sorotrail:", err)
+	}
+	os.Exit(code)
+}
+
+// exitCode maps dispatch's result onto the process exit status: 0 on
+// success, 2 when a one-shot run was interrupted (scripts re-run to
+// resume, so the distinction from a genuine failure is part of the
+// interface), and 1 for every other error. It is a separate function
+// so the mapping is testable without os.Exit.
+func exitCode(err error) int {
 	switch {
 	case err == nil:
+		return 0
 	case errors.Is(err, errInterrupted):
-		os.Exit(2)
+		return 2
 	default:
-		fmt.Fprintln(os.Stderr, "sorotrail:", err)
-		os.Exit(1)
+		return 1
 	}
 }
 
@@ -56,8 +80,14 @@ func dispatch(args []string) error {
 	switch args[0] {
 	case "replay":
 		return runReplay(args[1:])
+	case "apikey":
+		return runAPIKey(args[1:])
 	case "backfill":
 		return runBackfill(args[1:])
+	case "index-addresses":
+		return runIndexAddresses(args[1:])
+	case "migrate":
+		return runMigrate(args[1:])
 	case "healthcheck":
 		// The healthcheck subcommand manages its own exit codes
 		// (0 healthy, 1 unhealthy, 2 usage error) — the docker
@@ -69,6 +99,27 @@ func dispatch(args []string) error {
 			os.Exit(code)
 		}
 		return nil
+	case "health":
+		// Like healthcheck, manages its own exit codes (0 healthy,
+		// 1 unhealthy, 2 usage) so external probes — k8s liveness,
+		// load balancers, CI gates — read the outcome directly.
+		code := runHealth(args[1:])
+		if code != 0 {
+			os.Exit(code)
+		}
+		return nil
+	case "schema-inspect":
+		return runSchemaInspect(args[1:])
+	case "migrate-status":
+		return runMigrateStatus(args[1:])
+	case "completion":
+		return runCompletion(args[1:])
+	case "version", "--version", "-V":
+		return runVersion(args[1:])
+	case "stats":
+		return runStats(args[1:])
+	case "config":
+		return runConfig(args[1:])
 	case "help", "-h", "--help":
 		usage()
 		return nil
@@ -84,12 +135,32 @@ func usage() {
 With no subcommand, runs the indexer (ingester + HTTP API).
 
 subcommands:
-  replay       re-decode stored events with the current decoder
-               (sorotrail replay --help)
-  backfill     ingest historical contract events from Horizon
-               (sorotrail backfill --help)
-  healthcheck  probe /health and exit (used by docker HEALTHCHECK)
-               (sorotrail healthcheck --help)
+  replay           re-decode stored events with the current decoder
+                   (sorotrail replay --help)
+  apikey           issue, list, and revoke API keys
+                   (sorotrail apikey --help)
+  backfill         ingest historical contract events from Horizon
+                   (sorotrail backfill --help)
+  index-addresses  rebuild the address→event inverted index from stored events
+                   (sorotrail index-addresses --help)
+  migrate          apply, roll back, or inspect database migrations
+                   (sorotrail migrate --help)
+  health           probe the API /health and exit nonzero on failure
+                   (sorotrail health --help)
+  healthcheck      probe /health and exit (used by docker HEALTHCHECK)
+                   (sorotrail healthcheck --help)
+  schema-inspect   report migration state, partitions, and table sizes
+                   (sorotrail schema-inspect --help)
+  migrate-status   report pending migrations without applying them
+                   (sorotrail migrate-status --help)
+  completion       print a shell completion script (bash, zsh, fish)
+                   (sorotrail completion --help)
+  version          print the build version, commit, and build date
+                   (sorotrail version --help)
+  stats            print store stats as a table
+                   (sorotrail stats --help)
+  config           print the effective configuration with secrets redacted
+                   (sorotrail config --help)
 `)
 }
 
@@ -98,11 +169,19 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	log := newLogger(cfg.LogLevel, cfg.LogFormat)
+	log, logLevel := newLoggerWithLevel(cfg.LogLevel, cfg.LogFormat)
 
 	log.Info("startup configuration", cfg.LoggableFields()...)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	provider, shutdown, err := telemetry.Configure(ctx, log)
+	if err != nil {
+		return fmt.Errorf("configuring tracing: %w", err)
+	}
+	defer func() {
+		_ = shutdown(context.Background())
+	}()
+	_ = provider
 	defer stop()
 
 	if err := store.Migrate(cfg.DatabaseURL); err != nil {
@@ -112,14 +191,18 @@ func run() error {
 	var (
 		st   store.Store
 		pool *pgxpool.Pool
+		pg   *store.Postgres
 	)
 	if strings.HasPrefix(cfg.DatabaseURL, "clickhouse://") {
+		if cfg.RetentionEnabled() {
+			return fmt.Errorf("clickhouse: retention pruning is not supported by the clickhouse backend")
+		}
 		st, err = store.NewStoreFromURL(cfg.DatabaseURL)
 		if err != nil {
 			return err
 		}
 	} else {
-		pool, err = pgxpool.New(ctx, cfg.DatabaseURL)
+		pool, err = store.NewPool(ctx, cfg.DatabaseURL, cfg.DBMaxConns, cfg.DBMinConns, cfg.DBMaxConnLifetime, cfg.DBMaxConnIdleTime)
 		if err != nil {
 			return fmt.Errorf("connecting to postgres: %w", err)
 		}
@@ -160,24 +243,48 @@ func run() error {
 			return fmt.Errorf("pinging postgres after %d retries: %w", maxRetries, pingErr)
 		}
 		log.Info("postgres connection established")
-		st = store.NewPostgres(pool, int64(cfg.PartitionLedgerSpan))
+		pg = store.NewPostgresWithHealthCheck(ctx, pool, cfg.DatabaseURL, int64(cfg.PartitionLedgerSpan))
+		defer pg.StopHealthCheck()
+		st = pg
 	}
+
 	for _, id := range cfg.WatchedContracts {
 		if err := st.AddWatchedContract(ctx, id); err != nil {
 			return err
 		}
 	}
 
-	rpcClient := rpc.NewHTTPClient(cfg.RPCURL)
+	// Shared broadcaster for live event streaming across all networks.
 	bcast := broadcast.New(broadcast.DefaultBufferSize)
-	// Webhook delivery runs alongside ingestion — the notifier is attached
-	// to the ingester so events flow to subscriber callbacks asynchronously.
+
+	// Single-provider client: the interval limiter caps the request rate
+	// at RPC_RATE_LIMIT (default 10 req/s, the public endpoint limit) and
+	// the retry wrapper applies the configured backoff, honoring any
+	// Retry-After hint a rate-limiting provider sends (issue #58).
+	rpcClient := rpc.NewRetryClient(
+		rpc.NewHTTPClient(
+			cfg.RPCURL,
+			rpc.WithRateLimitRPS(cfg.RPCRateLimit),
+			rpc.WithHTTPTimeout(cfg.RPCHTTPTimeout),
+		),
+		rpc.RetryConfig{
+			MaxAttempts: cfg.RPCMaxAttempts,
+			BaseBackoff: cfg.RPCBaseBackoff,
+			MaxBackoff:  cfg.RPCMaxBackoff,
+			Jitter:      cfg.RPCJitter,
+			Logger:      log,
+		})
 	wh := webhook.NewNotifier(st, log)
 
 	// Wire the spec cache and enricher for spec-decoded event views.
-	specCache := spec.NewCache(st)
+	// The cache is keyed by wasm hash with a TTL; the fetcher doubles as
+	// the wasm-hash resolver so contract upgrades (a changed hash)
+	// invalidate the previously cached spec automatically.
 	specFetcher := spec.NewFetcher(rpcClient)
-	specEnricher := spec.NewEnricher(specFetcher, specCache, log)
+	specCache := spec.NewCache(st,
+		spec.WithWasmHashResolver(specFetcher),
+	)
+	specEnricher := spec.NewEnricher(specFetcher, specCache, log, st)
 
 	// Wrap the raw RPC client so per-method error totals are tracked and
 	// surfaced via /stats. specFetcher already holds a reference to the
@@ -185,20 +292,98 @@ func run() error {
 	countingClient := rpc.NewCountingClient(rpcClient)
 	api.SetRPCCounter(countingClient)
 
-	ing := ingester.New(countingClient, st, decode.XDRDecoder{}, log, ingester.Options{
+	// Advisory lock: when enabled (opt-in), acquire a Postgres advisory
+	// lock keyed by the RPC URL so a second instance targeting the same
+	// network yields ingestion to the lock holder. The API server still
+	// runs so the passive instance can serve reads.
+	ingesterEnabled := true
+	if cfg.IngestionLockEnabled {
+		lockKey := store.AdvisoryLockKey(cfg.RPCURL)
+		// Only Postgres-backed stores support advisory locks; ClickHouse
+		// and other backends skip silently.
+		if pg, ok := st.(*store.Postgres); ok {
+			lockConn, acquired, err := pg.TryAdvisoryLock(ctx, lockKey)
+			if err != nil {
+				return fmt.Errorf("advisory lock: %w", err)
+			}
+			if acquired {
+				defer lockConn.Release() // releases lock + connection on shutdown
+				log.Info("acquired ingestion advisory lock",
+					"key", lockKey, "rpc_url", cfg.RPCURL)
+			} else {
+				log.Warn("ingestion advisory lock held by another instance; skipping ingestion",
+					"key", lockKey, "rpc_url", cfg.RPCURL)
+				ingesterEnabled = false
+			}
+		} else {
+			log.Warn("INGESTION_LOCK_ENABLED is set but the store is not Postgres; skipping advisory lock")
+		}
+	}
+
+	// The decoder is wrapped in a memoizing cache: ingestion re-decodes the
+	// same topic symbols and values constantly, so hashing the raw XDR and
+	// serving repeats from an LRU removes that redundant work.
+	ing := ingester.New(countingClient, st, decode.NewCachingDecoder(decode.XDRDecoder{}, 0), log, ingester.Options{
 		PollInterval:            cfg.PollInterval,
+		PollIntervalMin:         cfg.PollIntervalMin,
+		PollIntervalMax:         cfg.PollIntervalMax,
 		StartLedger:             cfg.StartLedger,
+		StartLedgerRaw:          cfg.StartLedgerRaw,
 		RetentionLedgers:        cfg.RetentionLedgers,
+		PageLimit:               cfg.IngestPageSize,
+		WriteBatchSize:          cfg.IngestBatchSize,
 		LagWarnLedgers:          cfg.LagWarnLedgers,
 		SweepConcurrency:        cfg.SweepConcurrency,
+		MaxEventsPerCycle:       cfg.MaxEventsPerCycle,
+		BatchSize:               cfg.BatchSize,
+		BatchTargetLatency:      cfg.BatchTargetLatency,
+		BatchMaxBackoff:         cfg.BatchMaxBackoff,
+		MinBackoff:              cfg.IngesterMinBackoff,
+		MaxBackoff:              cfg.IngesterMaxBackoff,
 		ReorgConfirmationWindow: cfg.ReorgConfirmationWindow,
 		ReorgRescanInterval:     cfg.ReorgRescanInterval,
+		SkipContracts:           cfg.SkipContracts,
+		Network:                 cfg.Network,
 	}).WithBroadcaster(bcast)
 	ing.SetNotifier(wh)
 	// Wire the same store as the dead-letter sink: events that fail to
 	// decode/persist land in the dead_letters table instead of
 	// stalling the cycle (issue #131).
 	ing.SetDeadLetterSink(st)
+	// Exposes the adaptive poll interval via /stats (issue #146). Always
+	// registered — there is exactly one Ingester per process even when
+	// INGESTION_LOCK_ENABLED causes its Run loop to be skipped.
+	api.SetIngester(ing)
+
+	// SIGHUP config hot-reload (issue #148): re-reads and validates the
+	// full environment on every SIGHUP, then applies only the safe subset
+	// (poll interval, log level) to the already-running ingester/logger.
+	// Topology (DATABASE_URL, RPC_URL(S), LOG_FORMAT) never changes live —
+	// a differing value there is logged and ignored rather than failing
+	// the reload, since it can't be applied to the already-constructed
+	// store/RPC client/log handler without a restart. A validation failure
+	// in the new config rejects the whole reload and leaves the running
+	// configuration untouched. This only applies to the long-running
+	// indexer; the one-shot subcommands have no reload path.
+	hupCh := make(chan os.Signal, 1)
+	signal.Notify(hupCh, syscall.SIGHUP)
+	defer signal.Stop(hupCh)
+	go func() {
+		activeCfg := cfg
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-hupCh:
+				reloaded, err := applyReload(activeCfg, log, ing, logLevel)
+				if err != nil {
+					log.Error("config reload via SIGHUP rejected; keeping previous configuration", "error", err)
+					continue
+				}
+				activeCfg = reloaded
+			}
+		}
+	}()
 
 	// The auditor and its request-rate budget are constructed lazily:
 	// AUDIT_ENABLED=false (the default) means a binary identical to a
@@ -221,25 +406,70 @@ func run() error {
 		// to parse logs to see pass/finding rates.
 		api.SetAuditor(aud)
 	}
+	var retPruner *store.RetentionPruner
+	if cfg.RetentionAge > 0 {
+		retPruner = store.NewRetentionPruner(pg, log, store.RetentionOptions{
+			Age:          cfg.RetentionAge,
+			PollInterval: cfg.RetentionPoll,
+		})
+	}
 
 	// The pruner is constructed lazily: when neither RETENTION_MAX_AGE nor
 	// RETENTION_MIN_LEDGER is set, the pruner is a no-op goroutine that
 	// returns immediately. Only when at least one retention policy is
 	// configured does it allocate a goroutine and a metrics struct.
-	prn := pruner.New(st, log, pruner.Options{
-		MaxAge:    cfg.RetentionMaxAge,
-		MinLedger: cfg.RetentionMinLedger,
-		BatchSize: cfg.RetentionBatchSize,
-		Pause:     cfg.RetentionPause,
-		Interval:  cfg.RetentionInterval,
-	})
+	//
+	// When ARCHIVE_BUCKET is set, an archiver is created to export events
+	// to S3-compatible storage before pruning. Archival is optional and
+	// idempotent: without ARCHIVE_* vars, the binary behaves identically
+	// to the pre-archive build.
+	var arch *archive.Archiver
+	if cfg.ArchiveEnabled() {
+		var err error
+		aArchiverOpts := archive.Options{
+			Bucket:          cfg.ArchiveBucket,
+			Prefix:          cfg.ArchivePrefix,
+			Endpoint:        cfg.ArchiveEndpoint,
+			Region:          cfg.ArchiveRegion,
+			AccessKeyID:     cfg.ArchiveAccessKeyID,
+			SecretAccessKey: cfg.ArchiveSecretAccessKey,
+			UseSSL:          cfg.ArchiveUseSSL,
+			MaxRetries:      cfg.ArchiveMaxRetries,
+			Logger:          log,
+		}
+		arch, err = archive.New(st, aArchiverOpts)
+		if err != nil {
+			return fmt.Errorf("initializing archive: %w", err)
+		}
+		log.Info("archive enabled",
+			"bucket", cfg.ArchiveBucket,
+			"prefix", cfg.ArchivePrefix,
+			"before_prune", cfg.ArchiveBeforePrune,
+		)
+	}
+
+	// Expose spec-cache hit/miss metrics via /stats.
+	api.SetSpecCache(specCache)
+
+	prn := pruner.NewWithArchiver(st, log, pruner.Options{
+		MaxAge:             cfg.RetentionMaxAge,
+		MinLedger:          cfg.RetentionMinLedger,
+		BatchSize:          cfg.RetentionBatchSize,
+		Pause:              cfg.RetentionPause,
+		Interval:           cfg.RetentionInterval,
+		ArchiveBeforePrune: cfg.ArchiveBeforePrune,
+	}, arch)
 	if cfg.RetentionEnabled() {
 		api.SetPruner(prn)
 	}
+
 	// Per-client HTTP rate limiter. Disabled when RATE_LIMIT_RPS or
 	// RATE_LIMIT_BURST is unset; the limiter is then a pass-through and
 	// its cleanup goroutine is never started.
-	limiterOpts := []api.LimiterOption{}
+	limiterOpts := []api.LimiterOption{
+		api.WithHourlyQuota(cfg.HourlyQuota),
+		api.WithDailyQuota(cfg.DailyQuota),
+	}
 	if cfg.MultiTenant {
 		// Key buckets on the authenticated tenant rather than the source
 		// IP, so a tenant's quota follows its identity across however many
@@ -251,6 +481,7 @@ func run() error {
 	limiter.Start(ctx)
 	defer limiter.Stop()
 
+	// Guarded store for API-originated reads with timeout and slow-query logging.
 	apiStore := store.NewGuardedStore(st, store.GuardedStoreOptions{
 		Timeout:            cfg.APIQueryTimeout,
 		SlowQueryThreshold: cfg.APISlowQueryThreshold,
@@ -259,13 +490,21 @@ func run() error {
 	api.SetMaxLimit(cfg.APIMaxLimit)
 
 	apiServer := api.New(apiStore, countingClient, log, cfg.APIKey, specEnricher).WithBroadcaster(bcast)
+	apiServer.SetStatsTTL(cfg.StatsCacheTTL)
 	apiServer.SetRateLimiter(limiter)
+	if cfg.APIKeyAuthEnabled {
+		log.Info("api key authentication enabled", "gated", "write/streaming/subscriptions routes")
+	}
+	apiServer.WithAPIKeyAuth(cfg.APIKeyAuthEnabled)
+	apiServer.SetMetricsEnabled(cfg.MetricsEnabled)
 	apiServer.SetCompressMinSize(cfg.CompressMinSize)
+	apiServer.SetHTTPRequestBodyLimit(cfg.HTTPRequestBodyLimit)
 	apiServer.SetExportMaxRange(cfg.ExportMaxRange)
 	apiServer.SetCORSConfig(api.CORSConfig{
 		AllowedOrigins: cfg.CORSAllowedOrigins,
 		AllowedMethods: cfg.CORSAllowedMethods,
 		AllowedHeaders: cfg.CORSAllowedHeaders,
+		ExposedHeaders: cfg.CORSExposedHeaders,
 	})
 
 	// GraphQL transport: reads against the same store + spec enricher
@@ -279,7 +518,7 @@ func run() error {
 	apiServer.SetGraphQLHandler(gqlHandler, gqlHandler.PlaygroundHandler())
 
 	if cfg.MultiTenant {
-		// Tenancy lives in tables (tenants, grants, api_keys, usage) that
+		// Tenancy lives in tables (tenants, grants, tenant_api_keys, usage) that
 		// only the Postgres backend has. Refusing at startup is the whole
 		// point: silently running a ClickHouse deployment with MULTI_TENANT
 		// set would mean an operator believing a boundary is enforced when
@@ -318,19 +557,40 @@ func run() error {
 	} else {
 		log.Info("watched-contracts endpoints are auth-gated")
 	}
+	if len(cfg.CORSAllowedOrigins) > 0 {
+		log.Info("cors enabled", "origins", strings.Join(cfg.CORSAllowedOrigins, ","))
+	}
 
-	errCh := make(chan error, 4)
+	// Six reporters can write here: http, webhook, ingester, auditor,
+	// retention pruner, and pruner. The buffer must hold all of them so
+	// no goroutine parks on a send while shutdown is still draining.
+	errCh := make(chan error, 6)
 	go func() {
-		go wh.Run(ctx)
+		// The webhook pool joins the shutdown accounting: Run returns
+		// as soon as ctx is cancelled, and this report is what the
+		// drain loop below waits for. It used to be launched without
+		// a report, which left the loop waiting for a component that
+		// never spoke — every graceful shutdown hung until SIGKILL.
+		wh.Run(ctx)
+		errCh <- nil
 	}()
-	go func() {
-		log.Info("ingester starting", "rpc_url", cfg.RPCURL, "poll_interval", cfg.PollInterval)
-		if err := ing.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
-			errCh <- fmt.Errorf("ingester: %w", err)
-		} else {
-			errCh <- nil
-		}
-	}()
+
+	// Start the ingester only when the advisory lock was acquired (or
+	// when lock enforcement is disabled). The goroutine is skipped
+	// when another instance holds the lock.
+	remaining := 2 // http server + webhook
+	if ingesterEnabled {
+		remaining++ // + ingester
+		go func() {
+			log.Info("ingester starting", requestid.Field, requestid.JobIngester,
+				"rpc_urls", rpcURLsForLog(cfg), "poll_interval", cfg.PollInterval)
+			if err := ing.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+				errCh <- fmt.Errorf("ingester: %w", err)
+			} else {
+				errCh <- nil
+			}
+		}()
+	}
 	go func() {
 		log.Info("http api listening", "addr", cfg.HTTPAddr)
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -339,9 +599,13 @@ func run() error {
 			errCh <- nil
 		}
 	}()
+
+	// The auditor runs alongside ingestion and reports into the same
+	// error channel when enabled.
 	if aud != nil {
+		remaining++ // + auditor
 		go func() {
-			log.Info("auditor starting",
+			log.Info("auditor starting", requestid.Field, requestid.JobAuditor,
 				"budget_share", cfg.AuditBudgetShare,
 				"batch_ledgers", cfg.AuditBatchLedgers,
 				"lag_threshold", cfg.AuditLagThreshold,
@@ -353,9 +617,24 @@ func run() error {
 			}
 		}()
 	}
+	if retPruner != nil {
+		remaining++ // + age-based retention pruner
+		go func() {
+			log.Info("event retention pruning starting", "age", cfg.RetentionAge, "poll_interval", cfg.RetentionPoll)
+			if err := retPruner.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+				errCh <- fmt.Errorf("retention pruner: %w", err)
+			} else {
+				errCh <- nil
+			}
+		}()
+	}
+
+	// The pruner goroutine always runs; without a retention policy it
+	// returns immediately and reports nil so shutdown accounting holds.
+	remaining++ // + pruner
 	go func() {
 		if cfg.RetentionEnabled() {
-			log.Info("pruner starting",
+			log.Info("pruner starting", requestid.Field, requestid.JobPruner,
 				"max_age", cfg.RetentionMaxAge,
 				"min_ledger", cfg.RetentionMinLedger,
 				"batch_size", cfg.RetentionBatchSize,
@@ -369,17 +648,35 @@ func run() error {
 		}
 	}()
 
+	// A nil report is a component that finished cleanly before any
+	// shutdown was requested — the disabled pruner emits one the moment
+	// it starts. Reading that as "a component died" used to tear the
+	// process down a second after boot. Only the shutdown signal or a
+	// non-nil report ends the loop; every report, nil or not, consumes
+	// exactly one slot of the accounting above, so the drain below waits
+	// for precisely the messages that are still outstanding.
 	var firstErr error
-	remaining := 3 // ingester + http server + webhook
-	if aud != nil {
-		remaining = 4
-	}
-	select {
-	case <-ctx.Done():
-		log.Info("shutdown signal received")
-	case firstErr = <-errCh:
-		remaining--
-		stop() // one component failed; wind down the others
+	stopping := false
+	for !stopping {
+		select {
+		case <-ctx.Done():
+			log.Info("shutdown signal received")
+			// Drop the SIGINT/SIGTERM registration right away: from
+			// here on a second signal takes the runtime's default
+			// action and forces immediate exit, instead of being
+			// swallowed while a stuck drain runs out the grace
+			// period. stop() is idempotent with the deferred call
+			// at function exit.
+			stop()
+			stopping = true
+		case err := <-errCh:
+			remaining--
+			if err != nil {
+				firstErr = err
+				stop()
+				stopping = true
+			}
+		}
 	}
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
@@ -420,7 +717,7 @@ func bootstrapAdminKey(ctx context.Context, ts store.TenantStore, key string, lo
 	if err != nil {
 		return fmt.Errorf("loading default tenant: %w", err)
 	}
-	err = ts.CreateAPIKeyIfAbsent(ctx, tenant.ID, "bootstrap", prefix, digest)
+	err = ts.CreateTenantAPIKeyIfAbsent(ctx, tenant.ID, "bootstrap", prefix, digest)
 	if err != nil {
 		return fmt.Errorf("installing bootstrap key: %w", err)
 	}
@@ -431,18 +728,22 @@ func bootstrapAdminKey(ctx context.Context, ts store.TenantStore, key string, lo
 }
 
 func newLogger(level, format string) *slog.Logger {
-	var lvl slog.Level
-	switch strings.ToLower(level) {
-	case "debug":
-		lvl = slog.LevelDebug
-	case "warn":
-		lvl = slog.LevelWarn
-	case "error":
-		lvl = slog.LevelError
-	default:
-		lvl = slog.LevelInfo
-	}
-	opts := &slog.HandlerOptions{Level: lvl}
+	log, _ := newLoggerWithLevel(level, format)
+	return log
+}
+
+// newLoggerWithLevel builds a logger exactly like newLogger, but also
+// returns the slog.LevelVar backing its handler. slog handlers don't
+// support swapping their level after construction, so a caller that needs
+// to adjust the effective log level in place at runtime — the long-running
+// indexer's SIGHUP config-reload handler — holds onto the returned
+// LevelVar and calls Set on it instead of rebuilding the logger/handler.
+// The one-shot subcommands (replay/backfill/index-addresses) have no
+// reload path, so they keep using the simpler newLogger.
+func newLoggerWithLevel(level, format string) (*slog.Logger, *slog.LevelVar) {
+	var levelVar slog.LevelVar
+	levelVar.Set(config.ParseLogLevel(level))
+	opts := &slog.HandlerOptions{Level: &levelVar}
 	var h slog.Handler
 	switch strings.ToLower(format) {
 	case "json":
@@ -450,7 +751,7 @@ func newLogger(level, format string) *slog.Logger {
 	default:
 		h = slog.NewTextHandler(os.Stdout, opts)
 	}
-	return slog.New(h)
+	return slog.New(h), &levelVar
 }
 
 // graphqlServerDeps wraps the live store + enricher into the typed
@@ -458,4 +759,44 @@ func newLogger(level, format string) *slog.Logger {
 // keeps the route wiring in main.go one line wide.
 func graphqlServerDeps(st store.Store, enricher api.Enricher) api.ServerDeps {
 	return api.ServerDeps{Store: st, Enricher: enricher}
+}
+
+// rpcURLsForLog returns the RPC endpoints to log at startup. An RPC URL may
+// carry basic-auth credentials in its userinfo, so the password is masked
+// before the value reaches the logger; RPC_URLS (the failover endpoints)
+// takes priority when set, otherwise the single RPC_URL is reported. Empty
+// entries are dropped so an unconfigured config logs as an empty list rather
+// than a single blank string.
+func rpcURLsForLog(cfg config.Config) []string {
+	var urls []string
+	if len(cfg.RPCURLS) > 0 {
+		urls = cfg.RPCURLS
+	} else {
+		urls = []string{cfg.RPCURL}
+	}
+	out := make([]string, 0, len(urls))
+	for _, raw := range urls {
+		if raw == "" {
+			continue
+		}
+		out = append(out, redactURLUserinfo(raw))
+	}
+	return out
+}
+
+// redactURLUserinfo masks the password portion of a URL's userinfo so
+// basic-auth credentials never reach log output. URLs without a password
+// — and unparseable ones, which config validation already rejects — are
+// returned unchanged.
+func redactURLUserinfo(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return raw
+	}
+	if u.User != nil {
+		if _, has := u.User.Password(); has {
+			u.User = url.UserPassword(u.User.Username(), "***")
+		}
+	}
+	return u.String()
 }

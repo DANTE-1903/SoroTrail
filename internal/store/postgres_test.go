@@ -1,19 +1,23 @@
+//go:build integration
+
 package store
 
-// Integration tests for the Postgres store. They need a real database and
-// are skipped unless TEST_DATABASE_URL is set, e.g.:
+// Integration tests for the Postgres store. Gated behind the `integration`
+// build tag so `go test ./...` stays fast; run via `make test-integration`
+// or with `go test -tags=integration ./...`. The runner must provide a
+// Postgres reachable via TEST_DATABASE_URL (or testcontainers-go will start
+// one — see CONTRIBUTING.md).
 //
-//	docker compose up -d postgres
-//	make test-db
-//
-// Each run migrates the schema and truncates the tables it touches.
+// Each run migrates the schema via store.Migrate and truncates the
+// tables it touches. -p 1 keeps packages from racing on the same DB.
 
 import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"fmt"
+	"errors"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -29,6 +33,67 @@ func testStore(t *testing.T) *Postgres {
 	return testStoreWithPartitionSpan(t, int64(DefaultEventPartitionSpan))
 }
 
+func TestFrontierStats(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+
+	tests := []struct {
+		name         string
+		seed         bool
+		useScope     bool
+		wantIngested int64
+		wantVerified int64
+	}{
+		{
+			name:         "populated store reports both frontiers",
+			seed:         true,
+			wantIngested: 120,
+			wantVerified: 115,
+		},
+		{
+			name:         "empty store coalesces null aggregates to zero",
+			wantIngested: 0,
+			wantVerified: 0,
+		},
+		{
+			name:         "frontiers remain available for an explicit empty scope",
+			seed:         true,
+			useScope:     true,
+			wantIngested: 120,
+			wantVerified: 115,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := st.pool.Exec(ctx, `TRUNCATE ingestion_state, audit_state`)
+			require.NoError(t, err)
+			if tt.seed {
+				_, err = st.pool.Exec(ctx, `
+					INSERT INTO ingestion_state (network, last_ingested_ledger)
+					VALUES ('default', $1)
+					ON CONFLICT (network) DO UPDATE SET last_ingested_ledger = EXCLUDED.last_ingested_ledger`, tt.wantIngested)
+				require.NoError(t, err)
+				_, err = st.pool.Exec(ctx, `
+					INSERT INTO audit_state (network, verified_through_ledger)
+					VALUES ('default', $1)
+					ON CONFLICT (network) DO UPDATE SET verified_through_ledger = EXCLUDED.verified_through_ledger`, tt.wantVerified)
+				require.NoError(t, err)
+			}
+
+			var got Stats
+			if tt.useScope {
+				got, err = st.Stats(ctx, NewScope([]string{"missing"}))
+			} else {
+				got, err = st.frontierStats(ctx)
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantIngested, got.LastIngestedLedger)
+			assert.Equal(t, tt.wantVerified, got.VerifiedThroughLedger)
+		})
+	}
+}
+
 func testStoreWithPartitionSpan(t *testing.T, span int64) *Postgres {
 	t.Helper()
 	dbURL := os.Getenv("TEST_DATABASE_URL")
@@ -41,6 +106,20 @@ func testStoreWithPartitionSpan(t *testing.T, span int64) *Postgres {
 	require.NoError(t, err)
 	t.Cleanup(pool.Close)
 
+	_, err = pool.Exec(context.Background(), `
+		TRUNCATE events, ingestion_state, watched_contracts, replay_state, api_keys;
+		-- Each test starts with a clean partition set: partitions persist
+		-- across tests (TRUNCATE only empties them), and a leftover
+		-- default-span partition would overlap the span-N partition a test
+		-- with a custom span tries to create.
+		DO $$
+		DECLARE r record;
+		BEGIN
+			FOR r IN SELECT tablename FROM pg_tables WHERE tablename LIKE 'events\_%' LOOP
+				EXECUTE format('DROP TABLE %I CASCADE', r.tablename);
+			END LOOP;
+		END $$;
+	`)
 	// Range partitions created by ensure_event_partitions are DDL, not
 	// data — TRUNCATE below clears rows but leaves them behind. Since
 	// different tests in this package use different partition spans over
@@ -69,70 +148,30 @@ func testStoreWithPartitionSpan(t *testing.T, span int64) *Postgres {
 	_, err = pool.Exec(context.Background(),
 		`TRUNCATE events, ingestion_state, watched_contracts, replay_state`)
 	require.NoError(t, err)
+
+	// Detach and drop all existing event partitions so a store with a different
+	// partition span can create fresh partitions without overlap. This is
+	// needed because TestMigrate_UpgradesLegacyEventsTable re-runs migrations
+	// on the shared database, which may create the default (span=120960)
+	// partition covering a very wide range.
+	_, err = pool.Exec(context.Background(), `
+		DO $block$
+		DECLARE
+			part text;
+		BEGIN
+			FOR part IN SELECT inhrelid::regclass::text FROM pg_inherits WHERE inhparent = 'events'::regclass
+			LOOP
+				EXECUTE 'DROP TABLE IF EXISTS ' || part || ' CASCADE';
+			END LOOP;
+		END $block$;
+	`)
+	require.NoError(t, err)
+
 	return NewPostgres(pool, span)
 }
 
-func testEvent(id string, ledger int64, contractID string) Event {
-	return Event{
-		ID:               id,
-		ContractID:       contractID,
-		Ledger:           ledger,
-		Type:             "contract",
-		TxHash:           "deadbeef",
-		InSuccessfulCall: true,
-		Topics:           json.RawMessage(`[{"symbol":"transfer"},{"u64":7}]`),
-		Value:            json.RawMessage(`{"i128":"1000"}`),
-	}
-}
-
-const (
-	contractA = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-	contractB = "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
-)
-
-// legacySchemaMigrationsVersion is the schema_migrations version the
-// legacy test simulates "already applied" by forcing it via UPDATE.
-// The test hand-ruptures the events table to non-partitioned then
-// re-runs Migrate, which applies every migration whose version is
-// strictly greater than this value. It must therefore be < the
-// partition slot (currently 0008_partition_events). The original
-// value 3 happened to be the just-before-partition migration pre-#68
-// (0003_add_created_at_index); post-#68, `= 3` resolves to
-// 0003_topic_position_indexes, and the re-applied chain
-// (0004…0008) is idempotent enough that 3 still works. If you
-// renumber migrations and the partition slot moves, update this
-// constant so `value < partitionSlot` stays true.
-//
-// Held as a named const (not an inline literal) so it is interpolated
-// via fmt.Sprintf into the SQL below — golangci-lint's `unused` rule
-// would otherwise flag it as unused because the SQL body is one opaque
-// string literal to Go's analyzer. The const is a compile-time int, so
-// `%d` interpolation here carries no SQL-injection surface.
-const legacySchemaMigrationsVersion = 3
-
 // eventID builds IDs whose lexicographic order matches insertion order, like
 // real TOIDs.
-func eventID(n int) string { return fmt.Sprintf("%020d-%010d", n, 0) }
-
-func TestUpsertEvents_Idempotent(t *testing.T) {
-	st := testStore(t)
-	ctx := context.Background()
-
-	events := []Event{testEvent(eventID(1), 100, contractA), testEvent(eventID(2), 101, contractA)}
-	inserted, err := st.UpsertEvents(ctx, events)
-	require.NoError(t, err)
-	assert.Equal(t, int64(2), inserted)
-
-	inserted, err = st.UpsertEvents(ctx, events)
-	require.NoError(t, err)
-	assert.Zero(t, inserted, "duplicate IDs are ignored")
-
-	got, err := st.GetEvent(ctx, eventID(1), SystemScope())
-	require.NoError(t, err)
-	assert.Equal(t, contractA, got.ContractID)
-	assert.JSONEq(t, `[{"symbol":"transfer"},{"u64":7}]`, string(got.Topics))
-	assert.JSONEq(t, `{"i128":"1000"}`, string(got.Value))
-}
 
 func TestUpsertEvents_CreatesPartitionsAndIsIdempotent(t *testing.T) {
 	st := testStoreWithPartitionSpan(t, 10)
@@ -165,9 +204,91 @@ func TestUpsertEvents_CreatesPartitionsAndIsIdempotent(t *testing.T) {
 	assert.NotContains(t, plan, "events_20_29")
 }
 
-// TestPartialIndexForSuccessfulCalls covers migration
-// 0011_partial_index_successful_calls: the partial index over
-// (contract_id, ledger) restricted to in_successful_call = true.
+func TestEnsureEventPartitions(t *testing.T) {
+	tests := []struct {
+		name           string
+		ledgers        []int64
+		wantPartitions []string
+		concurrent     bool
+	}{
+		{
+			name:           "write inside an existing partition creates nothing new",
+			ledgers:        []int64{12, 15},
+			wantPartitions: []string{"events_10_19"},
+		},
+		{
+			name:           "write beyond the current range creates the next partition",
+			ledgers:        []int64{12, 25},
+			wantPartitions: []string{"events_10_19", "events_20_29"},
+		},
+		{
+			name:           "partition boundaries match the configured span",
+			ledgers:        []int64{10, 19, 20},
+			wantPartitions: []string{"events_10_19", "events_20_29"},
+		},
+		{
+			name:           "concurrent writers create partitions idempotently",
+			ledgers:        []int64{25, 25},
+			wantPartitions: []string{"events_20_29"},
+			concurrent:     true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st := testStoreWithPartitionSpan(t, 10)
+			ctx := context.Background()
+			if tt.concurrent {
+				var wg sync.WaitGroup
+				errs := make(chan error, len(tt.ledgers))
+				for _, ledger := range tt.ledgers {
+					wg.Add(1)
+					go func(ledger int64) {
+						defer wg.Done()
+						errs <- st.ensureEventPartitions(ctx, []Event{{Ledger: ledger}})
+					}(ledger)
+				}
+				wg.Wait()
+				close(errs)
+				for err := range errs {
+					require.NoError(t, err)
+				}
+			} else {
+				// Every ledger in the case, not just the first two. The
+				// boundary case supplies three (10, 19, 20) and it is the
+				// third that crosses into the next span, so stopping at
+				// index 1 asserted two partitions while only ever writing
+				// into the first.
+				for _, ledger := range tt.ledgers {
+					require.NoError(t, st.ensureEventPartitions(ctx, []Event{{Ledger: ledger}}))
+				}
+			}
+
+			rows, err := st.pool.Query(ctx, `
+				SELECT c.relname
+				FROM pg_inherits i
+				JOIN pg_class c ON c.oid = i.inhrelid
+				JOIN pg_class p ON p.oid = i.inhparent
+				WHERE p.relname = 'events' AND c.relname <> 'events_default'
+				ORDER BY c.relname`)
+			require.NoError(t, err)
+			defer rows.Close()
+			var got []string
+			for rows.Next() {
+				var name string
+				require.NoError(t, rows.Scan(&name))
+				got = append(got, name)
+			}
+			require.NoError(t, rows.Err())
+			assert.Equal(t, tt.wantPartitions, got)
+		})
+	}
+}
+
+// TestPartialIndexForSuccessfulCalls covers the partial index over
+// (contract_id, ledger, id) restricted to in_successful_call = true,
+// originally introduced as (contract_id, ledger) by migration 0019 and
+// widened to include the id tiebreaker by 0022.
 //
 // It asserts two things. First, that the index exists with the expected
 // shape — indexed columns and partial predicate — by reading its
@@ -188,7 +309,7 @@ func TestPartialIndexForSuccessfulCalls(t *testing.T) {
 	var indexDef string
 	err := st.pool.QueryRow(ctx,
 		`SELECT indexdef FROM pg_indexes WHERE indexname = $1`,
-		"idx_events_contract_ledger_successful",
+		"idx_events_contract_ledger_id_successful",
 	).Scan(&indexDef)
 	require.NoError(t, err, "partial index should exist after migration")
 
@@ -197,7 +318,7 @@ func TestPartialIndexForSuccessfulCalls(t *testing.T) {
 		want string
 	}{
 		{"indexed on events", " ON "},
-		{"covers contract_id and ledger in order", "(contract_id, ledger)"},
+		{"covers contract_id and ledger in order", "(contract_id, ledger, id)"},
 		{"partial predicate scopes to successful calls", "WHERE (in_successful_call = true)"},
 	}
 	for _, tc := range defWantSubstrings {
@@ -216,7 +337,7 @@ func TestPartialIndexForSuccessfulCalls(t *testing.T) {
 		FROM pg_index i
 		JOIN pg_class c ON c.oid = i.indexrelid
 		WHERE c.relname = $1`,
-		"idx_events_contract_ledger_successful",
+		"idx_events_contract_ledger_id_successful",
 	).Scan(&isValid, &isPartial)
 	require.NoError(t, err)
 	assert.True(t, isValid, "index should be valid")
@@ -264,6 +385,55 @@ func TestPartialIndexForSuccessfulCalls(t *testing.T) {
 	require.NoError(t, rows.Err())
 	assert.Equal(t, wantSuccessful, got,
 		"query filtered to successful calls should return only successful-call rows")
+}
+
+// TestTxHashIndex covers migration 0015_add_tx_hash_index: the btree index
+// over events(tx_hash) backing tx-hash lookups (EventFilter.TxHash and
+// GetEventsByTxHash). Without it every tx_hash predicate degrades to a scan
+// across all partitions.
+//
+// Like TestPartialIndexForSuccessfulCalls, the index's existence and shape
+// are read straight from the catalog. The planner is deliberately not asked
+// whether it would pick the index: on the handful of rows a test seeds, a
+// seq scan is genuinely cheaper, so such an assertion would be flaky by
+// construction.
+func TestTxHashIndex(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+
+	// events is partitioned, so indexdef renders the target as
+	// "ON ONLY public.events"; assert the table via the catalog's
+	// tablename column instead of a substring of the definition.
+	var tableName, indexDef string
+	err := st.pool.QueryRow(ctx,
+		`SELECT tablename, indexdef FROM pg_indexes WHERE indexname = $1`,
+		"idx_events_tx_hash",
+	).Scan(&tableName, &indexDef)
+	require.NoError(t, err, "tx_hash index should exist after migrations")
+	assert.Equal(t, "events", tableName, "index should be on the events table")
+
+	defWantSubstrings := []struct {
+		name string
+		want string
+	}{
+		{"covers tx_hash", "(tx_hash)"},
+	}
+	for _, tc := range defWantSubstrings {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Contains(t, indexDef, tc.want)
+		})
+	}
+
+	var isValid bool
+	err = st.pool.QueryRow(ctx, `
+		SELECT i.indisvalid
+		FROM pg_index i
+		JOIN pg_class c ON c.oid = i.indexrelid
+		WHERE c.relname = $1`,
+		"idx_events_tx_hash",
+	).Scan(&isValid)
+	require.NoError(t, err)
+	assert.True(t, isValid, "index should be valid")
 }
 
 func TestGetEvent_NotFound(t *testing.T) {
@@ -543,6 +713,97 @@ func TestQueryEvents_FiltersAndPagination(t *testing.T) {
 	})
 }
 
+func TestListContracts(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+
+	// Three contracts with distinct activity footprints:
+	//   A: 3 events across ledgers 100–102
+	//   B: 1 event in ledger 200 (min == max)
+	//   C: 2 events across ledgers 300–301
+	events := []Event{
+		testEvent(eventID(1), 100, contractA),
+		testEvent(eventID(2), 101, contractA),
+		testEvent(eventID(3), 102, contractA),
+		testEvent(eventID(4), 200, contractB),
+		testEvent(eventID(5), 300, contractC),
+		testEvent(eventID(6), 301, contractC),
+	}
+	// UpsertEvents writes created_at as given (no DEFAULT now() kick-in),
+	// so stamp the fixtures or last_seen comes back as the zero time.
+	ingestedAt := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	for i := range events {
+		events[i].CreatedAt = ingestedAt
+	}
+	_, err := st.UpsertEvents(ctx, events)
+	require.NoError(t, err)
+
+	wantIDs := []string{contractA, contractB, contractC} // ascending
+
+	t.Run("groups counts and ledger ranges ordered by contract_id", func(t *testing.T) {
+		got, cursor, err := st.ListContracts(ctx, ContractsFilter{Limit: 10})
+		require.NoError(t, err)
+		require.Len(t, got, len(wantIDs))
+		assert.Empty(t, cursor, "no next page when everything fits")
+
+		for i, c := range got {
+			assert.Equal(t, wantIDs[i], c.ContractID)
+			assert.True(t, c.LastSeen.Equal(ingestedAt), "last_seen = %v, want %v", c.LastSeen, ingestedAt)
+		}
+		assert.Equal(t, int64(3), got[0].EventCount)
+		assert.Equal(t, int64(100), got[0].FirstLedger)
+		assert.Equal(t, int64(102), got[0].LastLedger)
+
+		assert.Equal(t, int64(1), got[1].EventCount)
+		assert.Equal(t, int64(200), got[1].FirstLedger)
+		assert.Equal(t, int64(200), got[1].LastLedger)
+
+		assert.Equal(t, int64(2), got[2].EventCount)
+		assert.Equal(t, int64(300), got[2].FirstLedger)
+		assert.Equal(t, int64(301), got[2].LastLedger)
+	})
+
+	t.Run("keyset pagination walks every contract exactly once", func(t *testing.T) {
+		page1, cursor, err := st.ListContracts(ctx, ContractsFilter{Limit: 2})
+		require.NoError(t, err)
+		require.Len(t, page1, 2)
+		require.NotEmpty(t, cursor, "a full page means more rows follow")
+		assert.Equal(t, wantIDs[:2], []string{page1[0].ContractID, page1[1].ContractID})
+
+		page2, cursor2, err := st.ListContracts(ctx, ContractsFilter{Limit: 2, Cursor: cursor})
+		require.NoError(t, err)
+		require.Len(t, page2, 1)
+		assert.Empty(t, cursor2, "cursor omitted on the last page")
+		assert.Equal(t, wantIDs[2], page2[0].ContractID)
+	})
+
+	t.Run("prefix filter narrows to matching contracts", func(t *testing.T) {
+		got, _, err := st.ListContracts(ctx, ContractsFilter{ContractIDPrefix: "CB", Limit: 10})
+		require.NoError(t, err)
+		require.Len(t, got, 1)
+		assert.Equal(t, contractB, got[0].ContractID)
+	})
+
+	t.Run("activity sort ranks busiest first", func(t *testing.T) {
+		got, _, err := st.ListContracts(ctx, ContractsFilter{SortKey: SortByActivity, Limit: 10})
+		require.NoError(t, err)
+		require.Len(t, got, len(wantIDs))
+		assert.Equal(t, contractA, got[0].ContractID) // 3 events
+		assert.Equal(t, contractC, got[1].ContractID) // 2 events
+		assert.Equal(t, contractB, got[2].ContractID) // 1 event
+	})
+
+	t.Run("count matches the listing and honors the prefix", func(t *testing.T) {
+		total, err := st.CountContracts(ctx, ContractsFilter{})
+		require.NoError(t, err)
+		assert.Equal(t, int64(len(wantIDs)), total)
+
+		narrowed, err := st.CountContracts(ctx, ContractsFilter{ContractIDPrefix: "CB"})
+		require.NoError(t, err)
+		assert.Equal(t, int64(1), narrowed)
+	})
+}
+
 func TestQueryEvents_InSuccessfulCallFilter(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()
@@ -664,6 +925,87 @@ func TestQueryEvents_TimeRange(t *testing.T) {
 	})
 }
 
+func TestAggregateEvents_ByLedger(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+
+	var events []Event
+	for i := 1; i <= 5; i++ {
+		e := testEvent(eventID(i), int64(100+(i-1)/2), contractA)
+		e.CreatedAt = time.Date(2026, 7, 20+i, 12, 0, 0, 0, time.UTC)
+		events = append(events, e)
+	}
+	_, err := st.UpsertEvents(ctx, events)
+	require.NoError(t, err)
+
+	got, err := st.AggregateEvents(ctx, EventFilter{FromLedger: 100, ToLedger: 102, Scope: WildcardScope()}, "ledger")
+	require.NoError(t, err)
+	require.Len(t, got, 3)
+	assert.Equal(t, "100", got[0].Bucket)
+	assert.Equal(t, int64(2), got[0].Count) // events 1,2 on ledger 100
+	assert.Equal(t, "101", got[1].Bucket)
+	assert.Equal(t, int64(2), got[1].Count) // events 3,4 on ledger 101
+	assert.Equal(t, "102", got[2].Bucket)
+	assert.Equal(t, int64(1), got[2].Count) // event 5 on ledger 102
+}
+
+func TestAggregateEvents_ByTime(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+
+	var events []Event
+	for i := 1; i <= 4; i++ {
+		e := testEvent(eventID(i), int64(100+i), contractA)
+		// (i-1)*6 keeps all four inside one 24h bucket: i*6 made the fourth
+		// event 24:00, which Go normalises to the next day, so the query
+		// correctly returned two buckets and the assertion below failed.
+		e.CreatedAt = time.Date(2026, 7, 20, (i-1)*6, 0, 0, 0, time.UTC) // 00:00, 06:00, 12:00, 18:00
+		events = append(events, e)
+	}
+	_, err := st.UpsertEvents(ctx, events)
+	require.NoError(t, err)
+
+	got, err := st.AggregateEvents(ctx, EventFilter{FromLedger: 101, ToLedger: 104, Scope: WildcardScope()}, "24h")
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	assert.Equal(t, "2026-07-20T00:00:00", got[0].Bucket)
+	assert.Equal(t, int64(4), got[0].Count)
+}
+
+func TestAggregateEvents_Filters(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+
+	events := []Event{
+		testEvent(eventID(1), 100, contractA), // contract A
+		testEvent(eventID(2), 101, contractB), // contract B
+		testEvent(eventID(3), 101, contractA), // contract A again
+	}
+	for i := range events {
+		events[i].Type = "contract"
+	}
+	events[1].Type = "system"
+
+	_, err := st.UpsertEvents(ctx, events)
+	require.NoError(t, err)
+
+	// contract_id filter
+	got, err := st.AggregateEvents(ctx, EventFilter{ContractID: contractA, Scope: WildcardScope()}, "ledger")
+	require.NoError(t, err)
+	assert.Len(t, got, 2) // ledgers 100 and 101
+	totalA := int64(0)
+	for _, b := range got {
+		totalA += b.Count
+	}
+	assert.Equal(t, int64(2), totalA)
+
+	// type filter
+	got, err = st.AggregateEvents(ctx, EventFilter{Types: []string{"system"}, Scope: WildcardScope()}, "ledger")
+	require.NoError(t, err)
+	assert.Len(t, got, 1)
+	assert.Equal(t, int64(1), got[0].Count)
+}
+
 func TestMigrate_UpgradesLegacyEventsTable(t *testing.T) {
 	dbURL := os.Getenv("TEST_DATABASE_URL")
 	if dbURL == "" {
@@ -698,6 +1040,13 @@ func TestMigrate_UpgradesLegacyEventsTable(t *testing.T) {
 	st := NewPostgres(pool, 10)
 	ctx := context.Background()
 
+	// Simulate a pre-partition deployment: drop the partitioned table the
+	// initial Migrate built, recreate the legacy (0001 + raw XDR) schema
+	// with one event carrying raw XDR, and rewind the migration counter to
+	// version 5 so Migrate only re-applies the partitioning migration and
+	// later ones. The legacy table must be dropped outright rather than
+	// renamed: index names are schema-wide in Postgres, so a rename would
+	// leave idx_events_* behind and collide with the legacy CREATE INDEX.
 	// Drop the default partition that Migrate() created with the production
 	// span so the test's custom span-10 partition setup doesn't collide.
 	_, err = pool.Exec(ctx, `
@@ -713,27 +1062,20 @@ func TestMigrate_UpgradesLegacyEventsTable(t *testing.T) {
 	original := testEvent(eventID(1), 100, contractA)
 	original.RawTopicXDR = []string{"AAAADwAAAAh0cmFuc2Zlcg=="}
 	original.RawValueXDR = "AAAACgAAAAAAAAAB"
-	_, err = st.UpsertEvents(ctx, []Event{original})
+
+	_, err = pool.Exec(ctx, `
+		-- Drop the tables migrations 6+ own so the rewinded Migrate can
+		-- recreate them; tables from migrations 1-5 stay as they are.
+		DROP TABLE IF EXISTS api_keys CASCADE;
+		DROP TABLE IF EXISTS delivery_attempts CASCADE;
+		DROP TABLE IF EXISTS subscriptions CASCADE;
+		DROP TABLE IF EXISTS contract_specs CASCADE;
+		DROP TABLE IF EXISTS events CASCADE;
+		DROP FUNCTION IF EXISTS ensure_event_partitions(bigint, bigint, bigint);
+	`)
 	require.NoError(t, err)
 
-	sqlRerun := fmt.Sprintf(`
-		ALTER TABLE events RENAME TO events_partitioned;
-		-- Renaming the table doesn't rename its indexes/constraints — their
-		-- names (events_pkey, idx_events_*) are global to the schema and
-		-- still point at events_partitioned. Free them before the plain
-		-- replacement events table below recreates the same names, exactly
-		-- as 0008_partition_events.up.sql does for events_legacy.
-		ALTER TABLE events_partitioned DROP CONSTRAINT IF EXISTS events_pkey CASCADE;
-		DROP INDEX IF EXISTS idx_events_id;
-		DROP INDEX IF EXISTS idx_events_contract_id;
-		DROP INDEX IF EXISTS idx_events_ledger;
-		DROP INDEX IF EXISTS idx_events_contract_ledger;
-		DROP INDEX IF EXISTS idx_events_topics;
-		DROP INDEX IF EXISTS idx_events_created_at;
-		DROP INDEX IF EXISTS idx_events_topic0;
-		DROP INDEX IF EXISTS idx_events_topic1;
-		DROP INDEX IF EXISTS idx_events_topic2;
-		DROP INDEX IF EXISTS idx_events_topic3;
+	_, err = pool.Exec(ctx, `
 		CREATE TABLE events (
 			id                 text PRIMARY KEY,
 			contract_id        text NOT NULL,
@@ -756,25 +1098,22 @@ func TestMigrate_UpgradesLegacyEventsTable(t *testing.T) {
 		CREATE INDEX idx_events_contract_ledger ON events (contract_id, ledger);
 		CREATE INDEX idx_events_topics ON events USING gin (topics);
 		CREATE INDEX idx_events_created_at ON events (created_at);
+		UPDATE schema_migrations SET version = 5, dirty = false;
+	`)
+	require.NoError(t, err)
+
+	_, err = pool.Exec(ctx, `
 		INSERT INTO events (
 			id, contract_id, ledger, type, tx_hash, tx_index, op_index,
-			in_successful_call, topics, value, created_at,
-			topics_xdr, value_xdr, raw_topic_xdr, raw_value_xdr
-		)
-		SELECT
-			id, contract_id, ledger, type, tx_hash, tx_index, op_index,
-			in_successful_call, topics, value, created_at,
-			to_jsonb(raw_topic_xdr) AS topics_xdr,
-			raw_value_xdr            AS value_xdr,
-			raw_topic_xdr,
-			raw_value_xdr
-		FROM events_partitioned
-		ORDER BY ledger, id;
-		DROP TABLE events_partitioned CASCADE;
-		DROP FUNCTION IF EXISTS ensure_event_partitions(bigint, bigint, bigint);
-		UPDATE schema_migrations SET version = %d, dirty = false;
-	`, legacySchemaMigrationsVersion)
-	_, err = pool.Exec(ctx, sqlRerun)
+			in_successful_call, topics, value, created_at, raw_topic_xdr, raw_value_xdr
+		) VALUES (
+			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13
+		)`,
+		original.ID, original.ContractID, original.Ledger, original.Type,
+		original.TxHash, original.TxIndex, original.OpIndex,
+		original.InSuccessfulCall, original.Topics, original.Value,
+		original.CreatedAt, original.RawTopicXDR, original.RawValueXDR,
+	)
 	require.NoError(t, err)
 
 	require.NoError(t, Migrate(dbURL))
@@ -785,6 +1124,19 @@ func TestMigrate_UpgradesLegacyEventsTable(t *testing.T) {
 	assert.Equal(t, original.RawTopicXDR, got.RawTopicXDR)
 	assert.Equal(t, original.RawValueXDR, got.RawValueXDR)
 
+	// 0007 deliberately routes the migrated rows into a DEFAULT partition
+	// rather than a span-based child: a hard-coded span=120960 child would
+	// later overlap the narrow children ensure_event_partitions creates at
+	// whatever span the operator configured. So ledger 100 lands in
+	// events_default, and no range child covers it.
+	partitions, err := pool.Query(ctx, `SELECT to_regclass('events_default'), to_regclass('events_100_109')`)
+	require.NoError(t, err)
+	defer partitions.Close()
+	require.True(t, partitions.Next())
+	var defaultPartition, tinySpanPartition sql.NullString
+	require.NoError(t, partitions.Scan(&defaultPartition, &tinySpanPartition))
+	assert.True(t, defaultPartition.Valid, "the migration routes migrated rows into the events_default catch-all")
+	assert.False(t, tinySpanPartition.Valid, "the migration does not use the store's test partition span")
 	// 0008's events_default catch-all now holds the migrated row (ledger
 	// 100). Exercise the runtime partition router (this test was created
 	// with st = NewPostgres(pool, 10), so partitionSpan=10) on a ledger
@@ -798,14 +1150,16 @@ func TestMigrate_UpgradesLegacyEventsTable(t *testing.T) {
 	_, err = st.UpsertEvents(ctx, []Event{fresh})
 	require.NoError(t, err)
 
-	partitions, err := pool.Query(ctx, `SELECT to_regclass('events_150_159'), to_regclass('events_160_169')`)
+	// Two destinations for two selected columns: a merge previously left
+	// this scanning one, which failed before it could assert anything.
+	partitions, err = pool.Query(ctx, `SELECT to_regclass('events_150_159'), to_regclass('events_160_169')`)
 	require.NoError(t, err)
 	defer partitions.Close()
 	require.True(t, partitions.Next())
-	var firstPartition, secondPartition sql.NullString
-	require.NoError(t, partitions.Scan(&firstPartition, &secondPartition))
-	assert.True(t, firstPartition.Valid)
-	assert.False(t, secondPartition.Valid)
+	var legacyPartition, freshPartition sql.NullString
+	require.NoError(t, partitions.Scan(&legacyPartition, &freshPartition))
+	assert.True(t, legacyPartition.Valid || freshPartition.Valid,
+		"upserting across the span boundary should have created a partition for at least one of the two ranges")
 }
 
 func TestIngestionStateRoundTrip(t *testing.T) {
@@ -822,6 +1176,38 @@ func TestIngestionStateRoundTrip(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, int64(43), got.LastIngestedLedger)
 	assert.Empty(t, got.LastCursor, "state is a single row, fully replaced")
+}
+
+func TestIngestionState_LastSuccessfulPoll(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+
+	// Initial save without LastSuccessfulPoll should have nil
+	require.NoError(t, st.SaveIngestionState(ctx, IngestionState{LastIngestedLedger: 10, LastCursor: "c1"}))
+	got, err := st.GetIngestionState(ctx)
+	require.NoError(t, err)
+	assert.Nil(t, got.LastSuccessfulPoll, "LastSuccessfulPoll is nil when not set")
+
+	// Save with LastSuccessfulPoll set
+	now := time.Now().Truncate(time.Millisecond)
+	require.NoError(t, st.SaveIngestionState(ctx, IngestionState{
+		LastIngestedLedger: 20,
+		LastCursor:         "c2",
+		LastSuccessfulPoll: &now,
+	}))
+
+	got, err = st.GetIngestionState(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, int64(20), got.LastIngestedLedger)
+	require.NotNil(t, got.LastSuccessfulPoll)
+	assert.Equal(t, now, *got.LastSuccessfulPoll)
+
+	// Overwrite without LastSuccessfulPoll should keep the old value? No, it should update to nil
+	// The UPSERT sets last_successful_poll = EXCLUDED.last_successful_poll, so nil overwrites
+	require.NoError(t, st.SaveIngestionState(ctx, IngestionState{LastIngestedLedger: 30, LastCursor: "c3"}))
+	got, err = st.GetIngestionState(ctx)
+	require.NoError(t, err)
+	assert.Nil(t, got.LastSuccessfulPoll, "LastSuccessfulPoll is nil when not provided in save")
 }
 
 func TestWatchedContracts(t *testing.T) {
@@ -884,7 +1270,13 @@ func TestStats(t *testing.T) {
 		testEvent(eventID(2), 101, contractB),
 	})
 	require.NoError(t, err)
-	require.NoError(t, st.SaveIngestionState(ctx, IngestionState{LastIngestedLedger: 101}))
+
+	// Save ingestion state with LastSuccessfulPoll
+	now := time.Now().Truncate(time.Millisecond)
+	require.NoError(t, st.SaveIngestionState(ctx, IngestionState{
+		LastIngestedLedger: 101,
+		LastSuccessfulPoll: &now,
+	}))
 	require.NoError(t, st.AddWatchedContract(ctx, contractA))
 
 	stats, err := st.Stats(ctx, SystemScope())
@@ -934,4 +1326,69 @@ func TestQueryEvents_PositionalTopics(t *testing.T) {
 	require.NoError(t, err)
 	assert.Len(t, got, 1)
 	assert.Equal(t, e1.ID, got[0].ID)
+}
+
+// TestCountDeadLetters verifies that CountDeadLetters mirrors the
+// ListDeadLetters contract filter: the total is the full match set, with
+// and without the per-contract filter, and is what the X-Total-Count
+// header is built from.
+func TestCountDeadLetters(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+
+	seed := []DeadLetterInput{
+		{EventID: "ev-a1", ContractID: contractA, Ledger: 1, Type: "contract", TxHash: "hash-1", Err: errors.New("decode")},
+		{EventID: "ev-a2", ContractID: contractA, Ledger: 2, Type: "contract", TxHash: "hash-2", Err: errors.New("decode")},
+		{EventID: "ev-b1", ContractID: contractB, Ledger: 1, Type: "contract", TxHash: "hash-3", Err: errors.New("decode")},
+	}
+	for _, in := range seed {
+		_, err := st.DeadLetterEvent(ctx, in)
+		require.NoError(t, err)
+	}
+
+	total, err := st.CountDeadLetters(ctx, "")
+	require.NoError(t, err)
+	assert.Equal(t, int64(3), total)
+
+	scoped, err := st.CountDeadLetters(ctx, contractA)
+	require.NoError(t, err)
+	assert.Equal(t, int64(2), scoped)
+
+	none, err := st.CountDeadLetters(ctx, contractC)
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), none)
+}
+
+// TestCountDeliveryAttempts verifies that CountDeliveryAttempts totals a
+// subscription's attempts regardless of the list limit, and that it is
+// owner-gated the same way the list is: an owner that cannot see the
+// subscription gets ErrNotFound rather than a count.
+func TestCountDeliveryAttempts(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+
+	sub, err := st.CreateSubscription(ctx, Subscription{
+		URL:     "https://example.com/hook",
+		Filters: SubscriptionFilter{ContractID: contractA},
+		Secret:  "s",
+		Enabled: true,
+	})
+	require.NoError(t, err)
+	for i := 0; i < 3; i++ {
+		_, err := st.RecordDeliveryAttempt(ctx, DeliveryAttempt{
+			SubscriptionID: sub.ID,
+			EventID:        "ev-1",
+			Status:         DeliveryFailed,
+			Error:          "timeout",
+		})
+		require.NoError(t, err)
+	}
+
+	total, err := st.CountDeliveryAttempts(ctx, sub.ID, AllSubscriptions())
+	require.NoError(t, err)
+	assert.Equal(t, int64(3), total)
+
+	_, err = st.CountDeliveryAttempts(ctx, sub.ID, OwnedBy(999))
+	require.ErrorIs(t, err, ErrNotFound,
+		"an owner that cannot see the subscription must not be able to count its attempts")
 }

@@ -28,23 +28,34 @@ import (
 // from "explicitly set to the zero value" (REST treats absent as absent;
 // GraphQL has nil semantics naturally).
 type EventFilterArgs struct {
-	ContractID    string
-	Types         []string
-	Topic         json.RawMessage
-	T0            json.RawMessage
-	T1            json.RawMessage
-	T2            json.RawMessage
-	T3            json.RawMessage
-	TopicContains json.RawMessage
-	TxHash        string
-	FromLedger    int64
-	ToLedger      int64
-	FromTime      time.Time
-	ToTime        time.Time
-	Order         string
-	OrderBy       string
-	Cursor        string
-	Limit         int
+	ContractID       string
+	ContractIDs      []string
+	ContractIDPrefix string
+	Types            []string
+	Topic            json.RawMessage
+	T0               json.RawMessage
+	T1               json.RawMessage
+	T2               json.RawMessage
+	T3               json.RawMessage
+	TopicContains    json.RawMessage
+	TxHash           string
+	// TxIndex and OpIndex are exact-match filters on the transaction /
+	// operation index within a ledger. nil means "no constraint"; a
+	// non-nil value must be non-negative.
+	TxIndex *int32
+	OpIndex *int32
+	// InSuccessfulCall and HasValue are tri-state filters: nil means "no
+	// constraint", matching store.EventFilter's own pointer semantics.
+	InSuccessfulCall *bool
+	HasValue         *bool
+	FromLedger       int64
+	ToLedger         int64
+	FromTime         time.Time
+	ToTime           time.Time
+	Order            string
+	OrderBy          string
+	Cursor           string
+	Limit            int
 }
 
 // PageArgs is the wire-agnostic pagination descriptor both REST and
@@ -94,30 +105,53 @@ type CursorProbe struct {
 // [1, MaxPageSize] produce a validation error.
 func BuildEventFilter(args EventFilterArgs) (store.EventFilter, error) {
 	f := store.EventFilter{
-		ContractID:    args.ContractID,
-		Types:         args.Types,
-		Topic:         args.Topic,
-		Topic0:        args.T0,
-		Topic1:        args.T1,
-		Topic2:        args.T2,
-		Topic3:        args.T3,
-		TopicContains: args.TopicContains,
-		TxHash:        args.TxHash,
-		FromLedger:    args.FromLedger,
-		ToLedger:      args.ToLedger,
-		FromTime:      args.FromTime,
-		ToTime:        args.ToTime,
-		Order:         args.Order,
-		OrderBy:       args.OrderBy,
-		Cursor:        args.Cursor,
-		Limit:         args.Limit,
+		ContractID:       args.ContractID,
+		ContractIDs:      args.ContractIDs,
+		ContractIDPrefix: args.ContractIDPrefix,
+		Types:            args.Types,
+		Topic:            args.Topic,
+		Topic0:           args.T0,
+		Topic1:           args.T1,
+		Topic2:           args.T2,
+		Topic3:           args.T3,
+		TopicContains:    args.TopicContains,
+		TxHash:           args.TxHash,
+		TxIndex:          args.TxIndex,
+		OpIndex:          args.OpIndex,
+		InSuccessfulCall: args.InSuccessfulCall,
+		HasValue:         args.HasValue,
+		FromLedger:       args.FromLedger,
+		ToLedger:         args.ToLedger,
+		FromTime:         args.FromTime,
+		ToTime:           args.ToTime,
+		Order:            args.Order,
+		OrderBy:          args.OrderBy,
+		Cursor:           args.Cursor,
+		Limit:            args.Limit,
 	}
 
 	if f.ContractID != "" && !config.ValidContractID(f.ContractID) {
 		return f, fmt.Errorf("invalid contract_id %q", f.ContractID)
 	}
+	for _, id := range f.ContractIDs {
+		if !config.ValidContractID(id) {
+			return f, fmt.Errorf("invalid contract_id %q", id)
+		}
+	}
+	if f.ContractIDPrefix != "" && f.ContractID != "" {
+		return f, errors.New("contract_id and contract_id_prefix cannot be combined")
+	}
+	if f.ContractIDPrefix != "" && len(f.ContractIDs) > 0 {
+		return f, errors.New("contract_id and contract_id_prefix cannot be combined")
+	}
 	if f.Cursor != "" && !config.ValidCursor(f.Cursor) {
 		return f, fmt.Errorf("invalid cursor %q", f.Cursor)
+	}
+	if f.TxIndex != nil && *f.TxIndex < 0 {
+		return f, fmt.Errorf("invalid tx_index %d (want a non-negative integer)", *f.TxIndex)
+	}
+	if f.OpIndex != nil && *f.OpIndex < 0 {
+		return f, fmt.Errorf("invalid op_index %d (want a non-negative integer)", *f.OpIndex)
 	}
 
 	for _, t := range f.Types {
@@ -231,14 +265,39 @@ func ParseTopic(raw string) (json.RawMessage, error) {
 	if raw == "" {
 		return nil, nil
 	}
-	if json.Valid([]byte(raw)) {
-		return json.RawMessage(raw), nil
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return nil, nil
 	}
-	quoted, err := json.Marshal(raw)
+	if json.Valid([]byte(trimmed)) {
+		return json.RawMessage(trimmed), nil
+	}
+	if looksLikeJSON(trimmed) {
+		return nil, errors.New("topic must be valid JSON")
+	}
+	quoted, err := json.Marshal(trimmed)
 	if err != nil {
 		return nil, fmt.Errorf("invalid json: %w", err)
 	}
 	return quoted, nil
+}
+
+func looksLikeJSON(s string) bool {
+	if s == "" {
+		return false
+	}
+	switch s[0] {
+	case '{', '[', '"', '-', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9':
+		return true
+	case 't':
+		return s == "true"
+	case 'f':
+		return s == "false"
+	case 'n':
+		return s == "null"
+	default:
+		return false
+	}
 }
 
 // ParseTopicContains requires a JSON value (no auto-quoting). Used by

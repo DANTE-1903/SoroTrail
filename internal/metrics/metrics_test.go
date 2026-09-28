@@ -87,6 +87,35 @@ func TestHandler_ServesPrometheusExposition(t *testing.T) {
 	assert.Contains(t, w.Header().Get("Content-Type"), "text/plain")
 }
 
+// TestIngestionLagGauge_ExportedAtMetrics verifies the ingestion-lag gauge
+// (#237) is registered on the global registry and exposed at /metrics with
+// the exact chain-head-minus-last-ingested value.
+func TestIngestionLagGauge_ExportedAtMetrics(t *testing.T) {
+	tests := []struct {
+		name         string
+		chainHead    int64
+		lastIngested int64
+		want         string
+	}{
+		{name: "caught up", chainHead: 100, lastIngested: 100, want: "sorotrail_ingestion_lag_ledgers 0"},
+		{name: "five ledgers behind", chainHead: 100, lastIngested: 95, want: "sorotrail_ingestion_lag_ledgers 5"},
+		{name: "deep lag", chainHead: 1_000_000, lastIngested: 123_456, want: "sorotrail_ingestion_lag_ledgers 876544"},
+		{name: "nothing ingested yet", chainHead: 100, lastIngested: 0, want: "sorotrail_ingestion_lag_ledgers 100"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			IngestionLag.Set(float64(tt.chainHead - tt.lastIngested))
+			defer IngestionLag.Set(0)
+
+			req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+			w := httptest.NewRecorder()
+			Handler().ServeHTTP(w, req)
+			require.Equal(t, http.StatusOK, w.Code)
+			assert.Contains(t, w.Body.String(), tt.want)
+		})
+	}
+}
+
 func scrapeBody(t *testing.T, m *HTTPMetrics) string {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
@@ -94,4 +123,27 @@ func scrapeBody(t *testing.T, m *HTTPMetrics) string {
 	m.Handler().ServeHTTP(w, req)
 	require.Equal(t, http.StatusOK, w.Code)
 	return strings.ReplaceAll(w.Body.String(), "\n\n", "\n")
+}
+
+// TestBatchMetrics_ExportedAtMetrics verifies the batch/backpressure
+// instrumentation is registered on the global registry and served at
+// /metrics, so operators can observe how the ingester is sizing its writes
+// and whether it is throttling a strapped database. Unobserved families
+// still render with a zero value, so no mutation is needed and the test is
+// safe to run against the shared global registry regardless of order.
+func TestBatchMetrics_ExportedAtMetrics(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	w := httptest.NewRecorder()
+	Handler().ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+
+	body := w.Body.String()
+	assert.Contains(t, body, "sorotrail_event_batch_writes_total",
+		"write-count counter must be exported")
+	assert.Contains(t, body, "sorotrail_event_batch_size",
+		"batch-size gauge must be exported")
+	assert.Contains(t, body, "sorotrail_event_backpressure_total",
+		"backpressure counter must be exported")
+	assert.Contains(t, body, "sorotrail_event_backpressure_seconds_total",
+		"backpressure-seconds counter must be exported")
 }

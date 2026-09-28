@@ -38,7 +38,7 @@ type tenantRequest struct {
 
 func (s *Server) handleCreateTenant(w http.ResponseWriter, r *http.Request) {
 	var req tenantRequest
-	if err := decodeJSON(w, r, &req); err != nil {
+	if err := decodeJSON(w, r, &req, s.httpRequestBodyLimit); err != nil {
 		return
 	}
 	if req.Name == nil || *req.Name == "" {
@@ -72,7 +72,7 @@ func (s *Server) handleCreateTenant(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		s.log.Error("creating tenant", "error", err)
+		loggerFromContext(r.Context()).Error("creating tenant", "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("creating tenant failed"))
 		return
 	}
@@ -102,10 +102,13 @@ func validateTenantQuotas(t store.Tenant) error {
 func (s *Server) handleListTenants(w http.ResponseWriter, r *http.Request) {
 	tenants, err := s.tenants.ListTenants(r.Context())
 	if err != nil {
-		s.log.Error("listing tenants", "error", err)
+		loggerFromContext(r.Context()).Error("listing tenants", "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("listing tenants failed"))
 		return
 	}
+	// The whole list is returned on one page, so the total is just the
+	// page size; no separate count query is needed.
+	w.Header().Set("X-Total-Count", fmt.Sprintf("%d", len(tenants)))
 	writeCacheHeaders(w, cacheNoStore, 0, "")
 	writeJSON(w, http.StatusOK, map[string]any{"tenants": tenants})
 }
@@ -125,7 +128,7 @@ func (s *Server) handleUpdateTenant(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req tenantRequest
-	if err := decodeJSON(w, r, &req); err != nil {
+	if err := decodeJSON(w, r, &req, s.httpRequestBodyLimit); err != nil {
 		return
 	}
 	// PATCH semantics: absent fields keep their stored value.
@@ -161,7 +164,7 @@ func (s *Server) handleUpdateTenant(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		s.log.Error("updating tenant", "error", err)
+		loggerFromContext(r.Context()).Error("updating tenant", "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("updating tenant failed"))
 		return
 	}
@@ -188,7 +191,7 @@ func (s *Server) handleDeleteTenant(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		s.log.Error("deleting tenant", "error", err)
+		loggerFromContext(r.Context()).Error("deleting tenant", "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("deleting tenant failed"))
 		return
 	}
@@ -206,7 +209,7 @@ func (s *Server) handleGrantContract(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req grantRequest
-	if err := decodeJSON(w, r, &req); err != nil {
+	if err := decodeJSON(w, r, &req, s.httpRequestBodyLimit); err != nil {
 		return
 	}
 	if !config.ValidContractID(req.ContractID) {
@@ -215,7 +218,7 @@ func (s *Server) handleGrantContract(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.tenants.GrantContract(r.Context(), t.ID, req.ContractID); err != nil {
-		s.log.Error("granting contract", "error", err)
+		loggerFromContext(r.Context()).Error("granting contract", "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("granting contract failed"))
 		return
 	}
@@ -229,7 +232,7 @@ func (s *Server) handleRevokeContract(w http.ResponseWriter, r *http.Request) {
 	}
 	contractID := chi.URLParam(r, "contract_id")
 	if err := s.tenants.RevokeContract(r.Context(), t.ID, contractID); err != nil {
-		s.log.Error("revoking contract", "error", err)
+		loggerFromContext(r.Context()).Error("revoking contract", "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("revoking contract failed"))
 		return
 	}
@@ -250,10 +253,13 @@ func (s *Server) handleListTenantGrants(w http.ResponseWriter, r *http.Request) 
 func (s *Server) writeGrants(w http.ResponseWriter, r *http.Request, tenantID int64) {
 	grants, err := s.tenants.ListGrants(r.Context(), tenantID)
 	if err != nil {
-		s.log.Error("listing grants", "error", err)
+		loggerFromContext(r.Context()).Error("listing grants", "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("listing grants failed"))
 		return
 	}
+	// The whole list is returned on one page, so the total is just the
+	// page size; no separate count query is needed.
+	w.Header().Set("X-Total-Count", fmt.Sprintf("%d", len(grants)))
 	writeCacheHeaders(w, cacheNoStore, 0, "")
 	writeJSON(w, http.StatusOK, map[string]any{"contract_ids": grants})
 }
@@ -270,18 +276,18 @@ func (s *Server) handleCreateTenantKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req keyRequest
-	if err := decodeJSON(w, r, &req); err != nil {
+	if err := decodeJSON(w, r, &req, s.httpRequestBodyLimit); err != nil {
 		return
 	}
 	plaintext, prefix, digest, err := GenerateAPIKey()
 	if err != nil {
-		s.log.Error("generating api key", "error", err)
+		loggerFromContext(r.Context()).Error("generating api key", "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("generating api key failed"))
 		return
 	}
-	key, err := s.tenants.CreateAPIKey(r.Context(), t.ID, req.Name, prefix, digest)
+	key, err := s.tenants.CreateTenantAPIKey(r.Context(), t.ID, req.Name, prefix, digest)
 	if err != nil {
-		s.log.Error("creating api key", "error", err)
+		loggerFromContext(r.Context()).Error("creating api key", "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("creating api key failed"))
 		return
 	}
@@ -295,12 +301,15 @@ func (s *Server) handleListTenantKeys(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	keys, err := s.tenants.ListAPIKeys(r.Context(), t.ID)
+	keys, err := s.tenants.ListTenantAPIKeys(r.Context(), t.ID)
 	if err != nil {
-		s.log.Error("listing api keys", "error", err)
+		loggerFromContext(r.Context()).Error("listing api keys", "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("listing api keys failed"))
 		return
 	}
+	// The whole list is returned on one page, so the total is just the
+	// page size; no separate count query is needed.
+	w.Header().Set("X-Total-Count", fmt.Sprintf("%d", len(keys)))
 	writeCacheHeaders(w, cacheNoStore, 0, "")
 	writeJSON(w, http.StatusOK, map[string]any{"keys": keys})
 }
@@ -310,13 +319,13 @@ func (s *Server) handleRevokeTenantKey(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	err := s.tenants.RevokeAPIKey(r.Context(), id)
+	err := s.tenants.RevokeTenantAPIKey(r.Context(), id)
 	if errors.Is(err, store.ErrNotFound) {
 		writeError(w, http.StatusNotFound, fmt.Errorf("api key %d not found", id))
 		return
 	}
 	if err != nil {
-		s.log.Error("revoking api key", "error", err)
+		loggerFromContext(r.Context()).Error("revoking api key", "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("revoking api key failed"))
 		return
 	}
@@ -373,7 +382,7 @@ func (s *Server) writeUsage(w http.ResponseWriter, r *http.Request, tenantID int
 	}
 	usage, err := s.tenants.ListUsage(r.Context(), tenantID, days)
 	if err != nil {
-		s.log.Error("listing usage", "error", err)
+		loggerFromContext(r.Context()).Error("listing usage", "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("listing usage failed"))
 		return
 	}
@@ -402,7 +411,7 @@ func (s *Server) handleListOwnWatched(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleAddOwnWatched(w http.ResponseWriter, r *http.Request) {
 	p, _ := PrincipalFrom(r.Context())
 	var req watchRequest
-	if err := decodeJSON(w, r, &req); err != nil {
+	if err := decodeJSON(w, r, &req, s.httpRequestBodyLimit); err != nil {
 		return
 	}
 	if !config.ValidContractID(req.ContractID) {
@@ -416,7 +425,7 @@ func (s *Server) handleAddOwnWatched(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		s.log.Error("adding watched contract", "error", err)
+		loggerFromContext(r.Context()).Error("adding watched contract", "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("adding watched contract failed"))
 		return
 	}
@@ -430,7 +439,7 @@ func (s *Server) handleRemoveOwnWatched(w http.ResponseWriter, r *http.Request) 
 	p, _ := PrincipalFrom(r.Context())
 	contractID := chi.URLParam(r, "contract_id")
 	if err := s.tenants.RemoveTenantWatchedContract(r.Context(), p.Tenant.ID, contractID); err != nil {
-		s.log.Error("removing watched contract", "error", err)
+		loggerFromContext(r.Context()).Error("removing watched contract", "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("removing watched contract failed"))
 		return
 	}
@@ -440,10 +449,13 @@ func (s *Server) handleRemoveOwnWatched(w http.ResponseWriter, r *http.Request) 
 func (s *Server) writeOwnWatched(w http.ResponseWriter, r *http.Request, tenantID int64) {
 	watched, err := s.tenants.ListTenantWatchedContracts(r.Context(), tenantID)
 	if err != nil {
-		s.log.Error("listing watched contracts", "error", err)
+		loggerFromContext(r.Context()).Error("listing watched contracts", "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("listing watched contracts failed"))
 		return
 	}
+	// The whole list is returned on one page, so the total is just the
+	// page size; no separate count query is needed.
+	w.Header().Set("X-Total-Count", fmt.Sprintf("%d", len(watched)))
 	writeCacheHeaders(w, cacheNoStore, 0, "")
 	writeJSON(w, http.StatusOK, map[string]any{"contract_ids": watched})
 }
@@ -462,7 +474,7 @@ func (s *Server) tenantFromPath(w http.ResponseWriter, r *http.Request) (store.T
 		return store.Tenant{}, false
 	}
 	if err != nil {
-		s.log.Error("loading tenant", "error", err)
+		loggerFromContext(r.Context()).Error("loading tenant", "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("loading tenant failed"))
 		return store.Tenant{}, false
 	}
@@ -482,8 +494,9 @@ func pathInt64(w http.ResponseWriter, r *http.Request, name string) (int64, bool
 // decodeJSON reads a JSON body, writing a 400 and returning an error when it
 // cannot. The body is length-limited so an oversized payload is rejected
 // rather than buffered.
-func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) error {
-	const maxBody = 1 << 20
+// decodeJSON reads a JSON body, writing a 400 and returning an error when it
+// cannot. The body is length-limited using the provided maxBody argument.
+func decodeJSON(w http.ResponseWriter, r *http.Request, dst any, maxBody int64) error {
 	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBody))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(dst); err != nil {

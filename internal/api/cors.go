@@ -38,6 +38,12 @@ type CORSConfig struct {
 	// AllowedHeaders is returned on the preflight OPTIONS response.
 	// Defaults to "Content-Type, X-API-Key, Accept" via config.
 	AllowedHeaders []string
+	// ExposedHeaders is returned as Access-Control-Expose-Headers on
+	// responses to allowed origins, so browser JavaScript can read
+	// response headers it would otherwise be denied (#52). The API sets
+	// X-Request-ID on every response (see Server.requestLogger), so the
+	// wired default exposes exactly that; empty suppresses the header.
+	ExposedHeaders []string
 }
 
 // CORS returns middleware that applies the policy in cfg.
@@ -49,7 +55,8 @@ type CORSConfig struct {
 //     adding response overhead).
 //   - For any other request with an Origin header:
 //   - If Origin matches an allowed origin (exact match), the response
-//     gets Access-Control-Allow-Origin=<origin>, Vary: Origin, and
+//     gets Access-Control-Allow-Origin=<origin>, Vary: Origin,
+//     Access-Control-Expose-Headers when ExposedHeaders is set, and
 //     (for OPTIONS) Access-Control-Allow-Methods / -Headers.
 //   - If Origin does NOT match any allowed origin, the middleware
 //     passes the request through with no CORS headers. The browser
@@ -74,6 +81,7 @@ func CORS(cfg CORSConfig) func(http.Handler) http.Handler {
 	}
 	methods := strings.Join(cfg.AllowedMethods, ", ")
 	headers := strings.Join(cfg.AllowedHeaders, ", ")
+	expose := strings.Join(cfg.ExposedHeaders, ", ")
 
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -100,6 +108,7 @@ func CORS(cfg CORSConfig) func(http.Handler) http.Handler {
 				// "*" responses are identical regardless of origin, so
 				// do NOT add Vary: Origin — that would *break* caching
 				// for shared caches that key on Vary.
+				setExposeHeaders(w, expose)
 				if r.Method == http.MethodOptions {
 					writePreflightHeaders(w, methods, headers)
 					w.WriteHeader(http.StatusNoContent)
@@ -128,6 +137,7 @@ func CORS(cfg CORSConfig) func(http.Handler) http.Handler {
 			// "Origin". Read the existing Vary first, fold in
 			// "Origin", and Set the merged string back.
 			appendVary(h, "Origin")
+			setExposeHeaders(w, expose)
 			if r.Method == http.MethodOptions {
 				writePreflightHeaders(w, methods, headers)
 				w.WriteHeader(http.StatusNoContent)
@@ -135,6 +145,17 @@ func CORS(cfg CORSConfig) func(http.Handler) http.Handler {
 			}
 			next.ServeHTTP(w, r)
 		})
+	}
+}
+
+// setExposeHeaders writes Access-Control-Expose-Headers so browser
+// JavaScript on an allowed origin can read the named response headers
+// (X-Request-ID in particular — without it fetch() hides the header
+// even though it is always present). Empty list writes nothing, which
+// keeps the deny-all and unconfigured paths byte-identical to before.
+func setExposeHeaders(w http.ResponseWriter, expose string) {
+	if expose != "" {
+		w.Header().Set("Access-Control-Expose-Headers", expose)
 	}
 }
 

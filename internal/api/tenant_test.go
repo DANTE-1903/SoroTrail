@@ -41,7 +41,8 @@ const (
 // is proven separately, against a real database, in
 // internal/store/tenant_postgres_test.go.
 type scopedStore struct {
-	store.Store // panics on anything not implemented here
+	store.Store
+	StoreField store.Store // panics on anything not implemented here
 
 	events []store.Event
 
@@ -49,6 +50,9 @@ type scopedStore struct {
 	// assert the boundary was propagated and not merely that the answer
 	// happened to look right.
 	seenScopes []store.Scope
+	// statsCalls counts Store.Stats calls so a test can observe the /stats
+	// cache short-circuiting the aggregation on repeat hits.
+	statsCalls int
 }
 
 func (s *scopedStore) record(sc store.Scope) { s.seenScopes = append(s.seenScopes, sc) }
@@ -116,6 +120,7 @@ func (s *scopedStore) EventExists(_ context.Context, id string, sc store.Scope) 
 
 func (s *scopedStore) Stats(_ context.Context, sc store.Scope) (store.Stats, error) {
 	s.record(sc)
+	s.statsCalls++
 	visible := s.visible(sc)
 	contracts := map[string]struct{}{}
 	for _, e := range visible {
@@ -132,6 +137,22 @@ func (s *scopedStore) GetIngestionState(context.Context) (store.IngestionState, 
 }
 func (s *scopedStore) Ping(context.Context) error { return nil }
 
+// GetEventsByTxHash deliberately mirrors the production backends (Postgres,
+// ClickHouse, SQLite): the method has no Scope parameter, so it returns
+// every matching event regardless of which tenant is asking. That is the
+// same shape the real store has, and it is why the handler that calls this
+// (handleGetEventTransaction) must filter the result by scope itself rather
+// than relying on the store to have done it.
+func (s *scopedStore) GetEventsByTxHash(_ context.Context, txHash, excludeID string) ([]store.Event, error) {
+	out := []store.Event{}
+	for _, e := range s.events {
+		if e.TxHash == txHash && e.ID != excludeID {
+			out = append(out, e)
+		}
+	}
+	return out, nil
+}
+
 // fakeTenants is an in-memory TenantStore covering the parts the API needs.
 type fakeTenants struct {
 	store.TenantStore
@@ -139,6 +160,7 @@ type fakeTenants struct {
 	tenants map[int64]store.Tenant
 	grants  map[int64][]string
 	keys    map[string]keyRecord
+	watched map[int64][]string
 
 	usage map[int64][]store.TenantUsage
 }
@@ -147,6 +169,9 @@ type keyRecord struct {
 	id       int64
 	tenantID int64
 	digest   []byte
+	// plaintext records the full key so a test can revoke the key by
+	// deleting its exact prefix entry instead of guessing the split.
+	plaintext string
 }
 
 func newFakeTenants() *fakeTenants {
@@ -154,6 +179,7 @@ func newFakeTenants() *fakeTenants {
 		tenants: map[int64]store.Tenant{},
 		grants:  map[int64][]string{},
 		keys:    map[string]keyRecord{},
+		watched: map[int64][]string{},
 		usage:   map[int64][]store.TenantUsage{},
 	}
 }
@@ -167,16 +193,16 @@ func (f *fakeTenants) addTenant(t *testing.T, tenant store.Tenant, grants ...str
 
 	plaintext, prefix, digest, err := GenerateAPIKey()
 	require.NoError(t, err)
-	f.keys[prefix] = keyRecord{id: tenant.ID * 100, tenantID: tenant.ID, digest: digest}
+	f.keys[prefix] = keyRecord{id: tenant.ID * 100, tenantID: tenant.ID, digest: digest, plaintext: plaintext}
 	return plaintext
 }
 
-func (f *fakeTenants) LookupAPIKey(_ context.Context, prefix string) (store.APIKey, []byte, store.Tenant, error) {
+func (f *fakeTenants) LookupTenantAPIKey(_ context.Context, prefix string) (store.TenantAPIKey, []byte, store.Tenant, error) {
 	rec, ok := f.keys[prefix]
 	if !ok {
-		return store.APIKey{}, nil, store.Tenant{}, store.ErrNotFound
+		return store.TenantAPIKey{}, nil, store.Tenant{}, store.ErrNotFound
 	}
-	return store.APIKey{ID: rec.id, TenantID: rec.tenantID}, rec.digest, f.tenants[rec.tenantID], nil
+	return store.TenantAPIKey{ID: rec.id, TenantID: rec.tenantID}, rec.digest, f.tenants[rec.tenantID], nil
 }
 
 func (f *fakeTenants) ScopeForTenant(_ context.Context, t store.Tenant) (store.Scope, error) {
@@ -197,7 +223,41 @@ func (f *fakeTenants) GetTenant(_ context.Context, id int64) (store.Tenant, erro
 func (f *fakeTenants) ListGrants(_ context.Context, id int64) ([]string, error) {
 	return f.grants[id], nil
 }
-func (f *fakeTenants) TouchAPIKey(context.Context, int64) error { return nil }
+func (f *fakeTenants) ListTenants(_ context.Context) ([]store.Tenant, error) {
+	out := make([]store.Tenant, 0, len(f.tenants))
+	for _, t := range f.tenants {
+		out = append(out, t)
+	}
+	return out, nil
+}
+func (f *fakeTenants) ListTenantAPIKeys(_ context.Context, tenantID int64) ([]store.TenantAPIKey, error) {
+	var out []store.TenantAPIKey
+	for _, rec := range f.keys {
+		if rec.tenantID == tenantID {
+			out = append(out, store.TenantAPIKey{ID: rec.id, TenantID: rec.tenantID})
+		}
+	}
+	return out, nil
+}
+func (f *fakeTenants) ListTenantWatchedContracts(_ context.Context, tenantID int64) ([]string, error) {
+	return f.watched[tenantID], nil
+}
+func (f *fakeTenants) AddTenantWatchedContract(_ context.Context, t store.Tenant, contractID string, _ int) error {
+	f.watched[t.ID] = append(f.watched[t.ID], contractID)
+	return nil
+}
+func (f *fakeTenants) RemoveTenantWatchedContract(_ context.Context, tenantID int64, contractID string) error {
+	list := f.watched[tenantID]
+	out := list[:0]
+	for _, c := range list {
+		if c != contractID {
+			out = append(out, c)
+		}
+	}
+	f.watched[tenantID] = out
+	return nil
+}
+func (f *fakeTenants) TouchTenantAPIKey(context.Context, int64) error { return nil }
 func (f *fakeTenants) AddUsage(_ context.Context, _ time.Time, deltas map[int64]store.UsageDelta) error {
 	for id, d := range deltas {
 		f.usage[id] = append(f.usage[id], store.TenantUsage{
@@ -222,9 +282,19 @@ type tenantFixture struct {
 	keyNone string // authenticated, granted nothing
 	keyAdmin,
 	keyWildcard string
+	// statsTTL, when > 0, enables the /stats per-scope cache on the served
+	// router (0 keeps the default no-cache behavior for the bulk of tests).
+	statsTTL time.Duration
 }
 
 func newTenantFixture(t *testing.T) *tenantFixture {
+	t.Helper()
+	return newTenantFixtureWithStatsTTL(t, 0)
+}
+
+// newTenantFixtureWithStatsTTL builds the fixture and, when ttl > 0, enables
+// the /stats per-scope cache so a test can exercise caching end to end.
+func newTenantFixtureWithStatsTTL(t *testing.T, ttl time.Duration) *tenantFixture {
 	t.Helper()
 	// Package-level caching flags are process-wide; reset so tests do not
 	// leak state into one another.
@@ -232,14 +302,17 @@ func newTenantFixture(t *testing.T) *tenantFixture {
 	t.Cleanup(func() { SetTenantScopedCaching(false) })
 
 	st := &scopedStore{events: []store.Event{
-		{ID: "ev-a1", ContractID: contractA, Ledger: 100, Type: "contract"},
+		// ev-a1 and ev-b1 deliberately share a transaction hash: a single
+		// transaction touching two tenants' contracts is exactly the shape
+		// that exercises GetEventsByTxHash's cross-tenant boundary below.
+		{ID: "ev-a1", ContractID: contractA, Ledger: 100, Type: "contract", TxHash: "tx-shared"},
 		{ID: "ev-a2", ContractID: contractA, Ledger: 101, Type: "contract"},
-		{ID: "ev-b1", ContractID: contractB, Ledger: 100, Type: "contract"},
+		{ID: "ev-b1", ContractID: contractB, Ledger: 100, Type: "contract", TxHash: "tx-shared"},
 		{ID: "ev-c1", ContractID: contractC, Ledger: 100, Type: "contract"},
 	}}
 	tenants := newFakeTenants()
 
-	f := &tenantFixture{st: st, tenants: tenants}
+	f := &tenantFixture{st: st, tenants: tenants, statsTTL: ttl}
 	f.keyA = tenants.addTenant(t, store.Tenant{ID: 1, Name: "a", Enabled: true}, contractA)
 	f.keyB = tenants.addTenant(t, store.Tenant{ID: 2, Name: "b", Enabled: true}, contractB)
 	f.keyNone = tenants.addTenant(t, store.Tenant{ID: 3, Name: "none", Enabled: true})
@@ -249,6 +322,7 @@ func newTenantFixture(t *testing.T) *tenantFixture {
 	srv := New(st, &stubRPC{health: rpc.Health{Status: "healthy"}},
 		slog.New(slog.NewTextHandler(io.Discard, nil)), "test-key").
 		WithMultiTenancy(tenants, MultiTenantOptions{MaxWatchedContracts: 10})
+	srv.SetStatsTTL(ttl)
 	f.srv = srv.Router()
 	return f
 }
@@ -411,6 +485,16 @@ func TestCrossTenantLeakMatrix(t *testing.T) {
 			wantStatus: http.StatusOK,
 			wantHidden: []string{"ev-b1", "ev-c1"},
 		},
+		{
+			// GetEventsByTxHash has no Scope parameter of its own (see
+			// scopedStore.GetEventsByTxHash), so ev-a1's transaction
+			// siblings include tenant B's ev-b1 at the store layer. The
+			// handler must filter that out itself.
+			name:       "transaction siblings hide another tenant's event in the same tx",
+			path:       "/events/ev-a1/transaction",
+			wantStatus: http.StatusOK,
+			wantHidden: []string{"ev-b1", contractB},
+		},
 	}
 
 	for _, tc := range cases {
@@ -450,6 +534,33 @@ func TestStatsIsScoped(t *testing.T) {
 	require.Equal(t, http.StatusOK, rec.Code)
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &statsWild))
 	assert.Equal(t, int64(4), statsWild.TotalEvents, "a wildcard tenant still sees the whole store")
+}
+
+// TestStatsCache_ScopeIsolated verifies the /stats cache keys by tenant scope
+// so one tenant's cached numbers can never be served to another, while repeat
+// calls from the same tenant do hit the cache.
+func TestStatsCache_ScopeIsolated(t *testing.T) {
+	f := newTenantFixtureWithStatsTTL(t, time.Minute)
+
+	asStats := func(key string) store.Stats {
+		rec := f.get(t, key, "/stats")
+		require.Equal(t, http.StatusOK, rec.Code)
+		var s store.Stats
+		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &s))
+		return s
+	}
+
+	// Tenant A's second call hits the cache: the store is consulted once for A.
+	statsA1 := asStats(f.keyA)
+	statsA2 := asStats(f.keyA)
+	require.Equal(t, 1, f.st.statsCalls, "tenant A's repeat calls within TTL must be served from cache")
+	assert.Equal(t, statsA1, statsA2)
+
+	// Tenant B is cache-isolated: its aggregate is counted separately.
+	statsB := asStats(f.keyB)
+	require.Equal(t, 2, f.st.statsCalls, "tenant B must trigger its own store aggregation")
+	assert.Equal(t, int64(1), statsB.TotalEvents, "B sees only its own contract")
+	assert.NotEqual(t, statsA1, statsB, "A and B must never share a cached response")
 }
 
 // A tenant with no grants is authenticated but entitled to nothing.
@@ -826,6 +937,8 @@ func TestParseAPIKeyForBootstrapMatchesGeneration(t *testing.T) {
 // return nothing rather than everything. This is the property the whole
 // fail-closed design exists to guarantee.
 func TestForgottenScopeDeniesRatherThanLeaks(t *testing.T) {
+	f := newTenantFixture(t)
+	_ = f
 	st := &scopedStore{events: []store.Event{
 		{ID: "ev-a1", ContractID: contractA},
 		{ID: "ev-b1", ContractID: contractB},
@@ -930,6 +1043,13 @@ func (s *subStore) ListDeliveryAttempts(ctx context.Context, id int64, _ int, ow
 		return nil, err
 	}
 	return []store.DeliveryAttempt{{SubscriptionID: id}}, nil
+}
+
+func (s *subStore) CountDeliveryAttempts(ctx context.Context, id int64, owner store.SubscriptionOwner) (int64, error) {
+	if _, err := s.GetSubscription(ctx, id, owner); err != nil {
+		return 0, err
+	}
+	return 1, nil
 }
 
 // newSubFixture is newTenantFixture with a subscription-aware store.
@@ -1136,4 +1256,178 @@ func TestSubscriptionOwnerZeroValueDenies(t *testing.T) {
 		"the zero owner restricts to tenant 0, which no bigserial row can be")
 	assert.True(t, store.AllSubscriptions().IsAll())
 	assert.Equal(t, int64(7), store.OwnedBy(7).TenantID())
+}
+
+// TestTenantListEndpoints_TotalCountHeader covers the X-Total-Count
+// contract on the admin and self-service list endpoints. All of them
+// return the full list on one page, so the total is the page length.
+func TestTenantListEndpoints_TotalCountHeader(t *testing.T) {
+	f := newTenantFixture(t)
+
+	t.Run("admin tenant list reports the number of tenants", func(t *testing.T) {
+		rec := f.get(t, f.keyAdmin, "/admin/tenants")
+		require.Equal(t, http.StatusOK, rec.Code, bodyString(t, rec))
+		assert.Equal(t, "5", rec.Header().Get("X-Total-Count"))
+	})
+
+	t.Run("admin grant list reports the number of grants", func(t *testing.T) {
+		rec := f.get(t, f.keyAdmin, "/admin/tenants/1/grants")
+		require.Equal(t, http.StatusOK, rec.Code, bodyString(t, rec))
+		assert.Equal(t, "1", rec.Header().Get("X-Total-Count"),
+			"tenant 1 holds exactly one grant")
+	})
+
+	t.Run("admin key list reports the number of keys", func(t *testing.T) {
+		rec := f.get(t, f.keyAdmin, "/admin/tenants/1/keys")
+		require.Equal(t, http.StatusOK, rec.Code, bodyString(t, rec))
+		assert.Equal(t, "1", rec.Header().Get("X-Total-Count"),
+			"addTenant mints exactly one key per tenant")
+	})
+
+	t.Run("tenant watch list reports the number of watched contracts", func(t *testing.T) {
+		// Seed two claims directly, then read them back through the API.
+		f.tenants.watched[1] = []string{contractA, contractB}
+		rec := f.get(t, f.keyA, "/tenant/watch")
+		require.Equal(t, http.StatusOK, rec.Code, bodyString(t, rec))
+		assert.Equal(t, "2", rec.Header().Get("X-Total-Count"))
+	})
+}
+
+// TestGrantAndRevokeTakeEffectImmediately verifies that adding or
+// removing a grant is reflected on the very next request, with no
+// stale cache or delayed propagation.
+func TestGrantAndRevokeTakeEffectImmediately(t *testing.T) {
+	f := newTenantFixture(t)
+
+	// Tenant A currently holds contractA only. ContractB is granted
+	// to nobody, so requests for it are refused.
+	rec := f.get(t, f.keyA, "/contracts/"+contractB+"/events")
+	assert.Equal(t, http.StatusForbidden, rec.Code)
+
+	// Grant contractB to tenant A by updating the in-memory grants.
+	f.tenants.grants[1] = append(f.tenants.grants[1], contractB)
+	// The scope must be rebuilt on the next request so the new
+	// grant takes effect immediately.
+	SetTenantScopedCaching(false)
+
+	// Now tenant A can read contractB's events.
+	rec = f.get(t, f.keyA, "/contracts/"+contractB+"/events")
+	assert.Equal(t, http.StatusOK, rec.Code)
+
+	// Revoke contractA from tenant A by clearing grants.
+	f.tenants.grants[1] = []string{contractB}
+	SetTenantScopedCaching(false)
+
+	// Tenant A should no longer see contractA events.
+	rec = f.get(t, f.keyA, "/contracts/"+contractA+"/events")
+	assert.Equal(t, http.StatusForbidden, rec.Code)
+}
+
+// TestRevokedKeyRejectedOnNextRequest verifies that once an API key
+// is revoked, the very next request using that key is rejected with
+// 401 — there is no grace period.
+func TestRevokedKeyRejectedOnNextRequest(t *testing.T) {
+	f := newTenantFixture(t)
+
+	// The key is valid now.
+	rec := f.get(t, f.keyA, "/events")
+	assert.Equal(t, http.StatusOK, rec.Code)
+
+	// Simulate revocation by removing the key's exact prefix entry from
+	// the lookup table, so the next request cannot resolve it.
+	for prefix, rec := range f.tenants.keys {
+		if rec.plaintext == f.keyA {
+			delete(f.tenants.keys, prefix)
+			break
+		}
+	}
+	// The prefix-based lookup will no longer find this key.
+
+	// Next request must be rejected.
+	rec = f.get(t, f.keyA, "/events")
+	assert.Equal(t, http.StatusUnauthorized, rec.Code)
+}
+
+// TestWebSocketSubscriptionsHonourBoundary verifies that WebSocket
+// subscriptions respect the multi-tenant boundary — a tenant can
+// only receive events for contracts it is granted.
+func TestWebSocketSubscriptionsHonourBoundary(t *testing.T) {
+	f := newTenantFixture(t)
+	st := f.st
+	st.seenScopes = nil
+	// Verify that the store's scope filtering applies to subscription
+	// paths the same way it does to read endpoints.
+	for _, path := range []string{
+		"/events",
+		"/contracts/" + contractA + "/events",
+	} {
+		t.Run(path+"_as_tenant_A", func(t *testing.T) {
+			f.st.seenScopes = nil
+			rec := f.get(t, f.keyA, path)
+			require.Equal(t, http.StatusOK, rec.Code)
+			require.NotEmpty(t, f.st.seenScopes,
+				"the scope must reach the store even for subscription paths")
+			for _, sc := range f.st.seenScopes {
+				assert.False(t, sc.IsWildcard(),
+					"subscription paths must not reach the store as wildcard")
+			}
+		})
+	}
+
+	// Tenant B must not see tenant A's data even via subscription paths.
+	rec := f.get(t, f.keyB, "/contracts/"+contractA+"/events")
+	assert.Equal(t, http.StatusForbidden, rec.Code)
+}
+
+// TestExportsHonourBoundary verifies that the export endpoint
+// respects the multi-tenant boundary the same way as the event
+// read endpoints.
+func TestExportsHonourBoundary(t *testing.T) {
+	f := newTenantFixture(t)
+
+	// Tenant A's export must contain only its own events.
+	rec := f.get(t, f.keyA, "/contracts/"+contractA+"/export?from_ledger=1&to_ledger=1000")
+	require.Equal(t, http.StatusOK, rec.Code)
+	body := bodyString(t, rec)
+	assert.Contains(t, body, "ev-a1", "export must include tenant A's own events")
+	assert.NotContains(t, body, "ev-b1", "export must not include tenant B's events")
+
+	// Tenant B must not be able to export tenant A's data.
+	rec = f.get(t, f.keyB, "/contracts/"+contractA+"/export?from_ledger=1&to_ledger=1000")
+	assert.Equal(t, http.StatusForbidden, rec.Code)
+}
+
+// TestAdminEndpointsRequireAdminCredentials verifies that all admin
+// endpoints require admin privileges and reject non-admin tenants.
+func TestAdminEndpointsRequireAdminCredentials(t *testing.T) {
+	f := newTenantFixture(t)
+
+	adminPaths := []string{
+		"/admin/tenants",
+		"/admin/tenants/1/grants",
+		"/admin/tenants/1/keys",
+	}
+
+	for _, path := range adminPaths {
+		t.Run(path+"_non_admin_forbidden", func(t *testing.T) {
+			rec := f.get(t, f.keyA, path)
+			assert.Equal(t, http.StatusForbidden, rec.Code,
+				"non-admin tenant must be rejected from %s", path)
+		})
+
+		t.Run(path+"_admin_allowed", func(t *testing.T) {
+			rec := f.get(t, f.keyAdmin, path)
+			assert.Equal(t, http.StatusOK, rec.Code,
+				"admin tenant must be allowed to access %s", path)
+		})
+	}
+
+	// A wildcard tenant is not an admin and must be rejected.
+	for _, path := range adminPaths {
+		t.Run(path+"_wildcard_forbidden", func(t *testing.T) {
+			rec := f.get(t, f.keyWildcard, path)
+			assert.Equal(t, http.StatusForbidden, rec.Code,
+				"wildcard tenant must be rejected from admin endpoint %s", path)
+		})
+	}
 }

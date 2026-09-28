@@ -160,6 +160,95 @@ func TestCORS_WildcardPreflight(t *testing.T) {
 	assert.Equal(t, "GET, POST", rr.Header().Get("Access-Control-Allow-Methods"))
 }
 
+// TestCORS_ExposedHeadersOnAllowedOrigin pins the #52 guidance that
+// X-Request-ID (set on every response by the request logger) is
+// readable by browser JavaScript on an allowed origin: without
+// Access-Control-Expose-Headers, fetch() hides it even though it is
+// present on the wire.
+func TestCORS_ExposedHeadersOnAllowedOrigin(t *testing.T) {
+	h := CORS(CORSConfig{
+		AllowedOrigins: []string{"https://app.example.com"},
+		ExposedHeaders: []string{"X-Request-ID", "X-RateLimit-Remaining"},
+	})(okHandler)
+
+	req := httptest.NewRequest(http.MethodGet, "/x", nil)
+	req.Header.Set("Origin", "https://app.example.com")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	assert.Equal(t, "https://app.example.com", rr.Header().Get("Access-Control-Allow-Origin"))
+	assert.Equal(t, "X-Request-ID, X-RateLimit-Remaining",
+		rr.Header().Get("Access-Control-Expose-Headers"))
+}
+
+// TestCORS_ExposedHeadersDefaultedToRequestID is the wiring contract
+// with main: a config carrying only the X-Request-ID default exposes
+// exactly that header, and nothing else.
+func TestCORS_ExposedHeadersDefaultedToRequestID(t *testing.T) {
+	h := CORS(CORSConfig{
+		AllowedOrigins: []string{"https://app.example.com"},
+		ExposedHeaders: []string{"X-Request-ID"},
+	})(okHandler)
+
+	req := httptest.NewRequest(http.MethodGet, "/x", nil)
+	req.Header.Set("Origin", "https://app.example.com")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	assert.Equal(t, "X-Request-ID", rr.Header().Get("Access-Control-Expose-Headers"))
+}
+
+// TestCORS_NoExposeHeadersWhenUnset confirms an empty ExposedHeaders
+// list suppresses Access-Control-Expose-Headers entirely — responses
+// are byte-identical to the pre-expose behavior.
+func TestCORS_NoExposeHeadersWhenUnset(t *testing.T) {
+	h := CORS(CORSConfig{
+		AllowedOrigins: []string{"https://app.example.com"},
+	})(okHandler)
+
+	req := httptest.NewRequest(http.MethodGet, "/x", nil)
+	req.Header.Set("Origin", "https://app.example.com")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	assert.Empty(t, rr.Header().Get("Access-Control-Expose-Headers"))
+}
+
+// TestCORS_ExposedHeadersOnWildcardAndPreflight covers the remaining
+// allowed-origin paths: "*" simple responses and preflights carry the
+// expose list too, while disallowed origins never see it.
+func TestCORS_ExposedHeadersOnWildcardAndPreflight(t *testing.T) {
+	wildcard := CORS(CORSConfig{
+		AllowedOrigins: []string{"*"},
+		ExposedHeaders: []string{"X-Request-ID"},
+	})(okHandler)
+
+	req := httptest.NewRequest(http.MethodGet, "/x", nil)
+	req.Header.Set("Origin", "https://anything.example.com")
+	rr := httptest.NewRecorder()
+	wildcard.ServeHTTP(rr, req)
+	assert.Equal(t, "X-Request-ID", rr.Header().Get("Access-Control-Expose-Headers"))
+
+	preflight := CORS(CORSConfig{
+		AllowedOrigins: []string{"https://app.example.com"},
+		ExposedHeaders: []string{"X-Request-ID"},
+	})(okHandler)
+
+	req = httptest.NewRequest(http.MethodOptions, "/x", nil)
+	req.Header.Set("Origin", "https://app.example.com")
+	rr = httptest.NewRecorder()
+	preflight.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusNoContent, rr.Code)
+	assert.Equal(t, "X-Request-ID", rr.Header().Get("Access-Control-Expose-Headers"))
+
+	disallowed := httptest.NewRequest(http.MethodGet, "/x", nil)
+	disallowed.Header.Set("Origin", "https://evil.example.com")
+	rr = httptest.NewRecorder()
+	preflight.ServeHTTP(rr, disallowed)
+	assert.Empty(t, rr.Header().Get("Access-Control-Expose-Headers"),
+		"disallowed origin gets no CORS headers of any kind")
+}
+
 // TestCORS_SameOriginRequestPassesThrough confirms a request with no
 // Origin header is forwarded unchanged. Same-origin browser calls
 // don't carry an Origin header.

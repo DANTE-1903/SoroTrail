@@ -152,16 +152,26 @@ type EventFilterArgs struct {
 
 // FilterInput maps the GraphQL EventFilterInput input type.
 type FilterInput struct {
-	ContractID    string              `json:"contractId"`
-	Types         []string            `json:"types"`
-	Topic         json.RawMessage     `json:"topic"`
-	Topics        *TopicPositionInput `json:"topics"`
-	TopicContains json.RawMessage     `json:"topicContains"`
-	TxHash        string              `json:"txHash"`
-	FromLedger    *int64              `json:"fromLedger"`
-	ToLedger      *int64              `json:"toLedger"`
-	FromTime      *time.Time          `json:"fromTime"`
-	ToTime        *time.Time          `json:"toTime"`
+	ContractID       string              `json:"contractId"`
+	ContractIDs      []string            `json:"contractIds"`
+	ContractIDPrefix string              `json:"contractIdPrefix"`
+	Types            []string            `json:"types"`
+	Topic            json.RawMessage     `json:"topic"`
+	Topics           *TopicPositionInput `json:"topics"`
+	TopicContains    json.RawMessage     `json:"topicContains"`
+	TxHash           string              `json:"txHash"`
+	// TxIndex and OpIndex mirror the REST ?tx_index / ?op_index exact-match
+	// filters. nil means "no constraint".
+	TxIndex *int32 `json:"txIndex"`
+	OpIndex *int32 `json:"opIndex"`
+	// InSuccessfulCall and HasValue are tri-state filters mirroring REST's
+	// ?in_successful_call / ?has_value. nil means "no constraint".
+	InSuccessfulCall *bool      `json:"inSuccessfulCall"`
+	HasValue         *bool      `json:"hasValue"`
+	FromLedger       *int64     `json:"fromLedger"`
+	ToLedger         *int64     `json:"toLedger"`
+	FromTime         *time.Time `json:"fromTime"`
+	ToTime           *time.Time `json:"toTime"`
 }
 
 // TopicPositionInput maps the GraphQL TopicPositionFilterInput input type.
@@ -230,18 +240,24 @@ func buildEventFilter(args EventFilterArgs) (store.EventFilter, string, string, 
 	}
 
 	queryArgs := queries.EventFilterArgs{
-		ContractID: args.Filter.ContractID,
-		Types:      args.Filter.Types,
-		Topic:      args.Filter.Topic,
-		TxHash:     args.Filter.TxHash,
-		FromLedger: derefInt64(args.Filter.FromLedger),
-		ToLedger:   derefInt64(args.Filter.ToLedger),
-		FromTime:   derefTime(args.Filter.FromTime),
-		ToTime:     derefTime(args.Filter.ToTime),
-		Order:      order,
-		OrderBy:    orderBy,
-		Cursor:     pageCursor,
-		Limit:      limit,
+		ContractID:       args.Filter.ContractID,
+		ContractIDs:      args.Filter.ContractIDs,
+		ContractIDPrefix: args.Filter.ContractIDPrefix,
+		Types:            args.Filter.Types,
+		Topic:            args.Filter.Topic,
+		TxHash:           args.Filter.TxHash,
+		TxIndex:          args.Filter.TxIndex,
+		OpIndex:          args.Filter.OpIndex,
+		InSuccessfulCall: args.Filter.InSuccessfulCall,
+		HasValue:         args.Filter.HasValue,
+		FromLedger:       derefInt64(args.Filter.FromLedger),
+		ToLedger:         derefInt64(args.Filter.ToLedger),
+		FromTime:         derefTime(args.Filter.FromTime),
+		ToTime:           derefTime(args.Filter.ToTime),
+		Order:            order,
+		OrderBy:          orderBy,
+		Cursor:           pageCursor,
+		Limit:            limit,
 	}
 	if topics != nil {
 		queryArgs.T0 = topics.T0

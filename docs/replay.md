@@ -41,6 +41,7 @@ sorotrail replay --from-ledger N [--to-ledger M] [flags]
 | `--batch-size` | `500` | Events re-decoded per transaction. |
 | `--restart` | `false` | Discard saved progress and replay the range from the start. |
 | `--dry-run` | `false` | Report what would change; write nothing. |
+| `--progress-interval` | `0` | Emit periodic progress to stderr (e.g. `30s`, `1m`). `0` disables. |
 
 Configuration (notably `DATABASE_URL`) comes from the same environment
 variables the indexer uses.
@@ -75,6 +76,173 @@ replay completed
   forever. A non-zero count deserves investigation.
 
 Exit codes: `0` completed, `2` interrupted (re-run to resume), `1` error.
+
+## The workflow, end to end
+
+A replay is five steps: know what changed, size the job, dry-run it, run it,
+verify it. The commands below are the whole loop, in order.
+
+### 1. Confirm the new decoder is the one deployed
+
+Replay runs the decoder compiled into the binary you invoke — not the one
+running in the indexer. Running an old binary against a database rewrites
+rows *backwards*.
+
+```sh
+# The running indexer reports the build it was compiled from.
+curl -s localhost:8080/version | jq .
+# {
+#   "version": "v1.9.0",
+#   "commit": "4f2ab19",
+#   "build_date": "2026-09-18T10:22:04Z"
+# }
+```
+
+Check that commit contains the decoder change you are replaying for, and
+invoke `replay` from a binary built from the same commit or newer. In
+Kubernetes, run the replay from the same image tag as the deployment:
+
+```sh
+kubectl run sorotrail-replay --rm -it --restart=Never \
+  --image=ghcr.io/sorotrail/sorotrail:v1.9.0 \
+  --env="DATABASE_URL=$DATABASE_URL" \
+  -- replay --from-ledger 250000 --progress-interval 1m
+```
+
+### 2. Size the job
+
+Only rows that still have their raw XDR can be replayed, so the row count in
+the range is an upper bound, not the real one:
+
+```sql
+SELECT count(*)                                   AS rows_in_range,
+       count(*) FILTER (WHERE raw_value_xdr IS NOT NULL) AS replayable
+  FROM events
+ WHERE ledger >= 250000;
+```
+
+If `replayable` is far below `rows_in_range`, most of the range predates raw
+XDR retention and a replay will mostly report *skipped* — see
+[Rows without raw XDR](#rows-without-raw-xdr).
+
+### 3. Dry-run the range
+
+```sh
+DATABASE_URL=postgres://... sorotrail replay --from-ledger 250000 --dry-run
+```
+
+```
+replay completed (dry run — nothing written)
+  rows processed: 18234
+  rows changed:   4021
+  rows skipped:   118 (no raw XDR stored)
+  rows failed:    0 (stored XDR could not be decoded)
+  duration:       9.203s
+```
+
+Read `rows changed` as the blast radius. Two answers are worth pausing on:
+
+- **Zero changed.** Either the decoder change does not affect stored data,
+  or you are running the wrong binary. Go back to step 1.
+- **Every row changed.** Expected for a change to a common ScVal type;
+  surprising for a narrow fix. Spot-check one row (step 4) before writing.
+
+### 4. Spot-check a single event first
+
+Take one event ID out of the range and compare what is stored now against
+what the new decoder produces from the same XDR:
+
+```sh
+# What is stored today — ?decoded=false returns the stored columns with
+# nothing derived layered on top.
+curl -s 'localhost:8080/events/0000250013-0000000001?decoded=false' | jq '{topics, value}'
+
+# The raw XDR those columns were decoded from.
+curl -s 'localhost:8080/events/0000250013-0000000001/raw' | jq .
+```
+
+Then dry-run just that event's ledger and confirm it is counted as changed:
+
+```sh
+sorotrail replay --from-ledger 250013 --to-ledger 250013 --dry-run
+```
+
+### 5. Run it
+
+Start with a bounded slice rather than the whole history — a small range
+proves the pipeline end to end and is cheap to inspect:
+
+```sh
+sorotrail replay --from-ledger 250000 --to-ledger 260000 --progress-interval 30s
+```
+
+```
+  replay: 8000  rate 194.2/s  elapsed 41s
+  replay: 16000  rate 193.5/s  elapsed 1m23s
+replay completed
+  rows processed: 18234
+  rows changed:   4021
+  rows skipped:   118 (no raw XDR stored)
+  rows failed:    0 (stored XDR could not be decoded)
+  duration:       94.481s
+```
+
+Then let the rest run unbounded:
+
+```sh
+sorotrail replay --from-ledger 260001 --progress-interval 1m
+```
+
+For a very large history, walk it in chunks so each run is independently
+resumable and its results independently reviewable:
+
+```sh
+for start in $(seq 250000 100000 950000); do
+  end=$((start + 99999))
+  echo "── ledgers $start..$end"
+  sorotrail replay --from-ledger "$start" --to-ledger "$end" --batch-size 200 \
+    || exit 1   # exit 2 = interrupted; re-run the same command to resume
+done
+```
+
+Under Docker Compose the replay is a one-off container sharing the service's
+environment:
+
+```sh
+docker compose run --rm sorotrail replay --from-ledger 250000
+```
+
+### 6. Verify
+
+```sh
+# Re-running is the cheapest verification: a completed replay rewrites
+# nothing the second time (rows changed: 0).
+sorotrail replay --from-ledger 250000 --to-ledger 260000 --dry-run
+
+# And the spot-checked event now reads back with the new decoding.
+curl -s 'localhost:8080/events/0000250013-0000000001?decoded=false' | jq '{topics, value}'
+```
+
+A second dry run reporting `rows changed: 0` is the end-state check: the
+stored decoding is now a fixed point of the current decoder.
+
+Caches are the one thing a replay does not touch. `GET /events/{id}`
+responses are served with a one-year `immutable` cache lifetime, so a
+replayed event can still be served from a CDN or client cache in its old
+decoding. Purge the affected paths, or accept the lag, after a replay that
+changed a lot of rows.
+
+### Where it fits with the other commands
+
+| Symptom | Command |
+| --- | --- |
+| Decoder improved; stored decodings are stale | `sorotrail replay` (this doc) |
+| Ledger range was never ingested at all | `sorotrail backfill` ([backfill.md](backfill.md)) |
+| Stored rows disagree with the chain | the auditor's repair path ([runbook.md](runbook.md)) |
+
+Replay never fetches from the RPC and never inserts rows. If the data is
+missing rather than mis-decoded, replay is the wrong tool — it can only
+re-decode what is already stored.
 
 ## Interrupting and resuming
 
@@ -157,8 +325,8 @@ keeps the order in one reviewable spot.
 
 ## Rows without raw XDR
 
-Raw XDR (`events.topics_xdr`, `events.value_xdr`) is stored from the
-migration `0004_raw_xdr_and_replay` onward. Rows ingested before that have
+Raw XDR (`events.raw_topic_xdr`, `events.raw_value_xdr`) is stored from the
+migration `0007_partition_events` onward. Rows ingested before that have
 `NULL` there and can never be replayed — the XDR is gone and the RPC dropped
 the ledger long ago. Replay counts them as *skipped* and leaves their stored
 decoding alone.

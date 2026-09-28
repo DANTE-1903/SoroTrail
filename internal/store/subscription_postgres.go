@@ -47,6 +47,7 @@ func (p *Postgres) GetSubscription(ctx context.Context, id int64, owner Subscrip
 	var (
 		s       Subscription
 		filters []byte
+		network *string
 	)
 	pred, args := ownerPredicate(owner, 2)
 	err := p.pool.QueryRow(ctx,
@@ -61,6 +62,9 @@ func (p *Postgres) GetSubscription(ctx context.Context, id int64, owner Subscrip
 	}
 	if err := json.Unmarshal(filters, &s.Filters); err != nil {
 		return Subscription{}, fmt.Errorf("unmarshaling subscription filters: %w", err)
+	}
+	if network != nil {
+		s.Filters.Network = *network
 	}
 	return s, nil
 }
@@ -140,8 +144,6 @@ func (p *Postgres) ListEnabledSubscriptions(ctx context.Context) ([]Subscription
 	return scanSubscriptions(rows)
 }
 
-// --- Failure counting ---
-
 func (p *Postgres) IncrementSubscriptionFailures(ctx context.Context, id int64, maxFailures int) (int, bool, error) {
 	var newCount int
 	var stillEnabled bool
@@ -171,8 +173,6 @@ func (p *Postgres) ResetSubscriptionFailures(ctx context.Context, id int64) erro
 	return nil
 }
 
-// --- Delivery attempts ---
-
 func (p *Postgres) RecordDeliveryAttempt(ctx context.Context, a DeliveryAttempt) (DeliveryAttempt, error) {
 	err := p.pool.QueryRow(ctx, `
 		INSERT INTO delivery_attempts
@@ -180,7 +180,7 @@ func (p *Postgres) RecordDeliveryAttempt(ctx context.Context, a DeliveryAttempt)
 		VALUES ($1, $2, $3, $4, $5, $6)
 		RETURNING id, created_at`,
 		a.SubscriptionID, a.EventID, a.Status, a.ResponseCode,
-		a.DurationMs, nullableString(a.Error),
+		a.DurationMs, a.Error, // NOT NULL DEFAULT ''; empty means success, never NULL
 	).Scan(&a.ID, &a.CreatedAt)
 	if err != nil {
 		return DeliveryAttempt{}, fmt.Errorf("recording delivery attempt: %w", err)
@@ -231,7 +231,23 @@ func (p *Postgres) ListDeliveryAttempts(ctx context.Context, subscriptionID int6
 	return attempts, nil
 }
 
-// --- helpers ---
+// CountDeliveryAttempts returns the total number of delivery attempts
+// recorded for a subscription, ignoring the list's limit. The same owner
+// check as ListDeliveryAttempts gates it: delivery history reveals which
+// events matched, so a tenant must not be able to count another's.
+func (p *Postgres) CountDeliveryAttempts(ctx context.Context, subscriptionID int64, owner SubscriptionOwner) (int64, error) {
+	if _, err := p.GetSubscription(ctx, subscriptionID, owner); err != nil {
+		return 0, err
+	}
+	var total int64
+	if err := p.pool.QueryRow(ctx,
+		`SELECT count(*) FROM delivery_attempts WHERE subscription_id = $1`,
+		subscriptionID,
+	).Scan(&total); err != nil {
+		return 0, fmt.Errorf("counting delivery attempts: %w", err)
+	}
+	return total, nil
+}
 
 func scanSubscriptions(rows pgx.Rows) ([]Subscription, error) {
 	var subs []Subscription
@@ -239,6 +255,7 @@ func scanSubscriptions(rows pgx.Rows) ([]Subscription, error) {
 		var (
 			s       Subscription
 			filters []byte
+			network *string
 		)
 		if err := rows.Scan(&s.ID, &s.URL, &filters, &s.Secret, &s.Enabled,
 			&s.FailureCount, &s.CreatedAt, &s.TenantID); err != nil {
@@ -247,12 +264,14 @@ func scanSubscriptions(rows pgx.Rows) ([]Subscription, error) {
 		if err := json.Unmarshal(filters, &s.Filters); err != nil {
 			return nil, fmt.Errorf("unmarshaling subscription filters: %w", err)
 		}
+		if network != nil {
+			s.Filters.Network = *network
+		}
 		subs = append(subs, s)
 	}
 	return subs, rows.Err()
 }
 
-// Delivery status constants.
 const (
 	DeliverySuccess = "success"
 	DeliveryFailed  = "failed"

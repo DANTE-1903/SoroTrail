@@ -81,6 +81,25 @@ func TestBuildEventFilter_BadContractID(t *testing.T) {
 	assert.Contains(t, err.Error(), "invalid contract_id")
 }
 
+// TestBuildEventFilter_ContractIDPrefixConflict rejects combining
+// contract_id and contract_id_prefix.
+func TestBuildEventFilter_ContractIDPrefixConflict(t *testing.T) {
+	_, err := BuildEventFilter(EventFilterArgs{
+		ContractID:       "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+		ContractIDPrefix: "C",
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "cannot be combined")
+}
+
+// TestBuildEventFilter_ContractIDPrefix passes through the prefix unchanged.
+func TestBuildEventFilter_ContractIDPrefix(t *testing.T) {
+	got, err := BuildEventFilter(EventFilterArgs{ContractIDPrefix: "CABC"})
+	require.NoError(t, err)
+	assert.Equal(t, "CABC", got.ContractIDPrefix)
+	assert.Empty(t, got.ContractID)
+}
+
 // TestBuildEventFilter_BadOrder rejects unsupported sort directions.
 func TestBuildEventFilter_BadOrder(t *testing.T) {
 	_, err := BuildEventFilter(EventFilterArgs{Order: "reverse"})
@@ -147,6 +166,16 @@ func TestParseTopic_AutoQuote(t *testing.T) {
 	assert.JSONEq(t, `{"symbol":"transfer"}`, string(got))
 }
 
+func TestParseTopic_RejectsMalformedJSONLikeInput(t *testing.T) {
+	_, err := ParseTopic(`{"symbol":"transfer"`)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "valid JSON")
+
+	_, err = ParseTopic(`[1,2`)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "valid JSON")
+}
+
 // TestParseTopicContains_RejectsNonJSON mirrors REST's strict JSON
 // requirement on this filter.
 func TestParseTopicContains_RejectsNonJSON(t *testing.T) {
@@ -160,6 +189,16 @@ func TestParseLedgerParam_ZeroOnEmpty(t *testing.T) {
 	got, err := ParseLedgerParam("")
 	require.NoError(t, err)
 	assert.Equal(t, int64(0), got)
+}
+
+func TestParseLedgerParam_RejectsZeroAndNegative(t *testing.T) {
+	_, err := ParseLedgerParam("0")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "positive integer")
+
+	_, err = ParseLedgerParam("-5")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "positive integer")
 }
 
 // TestParseTimeParam_RejectsSubSecond ensures RFC3339 precision

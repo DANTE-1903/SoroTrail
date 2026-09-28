@@ -3,6 +3,7 @@
 package api
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -36,13 +37,22 @@ func (r *Recoverer) Middleware(next http.Handler) http.Handler {
 		defer func() {
 			if rvr := recover(); rvr != nil {
 				r.count.Add(1)
-				r.log.Error("http panic recovered",
+				// The request-scoped logger carries the request_id field,
+				// so a recovered panic is correlatable with the rest of
+				// the request's log lines and the X-Request-ID response
+				// header. Standalone use (unit tests, mounting outside the
+				// router) keeps the logger the constructor was given.
+				log := loggerFromContext(req.Context())
+				if log == slog.Default() && r.log != nil {
+					log = r.log
+				}
+				log.Error("http panic recovered",
 					"path", req.URL.Path,
 					"method", req.Method,
 					"panic", fmt.Sprintf("%v", rvr),
 					"stack", string(debug.Stack()),
 				)
-				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+				writeError(w, http.StatusInternalServerError, errors.New(http.StatusText(http.StatusInternalServerError)))
 			}
 		}()
 		next.ServeHTTP(w, req)
