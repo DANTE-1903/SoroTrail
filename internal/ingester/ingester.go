@@ -396,6 +396,10 @@ type Ingester struct {
 	// top of each cycle and logs it in a deferred call; the fields are
 	// atomic because the concurrent window-sweep goroutines increment it.
 	cycle cycleCounters
+	// dryRunPosition is used only when Options.DryRun is true. It is
+	// accessed by the Run goroutine (or the single goroutine driving
+	// RunOnceForTest), so it needs no synchronization.
+	dryRunPosition *dryRunPosition
 }
 
 // cycleCounters holds the per-poll-cycle totals behind the structured
@@ -1501,7 +1505,33 @@ func (ing *Ingester) setDryRunPosition(cursor string, lastIngestedLedger int64) 
 	}
 }
 
+func (ing *Ingester) logDryRunAddressRefs(events []store.Event) {
+	var refs []store.AddressRef
+	for _, ev := range events {
+		for _, ref := range decode.ExtractAddresses(ev.Topics, ev.Value) {
+			refs = append(refs, store.AddressRef{Address: ref.Address, EventID: ev.ID, Role: ref.Role})
+		}
+	}
+	if len(refs) == 0 {
+		return
+	}
+	ids := make([]string, len(refs))
+	for i, ref := range refs {
+		ids[i] = ref.EventID
+	}
+	ing.log.Info("dry-run: would write address references",
+		"count", len(refs),
+		"event_ids", ids)
+}
+
 func (ing *Ingester) resolvePosition(ctx context.Context) (startLedger uint32, cursor string, err error) {
+	if ing.opts.DryRun && ing.dryRunPosition != nil {
+		if ing.dryRunPosition.cursor != "" {
+			return 0, ing.dryRunPosition.cursor, nil
+		}
+		return uint32(ing.dryRunPosition.lastIngestedLedger) + 1, "", nil
+	}
+
 	if !ing.startOverrideApplied && ing.opts.StartLedger > 0 {
 		ing.startOverrideApplied = true // Apply override exactly once on startup
 		health, hErr := ing.client.GetHealth(ctx)
