@@ -11,10 +11,14 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/coder/websocket"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/sorotrail/sorotrail/internal/apikey"
+	"github.com/sorotrail/sorotrail/internal/rpc"
 	"github.com/sorotrail/sorotrail/internal/store"
 )
 
@@ -94,11 +98,11 @@ type errTenants struct {
 	scopeErr  error
 }
 
-func (e *errTenants) LookupAPIKey(ctx context.Context, prefix string) (store.APIKey, []byte, store.Tenant, error) {
+func (e *errTenants) LookupTenantAPIKey(ctx context.Context, prefix string) (store.TenantAPIKey, []byte, store.Tenant, error) {
 	if e.lookupErr != nil {
-		return store.APIKey{}, nil, store.Tenant{}, e.lookupErr
+		return store.TenantAPIKey{}, nil, store.Tenant{}, e.lookupErr
 	}
-	return e.fakeTenants.LookupAPIKey(ctx, prefix)
+	return e.fakeTenants.LookupTenantAPIKey(ctx, prefix)
 }
 
 func (e *errTenants) ScopeForTenant(ctx context.Context, t store.Tenant) (store.Scope, error) {
@@ -548,16 +552,7 @@ func TestWriteUnauthorizedHelper(t *testing.T) {
 	var env errorResponse
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &env))
 	assert.Equal(t, "missing API key", env.Error)
-	"time"
-
-	"github.com/coder/websocket"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
-
-	"github.com/sorotrail/sorotrail/internal/apikey"
-	"github.com/sorotrail/sorotrail/internal/rpc"
-	"github.com/sorotrail/sorotrail/internal/store"
-)
+}
 
 // authStubStore wraps stubStore with in-memory API key persistence so
 // the auth middleware and key-management handlers can be tested without
