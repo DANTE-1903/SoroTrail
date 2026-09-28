@@ -366,7 +366,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/EventResponse"
+                  "$ref": "#/components/schemas/Event"
                 },
                 "example": {
                   "id": "0001099511627776-0000000001",
@@ -4785,20 +4785,7 @@
           "events": {
             "type": "array",
             "items": {
-              "anyOf": [
-                {
-                  "$ref": "#/components/schemas/Event"
-                },
-                {
-                  "$ref": "#/components/schemas/EnrichedEvent"
-                },
-                {
-                  "$ref": "#/components/schemas/EventWithXDR"
-                },
-                {
-                  "$ref": "#/components/schemas/ProjectedEvent"
-                }
-              ]
+              "$ref": "#/components/schemas/Event"
             }
           },
           "cursor": {
