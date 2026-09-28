@@ -32,6 +32,19 @@ func TestSanitizeURL(t *testing.T) {
 			input: "https://user:secretpassword@rpc.example.com/path",
 			want:  "https://user:%2A%2A%2A@rpc.example.com/path",
 		},
+		// A password does not have to be exotic to defeat url.Parse, and the
+		// old fallback returned the string verbatim — so the one input most
+		// likely to hold a secret was the one that got logged in full.
+		{
+			name:  "unparseable url is redacted, not passed through",
+			input: "https://user:sekret%pass@rpc.example.com/path",
+			want:  "<redacted>",
+		},
+		{
+			name:  "space in userinfo is redacted",
+			input: "https://user:has space@rpc.example.com/path",
+			want:  "<redacted>",
+		},
 	}
 
 	for _, tt := range tests {

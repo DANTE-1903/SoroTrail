@@ -16,20 +16,27 @@ seams — most features should slot in behind an existing interface.
 1. Go 1.25+ (any Go ≥ 1.21 works too — the go toolchain auto-downloads the
    version pinned in go.mod) and Docker.
 2. Run `make help` to see every available target.
-3. `docker compose up -d postgres` for a local database (the integration
-   suite can also spin up its own ephemeral container — see "How the
-   integration test layer works" below).
+3. `make docker-up` is the quickest route to a local Postgres (starts
+   Postgres and the indexer via `docker compose up -d --build`). Alternatively,
+   run `docker compose up -d postgres` for a database-only service. The
+   integration suite can also spin up its own ephemeral container via Docker —
+   see "How the integration test layer works" below.
 4. `make test` for the unit suite, race-detector enabled
    (`go test -race ./...`) — the same race checking CI runs, so a data
-   race can't pass locally and fail in CI. The integration tests are
-   gated behind the `integration` build tag, so it stays a unit-only
-   run. `-race` requires cgo and a C toolchain; on Windows, install gcc
-   (e.g. MinGW-w64) or use `make test-fast` for the plain, non-race
-   run.
-5. `make test-integration` runs the integration suite against a real
-   Postgres — `go test -tags=integration -p 1 ./... -count=1`.
-6. `make test-db` runs everything, including integration tests, against
-   whatever `TEST_DATABASE_URL` points at — kept for backwards
+   race can't pass locally and fail in CI. Note that a plain `go test ./...`
+   (and `make test-fast`) skips the database-backed tests rather than failing.
+   The integration tests are gated behind the `integration` build tag, so it
+   stays a unit-only run. `-race` requires cgo and a C toolchain; on Windows,
+   install gcc (e.g. MinGW-w64) or use `make test-fast` for the plain,
+   non-race run.
+5. `make test-integration` runs the integration-tagged suite against a real
+   Postgres — `go test -tags=integration -p 1 ./... -count=1`. This additionally
+   needs Docker because the tagged suite starts an ephemeral container through
+   testcontainers when `TEST_DATABASE_URL` is unset.
+6. `make test-db` runs the full test suite against Postgres (requires
+   `DATABASE_URL`) — `TEST_DATABASE_URL=$(DATABASE_URL) go test -p 1 ./...`.
+   This target requires a live Postgres instance; without one, the tests will
+   fail with a connection error rather than skipping. Kept for backwards
    compatibility with the previous workflow.
 7. `make cover` / `make cover-html` for coverage.
 8. `make lint` (install [golangci-lint](https://golangci-lint.run/) locally).
@@ -73,9 +80,11 @@ Database resolution, in order:
   that points back here, so an integration run never fails loud for
   missing infra.
 
-`make test-integration` runs `go test -tags=integration -p 1 ./... -count=1`.
-Without the tag, the run is unit-suite-only: `make test` adds `-race`
-(CI's race checking) and `make test-fast` keeps the plain, fastest run.
+`make test-integration` runs `go test -tags=integration -p 1 ./... -count=1`
+(requires Docker running for testcontainers, or an explicit `TEST_DATABASE_URL`).
+Without the tag, the run is unit-suite-only: a plain `go test ./...` skips the
+database-backed tests rather than failing; `make test` adds `-race` (CI's race
+checking) and `make test-fast` keeps the plain, fastest run.
 
 ## Fuzz testing
 
@@ -137,16 +146,35 @@ testable and replaceable.
   come with a note in the PR that operators need to run
   `sorotrail replay --from-ledger N`, otherwise the change only applies to
   events ingested from then on.
-- **New API endpoints** — add routes in `internal/api/server.go`. Keep
-  endpoints read-only unless you also add authentication.
+- **New API endpoints** — add routes in `internal/api/server.go` and document
+  them in `api/openapi.yaml` (see "API specification" below). Keep endpoints
+  read-only unless you also add authentication.
 - **Alternative storage** — implement `store.Store`. The contract is spelled
   out on the interface; note that `QueryEvents` must return events in
   ascending ID order for cursor pagination to work.
 - **RPC methods** — add to `rpc.Client` only what the ingester/API actually
   needs; the client deliberately isn't a full RPC SDK.
 
+## API specification
+
+`api/openapi.yaml` is the **source of truth** for the HTTP API — edit that
+file, never the generated files. Two committed artifacts are derived from it:
+
+| Generated file                 | Regenerate with | Drift test                                        |
+|--------------------------------|-----------------|---------------------------------------------------|
+| `internal/api/openapi.json`    | `make spec`     | `pkg/docs.TestSpecCopiesAreIdentical`             |
+| `pkg/client/client.gen.go`     | `make client`   | `pkg/client.TestGeneratedClientIsUpToDate`        |
+
+`internal/api/openapi.json` is the copy `internal/api` embeds and serves at
+`/openapi.json`; a spec edit that skips `make spec` ships documentation nobody
+sees. `make spec-check` regenerates the JSON into a temporary file and diffs it
+against the committed copy, and CI runs it, so a stale copy fails the build
+rather than drifting silently. After any change to `api/openapi.yaml`, run
+`make spec` (and `make client` if you touched operations or schemas).
+
 ## Conventions
 
+- When a pull request introduces user-visible or behavioral changes, contributors must append a concise line-item summary to the root [CHANGELOG.md](CHANGELOG.md) under the `[Unreleased]` section.
 - Plain SQL via pgx; no ORM. Schema changes are new numbered migration pairs
   in `internal/store/migrations/` — never edit an applied migration.
 - `log/slog` for logging; pass loggers explicitly, no globals.
@@ -167,6 +195,12 @@ major version bumps come individually. The `vulncheck` CI job runs
 known-vulnerable code paths are surfaced before they ship. Review dependency
 PRs promptly — a green check on `vulncheck` is a good signal that the bump can
 be merged without deep audit.
+
+The golangci-lint pin in `.golangci-lint-version` is the exception. Dependabot
+keeps the `golangci/golangci-lint-action` **action** current but does not touch
+its `version:` input — which now comes from that file — so a human must bump the
+pin, and the Go version recorded beside it, whenever the Go version moves. See
+[Lint toolchain drift](#lint-toolchain-drift).
 
 ## Verification & Automated Checks
 
@@ -189,10 +223,40 @@ For individual checks, run each step on its own:
 make build-all        # go build ./...
 make vet              # go vet ./...
 make test-ci          # CI test job's exact command; DB-backed tests skip without TEST_DATABASE_URL
-make test-integration # integration-tagged suite against a real Postgres
+make test-integration # integration-tagged suite against a real Postgres (requires Docker or TEST_DATABASE_URL)
+make test-db          # full test suite against Postgres (requires live DATABASE_URL)
 make bench-ci         # benchmark smoke run
-make lint             # golangci-lint run
+make lint             # golangci-lint run, guarded against toolchain drift
 ```
+
+### Lint toolchain drift
+
+`golangci-lint` is compiled with a single Go version and refuses to run when the
+repository targets a newer one:
+
+```text
+the Go language version (go1.26) used to build golangci-lint is lower than the targeted Go version (1.27.1)
+```
+
+The "targeted" version is go.mod's `toolchain` directive when it has one and its
+`go` directive otherwise. A `toolchain` line is easy to pick up by accident: any
+`go get` or `go mod tidy` run under a newer local toolchain can add one. **Do not
+commit an unintended `toolchain` line** — if `git diff go.mod` shows one you did
+not mean to add, remove it. Otherwise the lint job fails while `make lint` stays
+green locally, because only CI runs the pinned binary.
+
+The pinned release lives in [`.golangci-lint-version`](../.golangci-lint-version)
+as `<version> <go-built-with>`; both the CI action and the guard read it, so they
+cannot disagree about which release runs. `make lint` runs
+`scripts/check_lint_toolchain.sh` first and fails with the fix spelled out when
+go.mod targets a newer Go than that release supports, so a `toolchain` bump is
+caught before you push rather than in CI.
+
+To move the project to a newer Go on purpose, bump all three together: the `go`
+(and `toolchain`) directives in go.mod, and the version plus Go field in
+`.golangci-lint-version` to a golangci-lint release built with that Go. A
+release's build Go is the wording after `built with` in `golangci-lint version`.
+Then run `make ci`.
 
 ## Migration safety
 
@@ -251,5 +315,7 @@ to fix it.
 - Include tests for behavior changes; add a new integration test for any
   public API or schema change.
 - Update the README's API reference and config table when you touch either.
+- Touching `api/openapi.yaml`? Run `make spec` and `make client` so the
+  generated copies stay in step (see "API specification" above).
 - Include `Closes #[issue_id]` and summarize fuzz findings, including when no
   panics were found.

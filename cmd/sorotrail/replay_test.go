@@ -6,6 +6,11 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+func TestRunReplay_HelpAndUsage(t *testing.T) {
+	err := runReplay([]string{"--help"})
+	assert.NoError(t, err)
+}
+
 func TestRunReplay_Flags(t *testing.T) {
 	tests := []struct {
 		name        string

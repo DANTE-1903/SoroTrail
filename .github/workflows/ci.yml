@@ -14,6 +14,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     strategy:
+      # Report both Postgres versions even when one fails. With the default
+      # fail-fast the surviving leg is cancelled, so a contributor sees
+      # "test-matrix (16) failure, test-matrix (15) cancelled" and cannot tell
+      # whether the break is version-specific or general — and a failure that
+      # only shows on the cancelled version is hidden entirely. Gating is
+      # unaffected: the aggregate `test` job below still requires every leg.
+      fail-fast: false
       matrix:
         postgres-version: ["15", "16"]
     services:
@@ -42,6 +49,12 @@ jobs:
         run: go build ./...
       - name: Vet
         run: go vet ./...
+      # Fails in seconds with an actionable message when a contributor edited
+      # api/openapi.yaml without running `make spec`. pkg/docs' drift test
+      # catches the same staleness later in the suite; this step exists so the
+      # signal arrives before the ten-minute test run, not buried in its output.
+      - name: Verify generated OpenAPI JSON is current
+        run: make spec-check
       - name: Wait for Postgres
         run: |
           for i in $(seq 1 30); do
@@ -99,8 +112,9 @@ jobs:
   # the `integration` build tag. Same Postgres service as the `test-matrix` job;
   # `-p 1` is required because internal/store and internal/replay
   # integration tests share the database and truncate the same tables.
+  # integration test workflow
   integration:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     services:
       postgres:
@@ -110,7 +124,7 @@ jobs:
           POSTGRES_PASSWORD: sorotrail
           POSTGRES_DB: sorotrail
         ports:
-          - 5432:5432
+          - "5433:5432"
         options: >-
           --health-cmd "pg_isready -U sorotrail"
           --health-interval 2s
@@ -129,7 +143,7 @@ jobs:
       - name: Wait for Postgres
         run: |
           for i in $(seq 1 30); do
-            if pg_isready -h localhost -p 5432 -U sorotrail -d sorotrail; then
+            if pg_isready -h localhost -p 5433 -U sorotrail -d sorotrail; then
               exit 0
             fi
             sleep 1
@@ -146,7 +160,7 @@ jobs:
           'TestMigrate_UpFromEmpty|TestMigrate_DownFromHead|TestMigrate_UpDownUpRoundTrip|TestMigrate_EachDownReversesItsUp'
           ./internal/store/...
         env:
-          TEST_DATABASE_URL: postgres://sorotrail:sorotrail@localhost:5432/sorotrail?sslmode=disable
+          TEST_DATABASE_URL: postgres://sorotrail:sorotrail@localhost:5433/sorotrail?sslmode=disable
       - name: Run integration tests
         # The integration tests cover:
         #   1. migration up from empty
@@ -162,7 +176,7 @@ jobs:
         # same tables between tests.
         run: go test -tags=integration -p 1 -timeout 5m ./... -count=1
         env:
-          TEST_DATABASE_URL: postgres://sorotrail:sorotrail@localhost:5432/sorotrail?sslmode=disable
+          TEST_DATABASE_URL: postgres://sorotrail:sorotrail@localhost:5433/sorotrail?sslmode=disable
 
   coverage:
     runs-on: ubuntu-latest
@@ -194,9 +208,27 @@ jobs:
         with:
           go-version-file: go.mod
           cache-dependency-path: go.sum
+      # A `toolchain` directive can land in go.mod by accident when a newer local
+      # Go runs `go get` / `go mod tidy`. The pinned linter below was built with
+      # an older Go and refuses to start when go.mod targets a newer one, so fail
+      # here with the fix spelled out rather than in golangci-lint's own words.
+      - name: Guard against golangci-lint / Go toolchain drift
+        run: ./scripts/check_lint_toolchain.sh
+      # The pin lives in .golangci-lint-version so the workflow and `make lint`
+      # cannot disagree about which release runs. Dependabot bumps this action's
+      # ref but not its `version:` input, so the pin is a manual bump.
+      - name: Read the pinned golangci-lint version
+        id: lint_pin
+        run: echo "version=$(./scripts/check_lint_toolchain.sh --print-version)" >> "$GITHUB_OUTPUT"
       - uses: golangci/golangci-lint-action@v9.3.0
         with:
-          version: v2.12.2
+          version: ${{ steps.lint_pin.outputs.version }}
+      # Confirm the Go version recorded alongside the pin matches the release the
+      # action actually installed, so the record cannot rot. always() so it still
+      # reports when the lint step above failed.
+      - name: Verify the pinned release matches the recorded Go version
+        if: always()
+        run: ./scripts/check_lint_toolchain.sh --verify-binary
 
   docker:
     runs-on: ubuntu-latest

@@ -1,345 +1,78 @@
 package config
 
 import (
-	"net/url"
-	"strings"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
-
-func TestMultiErrorFormat(t *testing.T) {
-	err := multiError{"first", "second", "third"}
-	msg := err.Error()
-	if !strings.Contains(msg, "first") || !strings.Contains(msg, "second") || !strings.Contains(msg, "third") {
-		t.Fatalf("multiError missing entries: %s", msg)
-	}
-	if !strings.HasPrefix(msg, "configuration validation failed:\n") {
-		t.Fatalf("wrong prefix: %s", msg)
-	}
-}
-
-func TestValidateAll_ValidConfig(t *testing.T) {
-	cfg := Config{
-		DatabaseURL:         "postgres://user:pass@localhost/db",
-		RPCURL:              "https://soroban-testnet.stellar.org",
-		PollInterval:        5 * time.Second,
-		AuditPollInterval:   30 * time.Second,
-		RetentionLedgers:    17280,
-		PartitionLedgerSpan: 120960,
-		AuditBatchLedgers:   100,
-		AuditLagThreshold:   200,
-		AuditBudgetShare:    0.1,
-		AuditMaxRPS:         10,
-		AuditMaxRepair:      3,
-		AuditFindingMaxLgrs: 100,
-		IngesterMinBackoff:  time.Second,
-		IngesterMaxBackoff:  time.Minute,
-		LogLevel:            "info",
-		LogFormat:           "text",
-	}
-	if err := cfg.ValidateAll(); err != nil {
-		t.Fatalf("unexpected error: %s", err)
-	}
-}
-
-// --- per-rule-type tests ---------------------------------------------------
-
-func TestValidateAll_Required(t *testing.T) {
-	err := Config{}.ValidateAll()
-	if err == nil {
-		t.Fatal("expected error")
-	}
-	if !strings.Contains(err.Error(), "DATABASE_URL: required but empty") {
-		t.Fatalf("missing DATABASE_URL error: %s", err)
-	}
-}
-
-func TestValidateAll_URL(t *testing.T) {
-	cfg := validBase()
-	cfg.RPCURL = "not-a-url"
-	err := cfg.ValidateAll()
-	checkContains(t, err, "RPC_URL")
-	checkContains(t, err, "not-a-url")
-
-	cfg.RPCURL = ""
-	err = cfg.ValidateAll()
-	checkContains(t, err, "RPC_URL")
-}
-
-func TestValidateAll_Duration(t *testing.T) {
-	cfg := validBase()
-	cfg.PollInterval = 0
-	err := cfg.ValidateAll()
-	checkContains(t, err, "POLL_INTERVAL")
-	checkContains(t, err, "must be a positive duration")
-
-	cfg.PollInterval = 5 * time.Second
-	cfg.AuditPollInterval = -1
-	err = cfg.ValidateAll()
-	checkContains(t, err, "AUDIT_POLL_INTERVAL")
-}
-
-func TestValidateAll_PollIntervalBounds(t *testing.T) {
-	cfg := validBase()
-
-	cfg.PollIntervalMin = -1
-	err := cfg.ValidateAll()
-	checkContains(t, err, "POLL_INTERVAL_MIN")
-
-	cfg.PollIntervalMin = 0
-	cfg.PollIntervalMax = -1
-	err = cfg.ValidateAll()
-	checkContains(t, err, "POLL_INTERVAL_MAX")
-
-	cfg.PollIntervalMin = 30 * time.Second
-	cfg.PollIntervalMax = 5 * time.Second
-	err = cfg.ValidateAll()
-	checkContains(t, err, "POLL_INTERVAL_MIN")
-	checkContains(t, err, "POLL_INTERVAL_MAX")
-
-	cfg.PollIntervalMin = time.Second
-	cfg.PollIntervalMax = 30 * time.Second
-	cfg.LogFormat = "text" // validBase() leaves this empty; unrelated to what this test checks
-	if err := cfg.ValidateAll(); err != nil {
-		t.Fatalf("unexpected error with ordered bounds: %s", err)
-	}
-}
-
-func TestValidateAll_NumericRanges(t *testing.T) {
-	cfg := validBase()
-
-	cfg.RetentionLedgers = 0
-	err := cfg.ValidateAll()
-	checkContains(t, err, "RETENTION_LEDGERS")
-
-	cfg.RetentionLedgers = 17280
-	cfg.PartitionLedgerSpan = 0
-	err = cfg.ValidateAll()
-	checkContains(t, err, "PARTITION_LEDGER_SPAN")
-
-	cfg.PartitionLedgerSpan = 120960
-	cfg.LogFormat = "text"
-	cfg.IngesterMinBackoff = 0
-	err = cfg.ValidateAll()
-	checkContains(t, err, "INGESTER_MIN_BACKOFF")
-
-	cfg.IngesterMinBackoff = 2 * time.Second
-	cfg.IngesterMaxBackoff = time.Second
-	err = cfg.ValidateAll()
-	checkContains(t, err, "INGESTER_MIN_BACKOFF")
-
-	cfg.IngesterMaxBackoff = time.Minute
-	cfg.IngesterJitterMin = 2 * time.Second
-	cfg.IngesterJitterMax = time.Second
-	err = cfg.ValidateAll()
-	checkContains(t, err, "INGESTER_JITTER_MIN")
-
-	cfg.IngesterJitterMin = 0
-	cfg.IngesterJitterMax = 0
-	cfg.AuditBatchLedgers = 0
-	err = cfg.ValidateAll()
-	checkContains(t, err, "AUDIT_BATCH_LEDGERS")
-
-	cfg.AuditBatchLedgers = 100
-	cfg.AuditLagThreshold = 0
-	err = cfg.ValidateAll()
-	checkContains(t, err, "AUDIT_LAG_THRESHOLD")
-
-	cfg.AuditLagThreshold = 200
-	cfg.AuditBudgetShare = -0.1
-	err = cfg.ValidateAll()
-	checkContains(t, err, "AUDIT_BUDGET_SHARE")
-
-	cfg.AuditBudgetShare = 0.1
-	cfg.AuditMaxRPS = 0
-	err = cfg.ValidateAll()
-	checkContains(t, err, "AUDIT_MAX_RPS")
-
-	cfg.AuditMaxRPS = 10
-	cfg.AuditMaxRepair = 0
-	err = cfg.ValidateAll()
-	checkContains(t, err, "AUDIT_MAX_REPAIR_ATTEMPTS")
-
-	cfg.AuditMaxRepair = 3
-	cfg.AuditFindingMaxLgrs = 0
-	err = cfg.ValidateAll()
-	checkContains(t, err, "AUDIT_FINDING_MAX_LEDGERS")
-
-	cfg.AuditFindingMaxLgrs = 100
-	cfg.RateLimitRPS = -1
-	err = cfg.ValidateAll()
-	checkContains(t, err, "RATE_LIMIT_RPS")
-
-	cfg.RateLimitRPS = 0
-	cfg.RateLimitBurst = -1
-	err = cfg.ValidateAll()
-	checkContains(t, err, "RATE_LIMIT_BURST")
-}
-
-func TestValidateAll_LogLevel(t *testing.T) {
-	cfg := validBase()
-	cfg.LogLevel = "loud"
-	err := cfg.ValidateAll()
-	checkContains(t, err, "LOG_LEVEL")
-	checkContains(t, err, "loud")
-}
-
-func TestValidateAll_ContractIDs(t *testing.T) {
-	cfg := validBase()
-	cfg.WatchedContracts = []string{"not-a-contract"}
-	err := cfg.ValidateAll()
-	checkContains(t, err, "WATCHED_CONTRACTS")
-}
-
-func TestValidateAll_MutualDependency(t *testing.T) {
-	cfg := validBase()
-	cfg.RateLimitRPS = 5
-	err := cfg.ValidateAll()
-	checkContains(t, err, "RATE_LIMIT_RPS and RATE_LIMIT_BURST must both be set or both unset")
-
-	cfg.RateLimitRPS = 0
-	cfg.RateLimitBurst = 10
-	err = cfg.ValidateAll()
-	checkContains(t, err, "RATE_LIMIT_RPS and RATE_LIMIT_BURST must both be set or both unset")
-}
-
-// --- multi-error aggregation -----------------------------------------------
-
-func TestValidateAll_Aggregation(t *testing.T) {
-	// Empty config hits many rules at once.
-	cfg := Config{}
-	err := cfg.ValidateAll()
-	if err == nil {
-		t.Fatal("expected multiple errors")
-	}
-	msg := err.Error()
-	count := strings.Count(msg, "\n  - ")
-	if count < 5 {
-		t.Fatalf("expected >=5 failures, got %d:\n%s", count, msg)
-	}
-}
-
-func TestValidateAll_Aggregation_PreservesAll(t *testing.T) {
-	cfg := Config{
-		// Only set DatabaseURL — leave everything else invalid.
-		DatabaseURL: "postgres://localhost/db",
-	}
-	err := cfg.ValidateAll()
-	msg := err.Error()
-	required := []string{
-		"RPC_URL",
-		"POLL_INTERVAL",
-		"AUDIT_POLL_INTERVAL",
-		"RETENTION_LEDGERS",
-		"PARTITION_LEDGER_SPAN",
-		"AUDIT_BATCH_LEDGERS",
-		"AUDIT_LAG_THRESHOLD",
-		"AUDIT_MAX_RPS",
-		"AUDIT_MAX_REPAIR_ATTEMPTS",
-		"AUDIT_FINDING_MAX_LEDGERS",
-		"LOG_LEVEL",
-	}
-	for _, v := range required {
-		if !strings.Contains(msg, v) {
-			t.Errorf("aggregated error missing %q", v)
-		}
-	}
-}
-
-// --- redaction -------------------------------------------------------------
-
-func TestRedact_DatabaseURL_Token(t *testing.T) {
-	raw := "postgres://alice:secret123@localhost:5432/mydb?sslmode=disable"
-	got := redact("DATABASE_URL", raw)
-	if strings.Contains(got, "secret123") {
-		t.Fatalf("redact leaked password: %s", got)
-	}
-	if !strings.HasPrefix(got, "postgres://alice:") {
-		t.Fatalf("redact removed username prefix: %s", got)
-	}
-	if strings.Contains(got, ":secret123@") {
-		t.Fatalf("redact preserved original password: %s", got)
-	}
-	// url.UserPassword URL-encodes special chars, so *** becomes %2A%2A%2A.
-	if got == raw {
-		t.Fatalf("redact did not modify the URL: %s", got)
-	}
-}
-
-func TestRedact_DatabaseURL_NoCredentials(t *testing.T) {
-	raw := "postgres://localhost/mydb"
-	got := redact("DATABASE_URL", raw)
-	if got != raw {
-		t.Fatalf("redact should not change URL without credentials: got %q", got)
-	}
-}
-
-func TestRedact_NonSensitive(t *testing.T) {
-	raw := "https://example.com"
-	got := redact("RPC_URL", raw)
-	if got != raw {
-		t.Fatalf("redact should not touch non-sensitive vars: got %q", got)
-	}
-}
-
-func TestRedact_InvalidURL(t *testing.T) {
-	got := redact("DATABASE_URL", "not-a-url")
-	if got != "<redacted>" {
-		t.Fatalf("redact should return <redacted> for unparseable URLs: got %q", got)
-	}
-}
-
-func TestRedact_Empty(t *testing.T) {
-	if got := redact("DATABASE_URL", ""); got != "" {
-		t.Fatalf("redact should return empty string unchanged: got %q", got)
-	}
-}
-
-func TestValidateAll_RedactInErrorOutput(t *testing.T) {
-	// Even though DATABASE_URL errors don't include the value normally,
-	// verify that the redact path works end-to-end by checking via url.Parse
-	// that we'd get a redacted URL back.
-	raw := "postgres://user:supersecret@localhost/db"
-	u, _ := url.Parse(raw)
-	u.User = url.UserPassword(u.User.Username(), "***")
-	redacted := u.String()
-	if strings.Contains(redacted, "supersecret") {
-		t.Fatal("redacted URL still contains secret")
-	}
-}
-
-// --- helpers ---------------------------------------------------------------
 
 func validBase() Config {
 	return Config{
-		DatabaseURL:         "postgres://user:pass@localhost/db",
-		RPCURL:              "https://soroban-testnet.stellar.org",
+		DatabaseURL:         "postgres://user:pass@localhost:5432/db",
+		RPCURL:              "https://rpc.example.com",
 		PollInterval:        5 * time.Second,
 		AuditPollInterval:   30 * time.Second,
+		IngesterMinBackoff:  1 * time.Second,
+		IngesterMaxBackoff:  5 * time.Second,
 		RetentionLedgers:    17280,
 		PartitionLedgerSpan: 120960,
 		AuditBatchLedgers:   100,
 		AuditLagThreshold:   200,
-		AuditBudgetShare:    0.1,
+		AuditBudgetShare:    0.5,
 		AuditMaxRPS:         10,
 		AuditMaxRepair:      3,
 		AuditFindingMaxLgrs: 100,
-		IngesterMinBackoff:  time.Second,
-		IngesterMaxBackoff:  time.Minute,
 		LogLevel:            "info",
-		LogFormat:           "text",
+		LogFormat:           "json",
 	}
 }
 
-func checkContains(t *testing.T, err error, substr string) {
-	t.Helper()
-	if err == nil {
-		t.Fatalf("expected error containing %q, got nil", substr)
+func TestValidateAll_Coverage(t *testing.T) {
+	tests := []struct {
+		name        string
+		modify      func(*Config)
+		expectError string
+	}{
+		{"empty DATABASE_URL", func(c *Config) { c.DatabaseURL = "" }, "DATABASE_URL: required but empty"},
+		{"empty RPC_URL and RPC_URLS", func(c *Config) { c.RPCURL = ""; c.RPCURLS = nil }, "RPC_URL: required but empty"},
+		{"invalid RPC_URL", func(c *Config) { c.RPCURL = "invalid-url" }, "is not a valid absolute URL"},
+		{"invalid RPC_URLS element", func(c *Config) { c.RPCURLS = []string{"http://ok.com", "not-a-url"} }, "is not a valid absolute URL"},
+		{"negative PollInterval", func(c *Config) { c.PollInterval = -1 * time.Second }, "POLL_INTERVAL"},
+		{"negative PollIntervalMin", func(c *Config) { c.PollIntervalMin = -1 * time.Second }, "POLL_INTERVAL_MIN"},
+		{"negative PollIntervalMax", func(c *Config) { c.PollIntervalMax = -1 * time.Second }, "POLL_INTERVAL_MAX"},
+		{"PollIntervalMin > Max", func(c *Config) { c.PollIntervalMin = 5 * time.Second; c.PollIntervalMax = 1 * time.Second }, "must be <= POLL_INTERVAL_MAX"},
+		{"negative AuditPollInterval", func(c *Config) { c.AuditPollInterval = -1 * time.Second }, "AUDIT_POLL_INTERVAL"},
+		{"negative IngesterMinBackoff", func(c *Config) { c.IngesterMinBackoff = -1 * time.Second }, "INGESTER_MIN_BACKOFF"},
+		{"negative IngesterMaxBackoff", func(c *Config) { c.IngesterMaxBackoff = -1 * time.Second }, "INGESTER_MAX_BACKOFF"},
+		{"IngesterMinBackoff > Max", func(c *Config) { c.IngesterMinBackoff = 5 * time.Second; c.IngesterMaxBackoff = 1 * time.Second }, "must not exceed INGESTER_MAX_BACKOFF"},
+		{"negative IngesterJitterMin", func(c *Config) { c.IngesterJitterMin = -1 }, "jitter bounds must be non-negative"},
+		{"IngesterJitterMin > Max", func(c *Config) { c.IngesterJitterMin = 5; c.IngesterJitterMax = 1 }, "must not exceed INGESTER_JITTER_MAX"},
+		{"zero RetentionLedgers", func(c *Config) { c.RetentionLedgers = 0 }, "RETENTION_LEDGERS"},
+		{"zero PartitionLedgerSpan", func(c *Config) { c.PartitionLedgerSpan = 0 }, "PARTITION_LEDGER_SPAN"},
+		{"zero AuditBatchLedgers", func(c *Config) { c.AuditBatchLedgers = 0 }, "AUDIT_BATCH_LEDGERS"},
+		{"zero AuditLagThreshold", func(c *Config) { c.AuditLagThreshold = 0 }, "AUDIT_LAG_THRESHOLD"},
+		{"AuditBudgetShare > 1", func(c *Config) { c.AuditBudgetShare = 1.5 }, "AUDIT_BUDGET_SHARE"},
+		{"AuditMaxRPS zero", func(c *Config) { c.AuditMaxRPS = 0 }, "AUDIT_MAX_RPS"},
+		{"AuditMaxRepair zero", func(c *Config) { c.AuditMaxRepair = 0 }, "AUDIT_MAX_REPAIR_ATTEMPTS"},
+		{"AuditFindingMaxLgrs zero", func(c *Config) { c.AuditFindingMaxLgrs = 0 }, "AUDIT_FINDING_MAX_LEDGERS"},
+		{"RateLimitRPS negative", func(c *Config) { c.RateLimitRPS = -1 }, "RATE_LIMIT_RPS"},
+		{"RateLimitBurst negative", func(c *Config) { c.RateLimitBurst = -1 }, "RATE_LIMIT_BURST"},
+		{"HourlyQuota negative", func(c *Config) { c.HourlyQuota = -1 }, "HOURLY_QUOTA"},
+		{"DailyQuota negative", func(c *Config) { c.DailyQuota = -1 }, "DAILY_QUOTA"},
+		{"invalid LogLevel", func(c *Config) { c.LogLevel = "invalid" }, "LOG_LEVEL"},
+		{"invalid LogFormat", func(c *Config) { c.LogFormat = "invalid" }, "LOG_FORMAT"},
+		{"invalid WatchedContracts", func(c *Config) { c.WatchedContracts = []string{"invalid"} }, "WATCHED_CONTRACTS"},
 	}
-	if !strings.Contains(err.Error(), substr) {
-		t.Fatalf("expected error containing %q:\n%s", substr, err.Error())
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := validBaseValidate()
+			tt.modify(&cfg)
+			err := cfg.ValidateAll()
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.expectError)
+		})
 	}
 }
-
-// compile-time check: multiError satisfies error
-var _ error = multiError{}

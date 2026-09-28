@@ -4,8 +4,13 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"golang.org/x/time/rate"
 )
 
 func mkReq(method, path string) *http.Request {
@@ -22,6 +27,30 @@ func startLimiter(t *testing.T, lim *RateLimiter) func() {
 	}
 }
 
+// middlewareFor wraps a 200-OK endpoint with the limiter under test so the
+// request path — not some internal shortcut — is what every assertion below
+// exercises.
+func middlewareFor(lim *RateLimiter) http.Handler {
+	return lim.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+}
+
+// sendFrom sends a GET as if it came from addr and returns the response
+// recorder. Distinct addresses are what separate buckets, so every helper
+// below pins its client identity through this parameter.
+func sendFrom(lim *RateLimiter, addr string) *httptest.ResponseRecorder {
+	rec := httptest.NewRecorder()
+	req := mkReq(http.MethodGet, "/events")
+	req.RemoteAddr = addr
+	middlewareFor(lim).ServeHTTP(rec, req)
+	return rec
+}
+
+// TestClientIP pins the extraction rules the rate limiter keys on.
+// They matter for security: trusting XFF blindly lets a caller mint
+// unlimited identities, and skipping a valid hop silently regroups
+// traffic under the wrong bucket.
 func TestClientIP(t *testing.T) {
 	cases := []struct {
 		name       string
@@ -30,11 +59,101 @@ func TestClientIP(t *testing.T) {
 		trustXFF   bool
 		want       string
 	}{
-		{name: "trusted honors XFF", remoteAddr: "203.0.113.9:5432", xff: "198.51.100.7, 10.0.0.1", trustXFF: true, want: "198.51.100.7"},
-		{name: "untrusted ignores XFF", remoteAddr: "203.0.113.9:5432", xff: "198.51.100.7, 10.0.0.1", want: "203.0.113.9"},
-		{name: "trusted falls back to remote without XFF", remoteAddr: "203.0.113.9:5432", trustXFF: true, want: "203.0.113.9"},
-		{name: "trusted skips invalid XFF parts", remoteAddr: "203.0.113.9:5432", xff: "not-an-ip, 198.51.100.7", trustXFF: true, want: "198.51.100.7"},
-		{name: "bare IP remote without port", remoteAddr: "203.0.113.9", trustXFF: true, want: "203.0.113.9"},
+		{
+			name:       "direct connection uses the remote address",
+			remoteAddr: "203.0.113.9:5432",
+			want:       "203.0.113.9",
+		},
+		{
+			name:       "port is stripped from the remote address",
+			remoteAddr: "198.51.100.1:65535",
+			want:       "198.51.100.1",
+		},
+		{
+			name:       "trusted proxy honors the leftmost XFF entry",
+			remoteAddr: "10.0.0.1:443",
+			xff:        "198.51.100.7, 10.0.0.1",
+			trustXFF:   true,
+			want:       "198.51.100.7",
+		},
+		{
+			name:       "untrusted proxy ignores XFF entirely",
+			remoteAddr: "203.0.113.9:5432",
+			xff:        "198.51.100.7, 10.0.0.1",
+			want:       "203.0.113.9",
+		},
+		{
+			name:       "trusted with no XFF falls back to remote",
+			remoteAddr: "203.0.113.9:5432",
+			trustXFF:   true,
+			want:       "203.0.113.9",
+		},
+		{
+			name:       "multi-hop chain picks the first valid entry",
+			remoteAddr: "10.0.0.1:443",
+			xff:        "not-an-ip, 198.51.100.7, 172.16.0.9",
+			trustXFF:   true,
+			want:       "198.51.100.7",
+		},
+		{
+			name:       "trusted with all-invalid XFF falls back to remote",
+			remoteAddr: "203.0.113.9:5432",
+			xff:        "not-an-ip, , also-bad",
+			trustXFF:   true,
+			want:       "203.0.113.9",
+		},
+		{
+			name:       "IPv6 remote keeps brackets off the key",
+			remoteAddr: "[2001:db8::1]:443",
+			want:       "2001:db8::1",
+		},
+		{
+			name:       "bare IPv6 remote without port",
+			remoteAddr: "2001:db8::1",
+			want:       "2001:db8::1",
+		},
+		{
+			name:       "bracketed IPv6 remote without port",
+			remoteAddr: "[2001:db8::1]",
+			want:       "2001:db8::1",
+		},
+		{
+			name:       "unbracketed IPv6 in XFF",
+			remoteAddr: "10.0.0.1:443",
+			xff:        "2001:db8::1, 10.0.0.1",
+			trustXFF:   true,
+			want:       "2001:db8::1",
+		},
+		{
+			name:       "bracketed IPv6 with port in XFF",
+			remoteAddr: "10.0.0.1:443",
+			xff:        "[2001:db8::1]:4711, 10.0.0.1",
+			trustXFF:   true,
+			want:       "2001:db8::1",
+		},
+		{
+			name:       "bracketed IPv6 without port in XFF",
+			remoteAddr: "10.0.0.1:443",
+			xff:        "[2001:db8::1], 10.0.0.1",
+			trustXFF:   true,
+			want:       "2001:db8::1",
+		},
+		{
+			// A malformed address must produce the documented empty
+			// result so clientKey can substitute its stable
+			// "unknown" key instead of bucketing on junk.
+			name:       "malformed remote yields empty result",
+			remoteAddr: "garbage-without-a-port",
+			want:       "",
+		},
+		{
+			// host:port syntax alone is not enough: "foo:bar"
+			// splits cleanly but names no IP, and returning it raw
+			// would give every typo its own bucket.
+			name:       "non-IP host in remote yields empty result",
+			remoteAddr: "foo:bar",
+			want:       "",
+		},
 	}
 
 	for _, c := range cases {
@@ -44,9 +163,36 @@ func TestClientIP(t *testing.T) {
 			if c.xff != "" {
 				r.Header.Set("X-Forwarded-For", c.xff)
 			}
-			if got := clientIP(r, c.trustXFF); got != c.want {
-				t.Fatalf("clientIP() = %q, want %q (trustXFF=%v, XFF=%q)", got, c.want, c.trustXFF, c.xff)
-			}
+			got := clientIP(r, c.trustXFF)
+			assert.Equal(t, c.want, got,
+				"clientIP(trustXFF=%v, RemoteAddr=%q, XFF=%q)",
+				c.trustXFF, c.remoteAddr, c.xff)
+		})
+	}
+}
+
+// TestClientKeyStableFallbackForMalformedAddress covers the hand-off
+// the issue is about: a malformed address must not become an empty
+// rate-limit key, because an empty key would merge every broken client
+// into one bucket (or, worse, if treated as "no key", let them through
+// unthrottled).
+func TestClientKeyStableFallbackForMalformedAddress(t *testing.T) {
+	cases := []struct {
+		name       string
+		remoteAddr string
+		want       string
+	}{
+		{name: "malformed remote maps to unknown", remoteAddr: "garbage-without-a-port", want: "unknown"},
+		{name: "empty remote maps to unknown", remoteAddr: "", want: "unknown"},
+		{name: "valid remote keeps its IP key", remoteAddr: "203.0.113.9:1234", want: "203.0.113.9"},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			l := NewRateLimiter(1, 1, false)
+			r := httptest.NewRequest(http.MethodGet, "/", nil)
+			r.RemoteAddr = c.remoteAddr
+			assert.Equal(t, c.want, l.clientKey(r))
 		})
 	}
 }
@@ -60,19 +206,37 @@ func TestClientKeyUsesRemoteAddrWhenNoCredential(t *testing.T) {
 	}
 }
 
+// TestCeilSeconds pins the Retry-After rounding. Rounding down would
+// tell a throttled client to retry before its budget refills, which
+// produces a second 429 and looks like the limiter is broken; a
+// negative value would violate RFC 7231's delta-seconds contract
+// outright.
 func TestCeilSeconds(t *testing.T) {
-	cases := []struct{ in, want time.Duration }{
-		{0, time.Second},
-		{1, time.Second},
-		{999 * time.Millisecond, time.Second},
-		{time.Second, time.Second},
-		{time.Second + time.Millisecond, 2 * time.Second},
-		{2 * time.Second, 2 * time.Second},
+	cases := []struct {
+		name string
+		in   time.Duration
+		want time.Duration
+	}{
+		{name: "zero returns the documented minimum", in: 0, want: time.Second},
+		{name: "sub-second never rounds down to zero", in: time.Millisecond, want: time.Second},
+		{name: "one nanosecond rounds up to a full second", in: 1, want: time.Second},
+		{name: "sub-second rounds up to one", in: 500 * time.Millisecond, want: time.Second},
+		{name: "exact whole second stays as is", in: time.Second, want: time.Second},
+		{name: "larger exact multiple stays as is", in: 3 * time.Second, want: 3 * time.Second},
+		{name: "fractional duration rounds up", in: 1500 * time.Millisecond, want: 2 * time.Second},
+		{name: "just over a second rounds up to two", in: time.Second + time.Nanosecond, want: 2 * time.Second},
+		{name: "999 milliseconds round up to one", in: 999 * time.Millisecond, want: time.Second},
+		{name: "negative duration clamps to the minimum", in: -500 * time.Millisecond, want: time.Second},
+		{name: "large negative never yields a negative header", in: -time.Hour, want: time.Second},
 	}
+
 	for _, c := range cases {
-		if got := ceilSeconds(c.in); got != c.want {
-			t.Fatalf("ceilSeconds(%s) = %s, want %s", c.in, got, c.want)
-		}
+		t.Run(c.name, func(t *testing.T) {
+			got := ceilSeconds(c.in)
+			assert.Equal(t, c.want, got, "ceilSeconds(%s)", c.in)
+			assert.Greater(t, got, time.Duration(0),
+				"Retry-After must never be zero or negative (input %s)", c.in)
+		})
 	}
 }
 
@@ -85,4 +249,207 @@ func TestBucketEntryForReturnsSameInstance(t *testing.T) {
 	if e2 := l.bucketEntryFor("k1", 1, 1); e2 != e1 {
 		t.Fatal("bucketEntryFor() did not return the same bucket instance")
 	}
+}
+
+// TestBucketEntryForReconfiguresLimits pins the branch that lets an operator
+// lower a tenant's quota and have it bind on the next lookup instead of
+// whenever the bucket happens to age out.
+func TestBucketEntryForReconfiguresLimits(t *testing.T) {
+	l := NewRateLimiter(1, 1, false)
+	entry := l.bucketEntryFor("tenant-a", 2, 4)
+	require.Equal(t, rate.Limit(2), entry.limiter.Limit())
+	require.Equal(t, 4, entry.limiter.Burst())
+
+	again := l.bucketEntryFor("tenant-a", 0.5, 1)
+	require.Same(t, entry, again, "reconfiguring must reuse the existing bucket")
+	assert.Equal(t, rate.Limit(0.5), again.limiter.Limit(),
+		"a lowered limit must bind immediately, not when the bucket ages out")
+	assert.Equal(t, 1, again.limiter.Burst())
+	assert.Equal(t, 1, l.Size(), "reconfiguration must not fork a second bucket")
+}
+
+// TestRateLimiterAdmissionTable drives the middleware with distinct source
+// addresses. burst=2 at 0.5 rps means a client may spend its two-token bucket
+// immediately and is refused from the third request on — the plain
+// token-bucket contract the limiter exists to enforce.
+func TestRateLimiterAdmissionTable(t *testing.T) {
+	cases := []struct {
+		name         string
+		remoteAddr   string
+		requests     int
+		wantAdmitted int
+		wantRejected int
+	}{
+		{
+			name:         "client under its budget is admitted",
+			remoteAddr:   "203.0.113.10:1000",
+			requests:     2,
+			wantAdmitted: 2,
+		},
+		{
+			name:         "client over budget receives 429 with Retry-After",
+			remoteAddr:   "203.0.113.11:2000",
+			requests:     3,
+			wantAdmitted: 2,
+			wantRejected: 1,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			lim := NewRateLimiter(0.5, 2, false)
+
+			admitted, rejected := 0, 0
+			for i := 0; i < tc.requests; i++ {
+				rec := sendFrom(lim, tc.remoteAddr)
+				if rec.Code == http.StatusOK {
+					admitted++
+					continue
+				}
+				// Only a genuine over-budget rejection may land here;
+				// anything else means the limiter is refusing for the
+				// wrong reason.
+				require.Equal(t, http.StatusTooManyRequests, rec.Code)
+				assert.NotEmpty(t, rec.Header().Get("Retry-After"),
+					"every 429 must tell the caller when to come back")
+				assert.Equal(t, "0", rec.Header().Get("X-RateLimit-Remaining"))
+				rejected++
+			}
+
+			assert.Equal(t, tc.wantAdmitted, admitted,
+				"admitted count drifted from the token-bucket contract")
+			assert.Equal(t, tc.wantRejected, rejected,
+				"rejected count drifted from the token-bucket contract")
+			assert.Equal(t, 1, lim.Size(),
+				"one source address must map to exactly one bucket")
+		})
+	}
+}
+
+// TestRateLimiterPerClientBuckets pins the per-key isolation behind the
+// middleware: one client's spent bucket must never throttle another client.
+func TestRateLimiterPerClientBuckets(t *testing.T) {
+	lim := NewRateLimiter(0.5, 1, false)
+
+	first := sendFrom(lim, "203.0.113.21:4000")
+	require.Equal(t, http.StatusOK, first.Code, "first client's initial request must pass")
+
+	// A different source address gets its own bucket, not what is left of
+	// client A's.
+	second := sendFrom(lim, "203.0.113.22:5000")
+	assert.Equal(t, http.StatusOK, second.Code,
+		"a second client must not be throttled by the first client's spend")
+	assert.Equal(t, 2, lim.Size(), "two clients must map to two buckets")
+
+	// And client A really is done for now: their own bucket ran dry, not
+	// some shared pool.
+	third := sendFrom(lim, "203.0.113.21:4000")
+	assert.Equal(t, http.StatusTooManyRequests, third.Code,
+		"the first client's own budget must still be exhausted")
+}
+
+// TestRateLimiterUnauthenticatedFallback pins the fallback branch for callers
+// without a credential: they are keyed by source IP and share the
+// instance-wide bucket rather than being rejected outright.
+func TestRateLimiterUnauthenticatedFallback(t *testing.T) {
+	lim := NewRateLimiter(0.5, 1, false)
+	addr := "203.0.113.31:6000"
+
+	for i, want := range []int{http.StatusOK, http.StatusTooManyRequests} {
+		rec := sendFrom(lim, addr)
+		assert.Equal(t, want, rec.Code,
+			"request %d from an unauthenticated address must hit the shared IP bucket", i+1)
+	}
+}
+
+// TestRateLimiterRefillsOverTime covers the refill path. The limiter's one
+// seam for moving time without sleeping is the idle sweep, which takes an
+// explicit `now`: once a quiet bucket ages past the TTL it is evicted, and
+// the client's next request starts from a freshly created, full bucket —
+// which is exactly how a long-quiet client is refilled in production.
+func TestRateLimiterRefillsOverTime(t *testing.T) {
+	lim := NewRateLimiter(1, 2, false)
+	addr := "203.0.113.41:8000"
+
+	start := time.Now()
+	require.Equal(t, http.StatusOK, sendFrom(lim, addr).Code)
+	require.Equal(t, http.StatusOK, sendFrom(lim, addr).Code)
+	require.Equal(t, http.StatusTooManyRequests, sendFrom(lim, addr).Code,
+		"the bucket must be empty once the burst is spent")
+
+	// An hour later the untouched bucket is both refill-eligible (at 1 token
+	// per second it would have long topped up) and past the 5-minute idle
+	// TTL, so the sweep retires it.
+	require.Equal(t, 1, lim.evictIdle(start.Add(time.Hour)),
+		"a bucket untouched past the idle TTL must be evicted")
+	assert.Equal(t, 0, lim.Size(), "eviction must remove the bucket from the map")
+
+	assert.Equal(t, http.StatusOK, sendFrom(lim, addr).Code,
+		"after the refill window the client must be admitted again")
+	assert.Equal(t, http.StatusOK, sendFrom(lim, addr).Code,
+		"the refilled bucket must carry the full burst again")
+}
+
+// TestRateLimiterRefillDoesNotLeakSpendAcrossEviction is the negative half
+// of the refill story: eviction refills a quiet client, but a client seen
+// inside the TTL window keeps its spent bucket even when the sweep runs.
+func TestRateLimiterRefillDoesNotLeakSpendAcrossEviction(t *testing.T) {
+	lim := NewRateLimiter(1, 1, false)
+	addr := "203.0.113.42:8100"
+
+	now := time.Now()
+	require.Equal(t, http.StatusOK, sendFrom(lim, addr).Code)
+
+	// A sweep a second later must not evict a just-seen bucket, and the
+	// client's spend must survive it.
+	assert.Equal(t, 0, lim.evictIdle(now.Add(time.Second)),
+		"a bucket seen inside the TTL window must survive the sweep")
+	assert.Equal(t, http.StatusTooManyRequests, sendFrom(lim, addr).Code,
+		"the sweep must not refill a bucket that is still in use")
+}
+
+// TestRateLimiterRetryAfterIsCeiled covers the Retry-After calculation end
+// to end. With burst=3 at 0.5 rps the fourth immediate request waits just
+// under two seconds for its next token, so delta-seconds rounding must ceil
+// to 2 — truncating to 1 would invite the caller to hammer the endpoint
+// back-to-back and earn a second 429.
+func TestRateLimiterRetryAfterIsCeiled(t *testing.T) {
+	lim := NewRateLimiter(0.5, 3, false)
+	addr := "203.0.113.51:9000"
+
+	for i := 0; i < 3; i++ {
+		rec := sendFrom(lim, addr)
+		require.Equal(t, http.StatusOK, rec.Code, "request %d must be admitted", i+1)
+	}
+
+	rec := sendFrom(lim, addr)
+	require.Equal(t, http.StatusTooManyRequests, rec.Code)
+
+	raw := rec.Header().Get("Retry-After")
+	require.NotEmpty(t, raw, "a 429 must carry Retry-After")
+	secs, err := strconv.Atoi(raw)
+	require.NoError(t, err, "Retry-After must be integer delta-seconds (RFC 7231 §7.1.3)")
+	assert.Equal(t, 2, secs,
+		"ceil(2s - elapsed) must stay 2s; truncating to 1 would let the caller retry too early")
+
+	assert.Equal(t, "0", rec.Header().Get("X-RateLimit-Remaining"))
+	assert.Equal(t, "3", rec.Header().Get("X-RateLimit-Limit"), "the burst must be advertised")
+
+	reset, err := strconv.ParseInt(rec.Header().Get("X-RateLimit-Reset"), 10, 64)
+	require.NoError(t, err, "X-RateLimit-Reset must be a unix timestamp")
+	assert.InDelta(t, time.Now().Add(2*time.Second).Unix(), reset, 1,
+		"X-RateLimit-Reset must sit one refill period out")
+}
+
+// TestRateLimiterDisabledIsPassthrough guards the off-by-default posture: a
+// limiter with no limits configured must not add or reject anything, even
+// though the wiring stays in place.
+func TestRateLimiterDisabledIsPassthrough(t *testing.T) {
+	lim := NewRateLimiter(0, 0, false)
+	require.False(t, lim.Enabled())
+
+	for i := 0; i < 5; i++ {
+		rec := sendFrom(lim, "203.0.113.61:10000")
+		assert.Equal(t, http.StatusOK, rec.Code, "a disabled limiter must never reject")
+	}
+	assert.Equal(t, 0, lim.Size(), "a disabled limiter must not track buckets")
 }
