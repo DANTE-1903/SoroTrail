@@ -2,6 +2,8 @@ package store
 
 import (
 	"context"
+	"encoding/base64"
+	"errors"
 	"fmt"
 	"net"
 	"net/url"
@@ -128,28 +130,215 @@ func NewStoreFromURL(databaseURL string) (Store, error) {
 	return nil, fmt.Errorf("unsupported database url scheme")
 }
 
+// UpsertEvents inserts events idempotently by ID. The events table is a plain
+// MergeTree (no ReplacingMergeTree deduplication), so the idempotency the
+// Postgres ON CONFLICT provides has to be explicit here: the batch is deduped
+// in memory, ids already present are read back, and only the genuinely new
+// rows are inserted. The count returned is the number actually written, which
+// is what callers use to report how much new data a cycle ingested.
 func (c *ClickHouse) UpsertEvents(ctx context.Context, events []Event) (int64, error) {
-	return int64(len(events)), nil
+	if len(events) == 0 {
+		return 0, nil
+	}
+	deduped := dedupeEventsByID(events)
+	exec := newClickHouseExecutor(c.cfg)
+	database := c.cfg.databaseOrDefault()
+
+	ids := make([]string, 0, len(deduped))
+	for _, e := range deduped {
+		ids = append(ids, e.ID)
+	}
+	existing, err := exec.queryColumn(ctx, database, "SELECT id FROM events WHERE id IN ("+clickHouseQuoteList(ids)+")")
+	if err != nil {
+		return 0, fmt.Errorf("checking existing events: %w", err)
+	}
+	have := make(map[string]bool, len(existing))
+	for _, id := range existing {
+		have[id] = true
+	}
+
+	rows := make([]map[string]any, 0, len(deduped))
+	for _, e := range deduped {
+		if have[e.ID] {
+			continue
+		}
+		rows = append(rows, clickHouseEventRow(e))
+	}
+	if err := exec.insertRows(ctx, database, "events", clickHouseEventColumns, rows); err != nil {
+		return 0, fmt.Errorf("upserting events: %w", err)
+	}
+	return int64(len(rows)), nil
 }
 
+// ReplaceEventsInRange swaps the stored events in a ledger range for a
+// freshly fetched set, as the auditor's repair path does. The stored raw XDR
+// is preserved for any incoming row that arrives without it, mirroring
+// Postgres's coalesce() in the repair upsert, so a JSON-only repair cannot
+// strip the bytes a later replay needs.
+//
+// ClickHouse mutations are asynchronous by default, which would let the
+// delete race the reinsert (the mutation could run after the new rows land
+// and remove them too). SETTINGS mutations_sync = 1 makes the delete
+// synchronous, so the replacement is ordered exactly as it is on Postgres.
 func (c *ClickHouse) ReplaceEventsInRange(ctx context.Context, events []Event, fromLedger, toLedger int64) error {
+	if len(events) == 0 {
+		return nil
+	}
+	exec := newClickHouseExecutor(c.cfg)
+	database := c.cfg.databaseOrDefault()
+
+	rangePredicate := fmt.Sprintf("ledger >= %d AND ledger <= %d", fromLedger, toLedger)
+	stored, err := exec.queryRows(ctx, database,
+		"SELECT id, raw_topic_xdr, raw_value_xdr FROM events WHERE "+rangePredicate)
+	if err != nil {
+		return fmt.Errorf("reading events before repair: %w", err)
+	}
+	byID := make(map[string]clickHouseRow, len(stored))
+	for _, r := range stored {
+		byID[r.str("id")] = r
+	}
+
+	merged := make([]map[string]any, 0, len(events))
+	for _, e := range events {
+		if prev, ok := byID[e.ID]; ok {
+			if len(e.RawTopicXDR) == 0 {
+				e.RawTopicXDR = prev.strSlice("raw_topic_xdr")
+			}
+			if e.RawValueXDR == "" {
+				e.RawValueXDR = prev.str("raw_value_xdr")
+			}
+		}
+		merged = append(merged, clickHouseEventRow(e))
+	}
+
+	if err := exec.exec(ctx, database, "ALTER TABLE events DELETE WHERE "+rangePredicate+" SETTINGS mutations_sync = 1"); err != nil {
+		return fmt.Errorf("deleting events in range [%d,%d]: %w", fromLedger, toLedger, err)
+	}
+	if err := exec.insertRows(ctx, database, "events", clickHouseEventColumns, merged); err != nil {
+		return fmt.Errorf("replacing events in range [%d,%d]: %w", fromLedger, toLedger, err)
+	}
 	return nil
 }
 
+// GetEvent returns one event by ID, scoped like the Postgres implementation:
+// an event outside the scope is indistinguishable from a missing one, so a
+// caller cannot probe for other tenants' events by ID.
 func (c *ClickHouse) GetEvent(ctx context.Context, id string, sc Scope) (Event, error) {
-	return Event{}, ErrNotFound
+	if sc.DeniesAll() {
+		return Event{}, ErrNotFound
+	}
+	where := []string{"id = " + clickHouseQuoteString(id)}
+	if !sc.IsWildcard() {
+		ids := sc.Contracts()
+		if len(ids) == 0 {
+			return Event{}, ErrNotFound
+		}
+		where = append(where, "contract_id IN ("+clickHouseQuoteList(ids)+")")
+	}
+	rows, err := newClickHouseExecutor(c.cfg).queryRows(ctx, c.cfg.databaseOrDefault(),
+		"SELECT "+clickHouseEventColumnList+" FROM events"+clickHouseJoinWhere(where)+" LIMIT 1")
+	if err != nil {
+		return Event{}, fmt.Errorf("getting event %s: %w", id, err)
+	}
+	if len(rows) == 0 {
+		return Event{}, ErrNotFound
+	}
+	return eventFromRow(rows[0]), nil
 }
 
+// GetEventsByTxHash returns every event from one transaction except the
+// caller's own row, in ascending ID order. It is deliberately unscoped: the
+// API only reaches it after the anchor event has already passed an
+// authorization check.
 func (c *ClickHouse) GetEventsByTxHash(ctx context.Context, txHash, excludeID string) ([]Event, error) {
-	return nil, nil
+	where := []string{"tx_hash = " + clickHouseQuoteString(txHash)}
+	if excludeID != "" {
+		where = append(where, "id != "+clickHouseQuoteString(excludeID))
+	}
+	rows, err := newClickHouseExecutor(c.cfg).queryRows(ctx, c.cfg.databaseOrDefault(),
+		"SELECT "+clickHouseEventColumnList+" FROM events"+clickHouseJoinWhere(where)+" ORDER BY id ASC")
+	if err != nil {
+		return nil, fmt.Errorf("querying events by tx hash: %w", err)
+	}
+	events := make([]Event, 0, len(rows))
+	for _, r := range rows {
+		events = append(events, eventFromRow(r))
+	}
+	return events, nil
 }
 
+// EventExists is the cheap 304 probe behind conditional GETs. A scope that
+// grants nothing reports false without issuing SQL, matching Postgres.
 func (c *ClickHouse) EventExists(ctx context.Context, id string, sc Scope) (bool, error) {
-	return false, nil
+	if sc.DeniesAll() {
+		return false, nil
+	}
+	where := []string{"id = " + clickHouseQuoteString(id)}
+	if !sc.IsWildcard() {
+		ids := sc.Contracts()
+		if len(ids) == 0 {
+			return false, nil
+		}
+		where = append(where, "contract_id IN ("+clickHouseQuoteList(ids)+")")
+	}
+	total, err := newClickHouseExecutor(c.cfg).queryInt64(ctx, c.cfg.databaseOrDefault(),
+		"SELECT count(*) FROM events"+clickHouseJoinWhere(where))
+	if err != nil {
+		return false, fmt.Errorf("checking event existence: %w", err)
+	}
+	return total > 0, nil
 }
 
+// QueryEvents returns one page of events plus the cursor for the next. It
+// reuses clickHouseEventWhereClause for the filter/scope predicate (which
+// errors on the jsonb topic filters rather than approximating them) and adds
+// the keyset cursor, ordering and limit itself, so the read path matches
+// Postgres's semantics for everything the ClickHouse schema can express.
 func (c *ClickHouse) QueryEvents(ctx context.Context, f EventFilter) ([]Event, string, error) {
-	return nil, "", nil
+	if f.Scope.DeniesAll() {
+		return nil, "", nil
+	}
+	limit := f.Limit
+	if limit <= 0 {
+		limit = DefaultQueryLimit
+	}
+	if limit > MaxQueryLimit {
+		limit = MaxQueryLimit
+	}
+	if !ValidOrderBy(f.OrderBy) {
+		return nil, "", fmt.Errorf("unsupported order_by %q", f.OrderBy)
+	}
+
+	where, err := clickHouseEventWhereClause(f)
+	if err != nil {
+		return nil, "", err
+	}
+	cursorClause, err := clickHouseEventCursorClause(f)
+	if err != nil {
+		return nil, "", err
+	}
+	if cursorClause != "" {
+		where = append(where, cursorClause)
+	}
+
+	// Fetch one extra row to learn whether a next page exists, same as
+	// Postgres, then trim it back off before returning.
+	query := "SELECT " + clickHouseEventColumnList + " FROM events" + clickHouseJoinWhere(where) +
+		" ORDER BY " + clickHouseEventOrderColumns(f) + " LIMIT " + strconv.Itoa(limit+1)
+	rows, err := newClickHouseExecutor(c.cfg).queryRows(ctx, c.cfg.databaseOrDefault(), query)
+	if err != nil {
+		return nil, "", fmt.Errorf("querying events: %w", err)
+	}
+	events := make([]Event, 0, len(rows))
+	for _, r := range rows {
+		events = append(events, eventFromRow(r))
+	}
+	next := ""
+	if len(events) > limit {
+		events = events[:limit]
+		next = EncodeCursor(f.OrderBy, events[limit-1])
+	}
+	return events, next, nil
 }
 
 // CountEvents mirrors Postgres.CountEvents: same early-return on a denying
@@ -299,108 +488,550 @@ func (c *ClickHouse) AggregateEvents(ctx context.Context, f EventFilter, bucket 
 	return nil, nil
 }
 
+// GetIngestionState returns the single default-network ingestion row, or
+// ErrNotFound on a fresh instance. FINAL collapses the ReplacingMergeTree's
+// appended versions to the newest one, which is the durable resume position.
 func (c *ClickHouse) GetIngestionState(ctx context.Context) (IngestionState, error) {
-	return IngestionState{}, nil
+	rows, err := newClickHouseExecutor(c.cfg).queryRows(ctx, c.cfg.databaseOrDefault(),
+		"SELECT network, last_ingested_ledger, last_cursor, last_successful_poll, updated_at FROM ingestion_state FINAL WHERE network = 'default' LIMIT 1")
+	if err != nil {
+		return IngestionState{}, fmt.Errorf("loading ingestion state: %w", err)
+	}
+	if len(rows) == 0 {
+		return IngestionState{}, ErrNotFound
+	}
+	return ingestionStateFromRow(rows[0]), nil
 }
 
+// SaveIngestionState appends a new version of the singleton row. ClickHouse
+// has no efficient row-level UPDATE, so an upsert is an insert of a newer
+// version keyed by network; the schema's ReplacingMergeTree(updated_at) makes
+// readers see the latest without waiting for a background merge.
 func (c *ClickHouse) SaveIngestionState(ctx context.Context, s IngestionState) error {
+	if s.Network == "" {
+		s.Network = "default"
+	}
+	now := time.Now().UTC()
+	row := map[string]any{
+		"network":              s.Network,
+		"last_ingested_ledger": s.LastIngestedLedger,
+		"last_cursor":          s.LastCursor,
+		"last_successful_poll": nil,
+		"updated_at":           formatClickHouseTime(now),
+	}
+	if s.LastSuccessfulPoll != nil {
+		row["last_successful_poll"] = formatClickHouseTime(*s.LastSuccessfulPoll)
+	}
+	if err := newClickHouseExecutor(c.cfg).insertRows(ctx, c.cfg.databaseOrDefault(), "ingestion_state",
+		[]string{"network", "last_ingested_ledger", "last_cursor", "last_successful_poll", "updated_at"},
+		[]map[string]any{row}); err != nil {
+		return fmt.Errorf("saving ingestion state for network %q: %w", s.Network, err)
+	}
 	return nil
 }
 
+// GetAuditState returns the verified-through position for one network, or
+// ErrNotFound when the network has never been audited. Unlike SaveAuditState
+// it does not substitute a default network name, matching the Postgres
+// implementation exactly.
 func (c *ClickHouse) GetAuditState(ctx context.Context, network string) (AuditState, error) {
-	return AuditState{}, nil
+	rows, err := newClickHouseExecutor(c.cfg).queryRows(ctx, c.cfg.databaseOrDefault(),
+		"SELECT network, verified_through_ledger, updated_at FROM audit_state FINAL WHERE network = "+clickHouseQuoteString(network)+" LIMIT 1")
+	if err != nil {
+		return AuditState{}, fmt.Errorf("loading audit state for network %q: %w", network, err)
+	}
+	if len(rows) == 0 {
+		return AuditState{}, ErrNotFound
+	}
+	return auditStateFromRow(rows[0]), nil
 }
 
 func (c *ClickHouse) SaveAuditState(ctx context.Context, s AuditState) error {
+	if s.Network == "" {
+		s.Network = "default"
+	}
+	row := map[string]any{
+		"network":                 s.Network,
+		"verified_through_ledger": s.VerifiedThroughLedger,
+		"updated_at":              formatClickHouseTime(time.Now().UTC()),
+	}
+	if err := newClickHouseExecutor(c.cfg).insertRows(ctx, c.cfg.databaseOrDefault(), "audit_state",
+		[]string{"network", "verified_through_ledger", "updated_at"},
+		[]map[string]any{row}); err != nil {
+		return fmt.Errorf("saving audit state for network %q: %w", s.Network, err)
+	}
 	return nil
 }
 
+// SaveAuditStateIfGreater advances the verified-through marker only when the
+// new ledger is strictly ahead of what is stored, so a racing or lagging
+// auditor cannot regress it. Postgres gets the compare-and-set from an
+// ON CONFLICT ... WHERE; ClickHouse has no conditional upsert, so the current
+// value is read (FINAL) and the write skipped when it would move backward.
+// The read-modify-write is not atomic across instances, which matches the
+// monotonic intent closely enough for a marker the auditor owns exclusively.
 func (c *ClickHouse) SaveAuditStateIfGreater(ctx context.Context, network string, ledger int64) (AuditState, error) {
-	return AuditState{}, nil
+	if network == "" {
+		network = "default"
+	}
+	current, err := c.GetAuditState(ctx, network)
+	if err != nil && !errors.Is(err, ErrNotFound) {
+		return AuditState{}, err
+	}
+	if err == nil && ledger <= current.VerifiedThroughLedger {
+		return current, nil
+	}
+	s := AuditState{Network: network, VerifiedThroughLedger: ledger, UpdatedAt: time.Now().UTC()}
+	if err := c.SaveAuditState(ctx, s); err != nil {
+		return AuditState{}, err
+	}
+	return s, nil
 }
 
+// ListWatchedContracts returns the currently-watched set: rows whose latest
+// version has no removed_at. Removal is a soft delete (a newer version with
+// removed_at set), so FINAL is what turns the append-only table back into
+// the presence list ingestion reads.
 func (c *ClickHouse) ListWatchedContracts(ctx context.Context) ([]WatchedContract, error) {
-	return nil, nil
+	rows, err := newClickHouseExecutor(c.cfg).queryRows(ctx, c.cfg.databaseOrDefault(),
+		"SELECT contract_id, added_at FROM watched_contracts FINAL WHERE removed_at IS NULL ORDER BY contract_id")
+	if err != nil {
+		return nil, fmt.Errorf("listing watched contracts: %w", err)
+	}
+	out := make([]WatchedContract, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, watchedContractFromRow(r))
+	}
+	return out, nil
 }
 
+// RemoveWatchedContract stops future ingestion for a contract without
+// touching stored events. ErrNotFound signals a typo so the API can 404.
 func (c *ClickHouse) RemoveWatchedContract(ctx context.Context, contractID string) error {
+	exec := newClickHouseExecutor(c.cfg)
+	database := c.cfg.databaseOrDefault()
+	rows, err := exec.queryRows(ctx, database,
+		"SELECT contract_id FROM watched_contracts FINAL WHERE contract_id = "+clickHouseQuoteString(contractID)+" AND removed_at IS NULL LIMIT 1")
+	if err != nil {
+		return fmt.Errorf("removing watched contract: %w", err)
+	}
+	if len(rows) == 0 {
+		return ErrNotFound
+	}
+	now := formatClickHouseTime(time.Now().UTC())
+	row := map[string]any{"contract_id": contractID, "added_at": now, "removed_at": now}
+	if err := exec.insertRows(ctx, database, "watched_contracts",
+		[]string{"contract_id", "added_at", "removed_at"}, []map[string]any{row}); err != nil {
+		return fmt.Errorf("removing watched contract: %w", err)
+	}
 	return nil
 }
 
+// AddWatchedContract makes a contract watched, idempotently: re-adding an
+// already-watched contract appends another version that FINAL still collapses
+// to one present row. Re-adding a previously-removed contract appends a
+// newer version with removed_at NULL, which is what brings it back.
 func (c *ClickHouse) AddWatchedContract(ctx context.Context, contractID string) error {
+	row := map[string]any{
+		"contract_id": contractID,
+		"added_at":    formatClickHouseTime(time.Now().UTC()),
+		"removed_at":  nil,
+	}
+	if err := newClickHouseExecutor(c.cfg).insertRows(ctx, c.cfg.databaseOrDefault(), "watched_contracts",
+		[]string{"contract_id", "added_at", "removed_at"}, []map[string]any{row}); err != nil {
+		return fmt.Errorf("adding watched contract: %w", err)
+	}
 	return nil
 }
 
-func (c *ClickHouse) GetContractCursor(context.Context, string) (ContractCursor, error) {
-	return ContractCursor{}, ErrNotFound
+func (c *ClickHouse) GetContractCursor(ctx context.Context, contractID string) (ContractCursor, error) {
+	rows, err := newClickHouseExecutor(c.cfg).queryRows(ctx, c.cfg.databaseOrDefault(),
+		"SELECT contract_id, last_ingested_ledger, last_cursor, updated_at FROM contract_cursors FINAL WHERE contract_id = "+clickHouseQuoteString(contractID)+" LIMIT 1")
+	if err != nil {
+		return ContractCursor{}, fmt.Errorf("loading cursor for contract %s: %w", contractID, err)
+	}
+	if len(rows) == 0 {
+		return ContractCursor{}, ErrNotFound
+	}
+	return contractCursorFromRow(rows[0]), nil
 }
 
-func (c *ClickHouse) SaveContractCursor(context.Context, ContractCursor) error {
+func (c *ClickHouse) SaveContractCursor(ctx context.Context, cur ContractCursor) error {
+	row := map[string]any{
+		"contract_id":          cur.ContractID,
+		"last_ingested_ledger": cur.LastIngestedLedger,
+		"last_cursor":          cur.LastCursor,
+		"updated_at":           formatClickHouseTime(time.Now().UTC()),
+	}
+	if err := newClickHouseExecutor(c.cfg).insertRows(ctx, c.cfg.databaseOrDefault(), "contract_cursors",
+		[]string{"contract_id", "last_ingested_ledger", "last_cursor", "updated_at"},
+		[]map[string]any{row}); err != nil {
+		return fmt.Errorf("saving cursor for contract %s: %w", cur.ContractID, err)
+	}
 	return nil
 }
 
-func (c *ClickHouse) DeleteContractCursor(context.Context, string) error {
+// DeleteContractCursor removes a contract's resume position, returning
+// ErrNotFound when there was nothing to delete. mutations_sync makes the
+// delete synchronous so a subsequent ListContractCursors reflects it.
+func (c *ClickHouse) DeleteContractCursor(ctx context.Context, contractID string) error {
+	exec := newClickHouseExecutor(c.cfg)
+	database := c.cfg.databaseOrDefault()
+	total, err := exec.queryInt64(ctx, database,
+		"SELECT count(*) FROM contract_cursors FINAL WHERE contract_id = "+clickHouseQuoteString(contractID))
+	if err != nil {
+		return fmt.Errorf("deleting cursor for contract %s: %w", contractID, err)
+	}
+	if total == 0 {
+		return ErrNotFound
+	}
+	if err := exec.exec(ctx, database,
+		"ALTER TABLE contract_cursors DELETE WHERE contract_id = "+clickHouseQuoteString(contractID)+" SETTINGS mutations_sync = 1"); err != nil {
+		return fmt.Errorf("deleting cursor for contract %s: %w", contractID, err)
+	}
 	return nil
 }
 
-func (c *ClickHouse) ListContractCursors(context.Context) ([]ContractCursor, error) {
-	return nil, nil
+func (c *ClickHouse) ListContractCursors(ctx context.Context) ([]ContractCursor, error) {
+	rows, err := newClickHouseExecutor(c.cfg).queryRows(ctx, c.cfg.databaseOrDefault(),
+		"SELECT contract_id, last_ingested_ledger, last_cursor, updated_at FROM contract_cursors FINAL ORDER BY contract_id")
+	if err != nil {
+		return nil, fmt.Errorf("listing contract cursors: %w", err)
+	}
+	out := make([]ContractCursor, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, contractCursorFromRow(r))
+	}
+	return out, nil
 }
 
+// RecordAuditFinding inserts a new finding. The id is minted by the writer
+// (there is no sequence over the HTTP interface) and the attempts counter
+// starts at zero, matching the Postgres insert.
 func (c *ClickHouse) RecordAuditFinding(ctx context.Context, f AuditFinding) (AuditFinding, error) {
+	now := time.Now().UTC()
+	f.ID = nextClickHouseID()
+	f.CreatedAt = now
+	row := map[string]any{
+		"id":                f.ID,
+		"network":           defaultNetwork(f.Network),
+		"from_ledger":       f.FromLedger,
+		"to_ledger":         f.ToLedger,
+		"expected_count":    f.ExpectedCount,
+		"actual_count":      f.ActualCount,
+		"missing_ids":       f.MissingIDs,
+		"status":            f.Status,
+		"attempts":          0,
+		"last_attempted_at": nil,
+		"last_error":        f.LastError,
+		"created_at":        formatClickHouseTime(now),
+		"updated_at":        formatClickHouseTime(now),
+	}
+	if err := newClickHouseExecutor(c.cfg).insertRows(ctx, c.cfg.databaseOrDefault(), "audit_findings",
+		clickHouseAuditFindingColumns, []map[string]any{row}); err != nil {
+		return AuditFinding{}, fmt.Errorf("recording audit finding: %w", err)
+	}
 	return f, nil
 }
 
+// UpdateAuditFinding appends a new version of a finding carrying the mutable
+// fields the auditor tracks. A missing id is a silent no-op, mirroring the
+// Postgres UPDATE, which affects zero rows without erroring.
 func (c *ClickHouse) UpdateAuditFinding(ctx context.Context, f AuditFinding) error {
+	exec := newClickHouseExecutor(c.cfg)
+	database := c.cfg.databaseOrDefault()
+	rows, err := exec.queryRows(ctx, database,
+		"SELECT id, network, from_ledger, to_ledger, expected_count, actual_count, missing_ids, status, attempts, last_attempted_at, last_error, created_at FROM audit_findings FINAL WHERE id = "+strconv.FormatInt(f.ID, 10)+" LIMIT 1")
+	if err != nil {
+		return fmt.Errorf("updating audit finding %d: %w", f.ID, err)
+	}
+	if len(rows) == 0 {
+		return nil
+	}
+	current := auditFindingFromRow(rows[0])
+	current.Status = f.Status
+	current.Attempts = f.Attempts
+	current.LastAttemptedAt = f.LastAttemptedAt
+	current.LastError = f.LastError
+	current.MissingIDs = f.MissingIDs
+
+	row := map[string]any{
+		"id":                current.ID,
+		"network":           defaultNetwork(current.Network),
+		"from_ledger":       current.FromLedger,
+		"to_ledger":         current.ToLedger,
+		"expected_count":    current.ExpectedCount,
+		"actual_count":      current.ActualCount,
+		"missing_ids":       current.MissingIDs,
+		"status":            current.Status,
+		"attempts":          current.Attempts,
+		"last_attempted_at": nil,
+		"last_error":        current.LastError,
+		"created_at":        formatClickHouseTime(current.CreatedAt),
+		"updated_at":        formatClickHouseTime(time.Now().UTC()),
+	}
+	if !current.LastAttemptedAt.IsZero() {
+		row["last_attempted_at"] = formatClickHouseTime(current.LastAttemptedAt)
+	}
+	if err := exec.insertRows(ctx, database, "audit_findings", clickHouseAuditFindingColumns, []map[string]any{row}); err != nil {
+		return fmt.Errorf("updating audit finding %d: %w", f.ID, err)
+	}
 	return nil
 }
 
-func (c *ClickHouse) ListOpenFindingsByRange(ctx context.Context, network string, fromLedger, toLedger int64) (AuditFinding, error) {
-	return AuditFinding{}, ErrNotFound
+var clickHouseAuditFindingColumns = []string{
+	"id", "network", "from_ledger", "to_ledger", "expected_count", "actual_count",
+	"missing_ids", "status", "attempts", "last_attempted_at", "last_error",
+	"created_at", "updated_at",
 }
 
+// ListOpenFindingsByRange returns the newest finding that overlaps a ledger
+// and is still actionable (open or unrecoverable), or ErrNotFound.
+func (c *ClickHouse) ListOpenFindingsByRange(ctx context.Context, network string, fromLedger, toLedger int64) (AuditFinding, error) {
+	query := "SELECT id, network, from_ledger, to_ledger, expected_count, actual_count, missing_ids, status, attempts, last_attempted_at, last_error, created_at FROM audit_findings FINAL" +
+		" WHERE network = " + clickHouseQuoteString(network) +
+		" AND status IN ('open', 'unrecoverable')" +
+		fmt.Sprintf(" AND from_ledger <= %d AND to_ledger >= %d", toLedger, fromLedger) +
+		" ORDER BY id DESC LIMIT 1"
+	rows, err := newClickHouseExecutor(c.cfg).queryRows(ctx, c.cfg.databaseOrDefault(), query)
+	if err != nil {
+		return AuditFinding{}, fmt.Errorf("listing findings for [%d,%d]: %w", fromLedger, toLedger, err)
+	}
+	if len(rows) == 0 {
+		return AuditFinding{}, ErrNotFound
+	}
+	return auditFindingFromRow(rows[0]), nil
+}
+
+// CreateSubscription registers a webhook callback. The id and timestamps are
+// assigned here because ClickHouse has no sequence or RETURNING over its HTTP
+// interface, and failure_count starts at zero like the Postgres default.
 func (c *ClickHouse) CreateSubscription(ctx context.Context, s Subscription) (Subscription, error) {
+	now := time.Now().UTC()
+	s.ID = nextClickHouseID()
+	s.FailureCount = 0
+	s.CreatedAt = now
+	row, err := clickHouseSubscriptionRow(s, now)
+	if err != nil {
+		return Subscription{}, err
+	}
+	if err := newClickHouseExecutor(c.cfg).insertRows(ctx, c.cfg.databaseOrDefault(), "subscriptions",
+		clickHouseSubscriptionColumns, []map[string]any{row}); err != nil {
+		return Subscription{}, fmt.Errorf("creating subscription: %w", err)
+	}
 	return s, nil
 }
 
+// GetSubscription looks a subscription up under the owner filter. The owner
+// predicate is part of the query, not a post-filter, so a tenant cannot read
+// another's callback even incidentally — the same boundary Postgres enforces.
 func (c *ClickHouse) GetSubscription(ctx context.Context, id int64, owner SubscriptionOwner) (Subscription, error) {
-	return Subscription{}, ErrNotFound
+	where := "id = " + strconv.FormatInt(id, 10) + clickHouseOwnerPredicate(owner)
+	rows, err := newClickHouseExecutor(c.cfg).queryRows(ctx, c.cfg.databaseOrDefault(),
+		"SELECT "+clickHouseSubscriptionColumnList+" FROM subscriptions FINAL WHERE "+where+" LIMIT 1")
+	if err != nil {
+		return Subscription{}, fmt.Errorf("getting subscription %d: %w", id, err)
+	}
+	if len(rows) == 0 {
+		return Subscription{}, ErrNotFound
+	}
+	return subscriptionFromRow(rows[0])
 }
 
 func (c *ClickHouse) ListSubscriptions(ctx context.Context, owner SubscriptionOwner) ([]Subscription, error) {
-	return nil, nil
+	rows, err := newClickHouseExecutor(c.cfg).queryRows(ctx, c.cfg.databaseOrDefault(),
+		"SELECT "+clickHouseSubscriptionColumnList+" FROM subscriptions FINAL WHERE 1 = 1"+clickHouseOwnerPredicate(owner)+" ORDER BY id")
+	if err != nil {
+		return nil, fmt.Errorf("listing subscriptions: %w", err)
+	}
+	subs := make([]Subscription, 0, len(rows))
+	for _, r := range rows {
+		s, err := subscriptionFromRow(r)
+		if err != nil {
+			return nil, err
+		}
+		subs = append(subs, s)
+	}
+	return subs, nil
 }
 
+// UpdateSubscription rewrites the mutable fields (url, filters, secret,
+// enabled) as a new version, preserving the creation time and failure count
+// that only the counter methods own. Ownership is checked by the initial
+// GetSubscription, so a tenant cannot edit another's row.
 func (c *ClickHouse) UpdateSubscription(ctx context.Context, s Subscription, owner SubscriptionOwner) (Subscription, error) {
-	return s, nil
+	existing, err := c.GetSubscription(ctx, s.ID, owner)
+	if err != nil {
+		return Subscription{}, err
+	}
+	s.CreatedAt = existing.CreatedAt
+	s.FailureCount = existing.FailureCount
+	if s.TenantID == nil {
+		s.TenantID = existing.TenantID
+	}
+	row, err := clickHouseSubscriptionRow(s, time.Now().UTC())
+	if err != nil {
+		return Subscription{}, err
+	}
+	if err := newClickHouseExecutor(c.cfg).insertRows(ctx, c.cfg.databaseOrDefault(), "subscriptions",
+		clickHouseSubscriptionColumns, []map[string]any{row}); err != nil {
+		return Subscription{}, fmt.Errorf("updating subscription %d: %w", s.ID, err)
+	}
+	return c.GetSubscription(ctx, s.ID, owner)
 }
 
 func (c *ClickHouse) DeleteSubscription(ctx context.Context, id int64, owner SubscriptionOwner) error {
+	exec := newClickHouseExecutor(c.cfg)
+	database := c.cfg.databaseOrDefault()
+	total, err := exec.queryInt64(ctx, database,
+		"SELECT count(*) FROM subscriptions FINAL WHERE id = "+strconv.FormatInt(id, 10)+clickHouseOwnerPredicate(owner))
+	if err != nil {
+		return fmt.Errorf("deleting subscription %d: %w", id, err)
+	}
+	if total == 0 {
+		return ErrNotFound
+	}
+	if err := exec.exec(ctx, database,
+		"ALTER TABLE subscriptions DELETE WHERE id = "+strconv.FormatInt(id, 10)+clickHouseOwnerPredicate(owner)+" SETTINGS mutations_sync = 1"); err != nil {
+		return fmt.Errorf("deleting subscription %d: %w", id, err)
+	}
 	return nil
 }
 
 func (c *ClickHouse) ListEnabledSubscriptions(ctx context.Context) ([]Subscription, error) {
-	return nil, nil
+	rows, err := newClickHouseExecutor(c.cfg).queryRows(ctx, c.cfg.databaseOrDefault(),
+		"SELECT "+clickHouseSubscriptionColumnList+" FROM subscriptions FINAL WHERE enabled = 1 ORDER BY id")
+	if err != nil {
+		return nil, fmt.Errorf("listing enabled subscriptions: %w", err)
+	}
+	subs := make([]Subscription, 0, len(rows))
+	for _, r := range rows {
+		s, err := subscriptionFromRow(r)
+		if err != nil {
+			return nil, err
+		}
+		subs = append(subs, s)
+	}
+	return subs, nil
 }
 
+// IncrementSubscriptionFailures bumps the failure counter and disables the
+// subscription once it reaches the caller's ceiling. Postgres does both in one
+// UPDATE; here the current row is read (FINAL) and a new version written, so
+// the return value still reflects the increment the way callers expect.
 func (c *ClickHouse) IncrementSubscriptionFailures(ctx context.Context, id int64, maxFailures int) (int, bool, error) {
-	return 0, false, nil
+	s, err := c.getSubscriptionByID(ctx, id)
+	if err != nil {
+		return 0, false, err
+	}
+	newCount := s.FailureCount + 1
+	disabled := newCount >= maxFailures
+	s.FailureCount = newCount
+	if disabled {
+		s.Enabled = false
+	}
+	row, err := clickHouseSubscriptionRow(s, time.Now().UTC())
+	if err != nil {
+		return 0, false, err
+	}
+	if err := newClickHouseExecutor(c.cfg).insertRows(ctx, c.cfg.databaseOrDefault(), "subscriptions",
+		clickHouseSubscriptionColumns, []map[string]any{row}); err != nil {
+		return 0, false, fmt.Errorf("incrementing failures for subscription %d: %w", id, err)
+	}
+	return newCount, disabled, nil
 }
 
+// getSubscriptionByID is the unowned lookup the failure-counter methods use:
+// Postgres increments and resets by id alone, because the caller is the
+// delivery worker acting on behalf of every tenant, not a tenant itself.
+func (c *ClickHouse) getSubscriptionByID(ctx context.Context, id int64) (Subscription, error) {
+	rows, err := newClickHouseExecutor(c.cfg).queryRows(ctx, c.cfg.databaseOrDefault(),
+		"SELECT "+clickHouseSubscriptionColumnList+" FROM subscriptions FINAL WHERE id = "+strconv.FormatInt(id, 10)+" LIMIT 1")
+	if err != nil {
+		return Subscription{}, fmt.Errorf("getting subscription %d: %w", id, err)
+	}
+	if len(rows) == 0 {
+		return Subscription{}, ErrNotFound
+	}
+	return subscriptionFromRow(rows[0])
+}
+
+// ResetSubscriptionFailures clears the counter after a successful delivery.
+// A missing id is a silent no-op, matching the Postgres UPDATE that affects
+// zero rows without erroring.
 func (c *ClickHouse) ResetSubscriptionFailures(ctx context.Context, id int64) error {
+	s, err := c.getSubscriptionByID(ctx, id)
+	if errors.Is(err, ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	s.FailureCount = 0
+	row, err := clickHouseSubscriptionRow(s, time.Now().UTC())
+	if err != nil {
+		return err
+	}
+	if err := newClickHouseExecutor(c.cfg).insertRows(ctx, c.cfg.databaseOrDefault(), "subscriptions",
+		clickHouseSubscriptionColumns, []map[string]any{row}); err != nil {
+		return fmt.Errorf("resetting failures for subscription %d: %w", id, err)
+	}
 	return nil
 }
 
 func (c *ClickHouse) RecordDeliveryAttempt(ctx context.Context, a DeliveryAttempt) (DeliveryAttempt, error) {
+	a.ID = nextClickHouseID()
+	a.CreatedAt = time.Now().UTC()
+	row := map[string]any{
+		"id":              a.ID,
+		"subscription_id": a.SubscriptionID,
+		"event_id":        a.EventID,
+		"status":          a.Status,
+		"response_code":   a.ResponseCode,
+		"duration_ms":     a.DurationMs,
+		"error":           a.Error,
+		"created_at":      formatClickHouseTime(a.CreatedAt),
+	}
+	if err := newClickHouseExecutor(c.cfg).insertRows(ctx, c.cfg.databaseOrDefault(), "delivery_attempts",
+		[]string{"id", "subscription_id", "event_id", "status", "response_code", "duration_ms", "error", "created_at"},
+		[]map[string]any{row}); err != nil {
+		return DeliveryAttempt{}, fmt.Errorf("recording delivery attempt: %w", err)
+	}
 	return a, nil
 }
 
+// ListDeliveryAttempts resolves the subscription under the owner filter first,
+// then reads its history newest-first. Delivery history names the events that
+// matched, so an unowned read would leak a tenant's data one attempt at a time.
 func (c *ClickHouse) ListDeliveryAttempts(ctx context.Context, subscriptionID int64, limit int, owner SubscriptionOwner) ([]DeliveryAttempt, error) {
-	return nil, nil
+	if limit <= 0 {
+		limit = 50
+	}
+	if _, err := c.GetSubscription(ctx, subscriptionID, owner); err != nil {
+		return nil, err
+	}
+	rows, err := newClickHouseExecutor(c.cfg).queryRows(ctx, c.cfg.databaseOrDefault(),
+		"SELECT id, subscription_id, event_id, status, response_code, duration_ms, error, created_at FROM delivery_attempts WHERE subscription_id = "+strconv.FormatInt(subscriptionID, 10)+" ORDER BY created_at DESC LIMIT "+strconv.Itoa(limit))
+	if err != nil {
+		return nil, fmt.Errorf("listing delivery attempts: %w", err)
+	}
+	attempts := make([]DeliveryAttempt, 0, len(rows))
+	for _, r := range rows {
+		attempts = append(attempts, deliveryAttemptFromRow(r))
+	}
+	return attempts, nil
 }
 
 func (c *ClickHouse) CountDeliveryAttempts(ctx context.Context, subscriptionID int64, owner SubscriptionOwner) (int64, error) {
-	return 0, nil
+	if _, err := c.GetSubscription(ctx, subscriptionID, owner); err != nil {
+		return 0, err
+	}
+	total, err := newClickHouseExecutor(c.cfg).queryInt64(ctx, c.cfg.databaseOrDefault(),
+		"SELECT count(*) FROM delivery_attempts WHERE subscription_id = "+strconv.FormatInt(subscriptionID, 10))
+	if err != nil {
+		return 0, fmt.Errorf("counting delivery attempts: %w", err)
+	}
+	return total, nil
 }
 
 func (c *ClickHouse) GetContractSpec(ctx context.Context, wasmHash string) ([]byte, error) {
@@ -643,23 +1274,143 @@ func clickHouseRetentionWhere(maxLedger int64, beforeTime time.Time) string {
 	return where
 }
 
-func (c *ClickHouse) DeadLetterEvent(context.Context, DeadLetterInput) (DeadLetter, error) {
-	return DeadLetter{}, nil
+// DeadLetterEvent quarantines an event the ingester could not persist. It is
+// retry-safe: re-submitting the same event_id increments the attempt counter
+// and overwrites the payload with the newest attempt, keeping the row id
+// stable so GET/DELETE by id continue to work. Postgres gets this from
+// UNIQUE(event_id) plus ON CONFLICT; ClickHouse reads the existing version
+// with FINAL and appends an incremented one.
+func (c *ClickHouse) DeadLetterEvent(ctx context.Context, in DeadLetterInput) (DeadLetter, error) {
+	exec := newClickHouseExecutor(c.cfg)
+	database := c.cfg.databaseOrDefault()
+	now := time.Now().UTC()
+
+	errStr := ""
+	if in.Err != nil {
+		errStr = in.Err.Error()
+	}
+	d := DeadLetter{
+		ID:          nextClickHouseID(),
+		EventID:     in.EventID,
+		ContractID:  in.ContractID,
+		Ledger:      in.Ledger,
+		Type:        in.Type,
+		TxHash:      in.TxHash,
+		TopicXDR:    in.TopicXDR,
+		ValueXDR:    in.ValueXDR,
+		Error:       errStr,
+		Attempts:    1,
+		LastAttempt: now,
+		CreatedAt:   now,
+	}
+
+	existing, err := exec.queryRows(ctx, database,
+		"SELECT id, attempts, created_at FROM dead_letters FINAL WHERE event_id = "+clickHouseQuoteString(in.EventID)+" LIMIT 1")
+	if err != nil {
+		return DeadLetter{}, fmt.Errorf("recording dead letter: %w", err)
+	}
+	if len(existing) > 0 {
+		d.ID = existing[0].int64("id")
+		d.Attempts = int(existing[0].int64("attempts")) + 1
+		d.CreatedAt = existing[0].time("created_at")
+	}
+
+	if err := exec.insertRows(ctx, database, "dead_letters",
+		clickHouseDeadLetterColumns, []map[string]any{clickHouseDeadLetterRow(d)}); err != nil {
+		return DeadLetter{}, fmt.Errorf("recording dead letter: %w", err)
+	}
+	return d, nil
 }
 
-func (c *ClickHouse) ListDeadLetters(context.Context, string, int, string) ([]DeadLetter, string, error) {
-	return nil, "", nil
+// ListDeadLetters returns dead-letter rows newest-first, keyset-paginated by
+// the cursor's encoded id. It mirrors the Postgres implementation's contract
+// exactly, including the base64 cursor shape and the limit clamp.
+func (c *ClickHouse) ListDeadLetters(ctx context.Context, contractID string, limit int, cursor string) ([]DeadLetter, string, error) {
+	if limit <= 0 {
+		limit = DefaultQueryLimit
+	}
+	if limit > MaxQueryLimit {
+		limit = MaxQueryLimit
+	}
+	where := []string{}
+	if contractID != "" {
+		where = append(where, "contract_id = "+clickHouseQuoteString(contractID))
+	}
+	if cursor != "" {
+		raw, err := base64.RawURLEncoding.DecodeString(cursor)
+		if err != nil {
+			return nil, "", fmt.Errorf("%w: dead letter cursor", ErrInvalidContractsCursor)
+		}
+		id, err := strconv.ParseInt(string(raw), 10, 64)
+		if err != nil {
+			return nil, "", fmt.Errorf("%w: dead letter cursor", ErrInvalidContractsCursor)
+		}
+		where = append(where, "id < "+strconv.FormatInt(id, 10))
+	}
+	query := "SELECT " + clickHouseDeadLetterColumnList + " FROM dead_letters FINAL" +
+		clickHouseJoinWhere(where) + " ORDER BY id DESC LIMIT " + strconv.Itoa(limit+1)
+	rows, err := newClickHouseExecutor(c.cfg).queryRows(ctx, c.cfg.databaseOrDefault(), query)
+	if err != nil {
+		return nil, "", fmt.Errorf("listing dead letters: %w", err)
+	}
+	letters := make([]DeadLetter, 0, len(rows))
+	for _, r := range rows {
+		letters = append(letters, deadLetterFromRow(r))
+	}
+	next := ""
+	if len(letters) > limit {
+		last := letters[limit-1]
+		letters = letters[:limit]
+		next = base64.RawURLEncoding.EncodeToString([]byte(strconv.FormatInt(last.ID, 10)))
+	}
+	return letters, next, nil
 }
 
-func (c *ClickHouse) CountDeadLetters(context.Context, string) (int64, error) {
-	return 0, nil
+// CountDeadLetters returns the full match set behind any page, matching the
+// contract filter of ListDeadLetters.
+func (c *ClickHouse) CountDeadLetters(ctx context.Context, contractID string) (int64, error) {
+	where := []string{}
+	if contractID != "" {
+		where = append(where, "contract_id = "+clickHouseQuoteString(contractID))
+	}
+	total, err := newClickHouseExecutor(c.cfg).queryInt64(ctx, c.cfg.databaseOrDefault(),
+		"SELECT count(*) FROM dead_letters FINAL"+clickHouseJoinWhere(where))
+	if err != nil {
+		return 0, fmt.Errorf("counting dead letters: %w", err)
+	}
+	return total, nil
 }
 
-func (c *ClickHouse) GetDeadLetter(context.Context, int64) (DeadLetter, error) {
-	return DeadLetter{}, ErrNotFound
+func (c *ClickHouse) GetDeadLetter(ctx context.Context, id int64) (DeadLetter, error) {
+	rows, err := newClickHouseExecutor(c.cfg).queryRows(ctx, c.cfg.databaseOrDefault(),
+		"SELECT "+clickHouseDeadLetterColumnList+" FROM dead_letters FINAL WHERE id = "+strconv.FormatInt(id, 10)+" LIMIT 1")
+	if err != nil {
+		return DeadLetter{}, fmt.Errorf("loading dead letter %d: %w", id, err)
+	}
+	if len(rows) == 0 {
+		return DeadLetter{}, ErrNotFound
+	}
+	return deadLetterFromRow(rows[0]), nil
 }
 
-func (c *ClickHouse) DeleteDeadLetter(context.Context, int64) error {
+// DeleteDeadLetter removes a quarantine row once it has been dealt with.
+// mutations_sync makes the delete synchronous so a following
+// ListDeadLetters already reflects it, which the API relies on.
+func (c *ClickHouse) DeleteDeadLetter(ctx context.Context, id int64) error {
+	exec := newClickHouseExecutor(c.cfg)
+	database := c.cfg.databaseOrDefault()
+	total, err := exec.queryInt64(ctx, database,
+		"SELECT count(*) FROM dead_letters FINAL WHERE id = "+strconv.FormatInt(id, 10))
+	if err != nil {
+		return fmt.Errorf("deleting dead letter %d: %w", id, err)
+	}
+	if total == 0 {
+		return ErrNotFound
+	}
+	if err := exec.exec(ctx, database,
+		"ALTER TABLE dead_letters DELETE WHERE id = "+strconv.FormatInt(id, 10)+" SETTINGS mutations_sync = 1"); err != nil {
+		return fmt.Errorf("deleting dead letter %d: %w", id, err)
+	}
 	return nil
 }
 
