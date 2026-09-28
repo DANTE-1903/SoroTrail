@@ -2,6 +2,7 @@
 // Stellar RPC and persists them.
 package ingester
 
+
 import (
 	"context"
 	"errors"
@@ -19,7 +20,9 @@ import (
 	"github.com/sorotrail/sorotrail/internal/store"
 )
 
+
 // Options configure an Ingester.
+
 type Options struct {
 	// PollInterval is how long to sleep once caught up. Default 5s.
 	PollInterval time.Duration
