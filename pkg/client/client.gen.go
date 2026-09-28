@@ -232,8 +232,8 @@ type EventWithXDR struct {
 }
 
 type EventsResponse struct {
-	Cursor string `json:"cursor,omitempty"`
-	Events []any  `json:"events"`
+	Cursor string  `json:"cursor,omitempty"`
+	Events []Event `json:"events"`
 }
 
 type GrantContractRequest struct {
@@ -1491,10 +1491,10 @@ func (p EventStreamWSParams) values() url.Values {
 // GetEvent Get a single event by ID.
 //
 // GET /events/{id}
-func (c *Client) GetEvent(ctx context.Context, id string, params GetEventParams) (*EventResponse, error) {
+func (c *Client) GetEvent(ctx context.Context, id string, params GetEventParams) (*Event, error) {
 	path := urlEscapePath("/events/{id}", id)
 	query := params.values()
-	return do[EventResponse](c, ctx, "GET", path, query, nil)
+	return do[Event](c, ctx, "GET", path, query, nil)
 }
 
 // GetEventParams are the query parameters for GetEvent.
