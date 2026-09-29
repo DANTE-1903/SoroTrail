@@ -81,10 +81,18 @@ func dispatch(args []string) error {
 	if len(args) == 0 {
 		return run()
 	}
-	if args[0] == "help" || args[0] == "-h" || args[0] == "--help" {
+	// Subcommands that are spelled as flags have to be routed before the
+	// catch-all below, or they would be handed to the ingester and rejected
+	// as undefined flags. help and version are the only two.
+	switch args[0] {
+	case "help", "-h", "--help":
 		usage()
 		return nil
+	case "--version", "-V":
+		return runVersion(args[1:])
 	}
+	// Anything else starting with a dash is an option for the default
+	// ingester, so `sorotrail --dry-run` keeps working without a subcommand.
 	if strings.HasPrefix(args[0], "-") {
 		return runWithArgs(args)
 	}
