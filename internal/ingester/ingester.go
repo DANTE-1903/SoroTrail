@@ -21,7 +21,6 @@
 //     never silently disagree on page size.
 package ingester
 
-
 import (
 	"context"
 	"errors"
