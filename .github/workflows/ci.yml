@@ -188,7 +188,7 @@ jobs:
           go-version-file: go.mod
           cache-dependency-path: go.sum
       - name: Download all coverage artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: coverage-pg*
           merge-multiple: true

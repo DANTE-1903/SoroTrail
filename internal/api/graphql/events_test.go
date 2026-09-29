@@ -274,7 +274,7 @@ func TestBuildEventFilterDirectly(t *testing.T) {
 			Filter: &FilterInput{
 				ContractID:    knownContractID,
 				Types:         []string{"contract", "system"},
-				Topic:         json.RawMessage(`["topic0"]`),
+				Topics:        &TopicPositionInput{T0: json.RawMessage(`"t0val"`)},
 				TopicContains: json.RawMessage(`["contains"]`),
 				TxHash:        "abcdef",
 				FromLedger:    &fromLedge,
@@ -294,7 +294,8 @@ func TestBuildEventFilterDirectly(t *testing.T) {
 
 		assert.Equal(t, knownContractID, filter.ContractID)
 		assert.Equal(t, []string{"contract", "system"}, filter.Types)
-		assert.JSONEq(t, `["topic0"]`, string(filter.Topic))
+		assert.Nil(t, filter.Topic, "topic and topic0 are mutually exclusive")
+		assert.JSONEq(t, `"t0val"`, string(filter.Topic0))
 		assert.JSONEq(t, `["contains"]`, string(filter.TopicContains))
 		assert.Equal(t, "abcdef", filter.TxHash)
 		assert.Equal(t, int64(100), filter.FromLedger)

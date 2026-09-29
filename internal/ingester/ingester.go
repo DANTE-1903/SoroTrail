@@ -79,6 +79,7 @@ type JitterFunc func(max time.Duration) time.Duration
 func RealJitter(max time.Duration) time.Duration { return rand.N(max) }
 
 // Options configure an Ingester.
+
 type Options struct {
 	// Clock supplies time and sleeping. Defaults to RealClock; simulations
 	// inject a virtual clock so a test can cover hours of ingestion without
@@ -163,7 +164,8 @@ type Options struct {
 	// so a severely degraded database cannot stretch a single ingestion
 	// cycle for minutes. Default 1s when batching is enabled.
 	BatchMaxBackoff time.Duration
-	// MinBackoff is the initial error backoff before exponential growth.
+	// MinBackoff is the initial error backoff before exponential growth,
+	// and the floor the backoff returns to after a successful cycle.
 	// Default 1s (matches INGESTER_MIN_BACKOFF).
 	MinBackoff time.Duration
 	// MaxBackoff caps the error backoff. Default 1m.
