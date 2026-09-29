@@ -1,3 +1,6 @@
+# SoroTrail
+
+
 SoroTrail
 A contract event indexer for the Stellar/Soroban network.
 
@@ -5,6 +8,7 @@ Stellar RPC's getEvents method only retains contract events for roughly 24
 hours to 7 days. Anyone who needs historical Soroban event data — dapp
 dashboards, analytics, audits, notification services — must ingest and store
 events themselves before the RPC drops them.
+
 
 SoroTrail does exactly that: it polls a Stellar RPC endpoint, stores contract
 events durably in Postgres or SQLite, and serves them back through a queryable
@@ -16,8 +20,10 @@ HTTP API long after the RPC has forgotten them.
  Stellar RPC ──getEvents──▶ ingester ──▶ Postgres/SQLite ◀── HTTP API ◀── you
 ```
 
+
 ## Quickstart
 text
+
 
 ### Published image (fastest)
 

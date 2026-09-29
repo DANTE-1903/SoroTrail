@@ -79,6 +79,7 @@ type JitterFunc func(max time.Duration) time.Duration
 func RealJitter(max time.Duration) time.Duration { return rand.N(max) }
 
 // Options configure an Ingester.
+
 type Options struct {
 	// Clock supplies time and sleeping. Defaults to RealClock; simulations
 	// inject a virtual clock so a test can cover hours of ingestion without
