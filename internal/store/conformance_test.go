@@ -229,6 +229,7 @@ func testUpsertEventsIdempotent(t *testing.T, st Store) {
 
 	inserted, err = st.UpsertEvents(ctx, events)
 	require.NoError(t, err)
+	assert.Equal(t, int64(0), inserted)
 	assert.Zero(t, inserted, "duplicate IDs are ignored")
 
 	got, err := st.GetEvent(ctx, eventID(1), WildcardScope())

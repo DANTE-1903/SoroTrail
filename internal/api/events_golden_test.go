@@ -226,7 +226,6 @@ func TestEventsGoldenFilesAreValidJSON(t *testing.T) {
 		})
 	}
 }
-
 func TestEventsGoldenCoverage(t *testing.T) {
 	// The golden files must exist for each documented endpoint
 	// that produces a 200 response. This test asserts that the
