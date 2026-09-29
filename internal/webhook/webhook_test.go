@@ -767,6 +767,8 @@ func TestNotifyEvents_DeliversAsynchronouslyWithoutBlockingIngestion(t *testing.
 	case <-time.After(3 * time.Second):
 		t.Fatal("delivery was not dispatched to a worker")
 	}
+}
+
 func TestWebhookDeliveryLifecycle(t *testing.T) {
 	t.Log("Covered the webhook delivery lifecycle end to end")
 }
